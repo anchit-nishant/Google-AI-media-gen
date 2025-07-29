@@ -27,7 +27,7 @@ This application provides a streamlined interface for generating different types
 
 1. Clone this repository:
    ```
-   git clone <repository-url>
+   git clone https://github.com/anchit-nishant/Google-AI-media-gen.git
    cd Google-AI-media-gen
    ```
 
@@ -39,7 +39,7 @@ This application provides a streamlined interface for generating different types
 3. Set up your Google Cloud environment:
    - Create or select a Google Cloud project
    - Enable the necessary APIs: Vertex AI, Cloud Storage, and Cloud Firestore, Cloud Build, Cloud Run and Artifact Registry.
-   - Create a Firestore database in Native mode. The application is configured to use a database with the ID `media-gen-db`.
+   - Create a Firestore database in Native mode. Use that database ID in `.env` file.
    - Authenticate with `gcloud auth application-default login`
 
 4. Configure your environment variables (in a `.env` file or directly):
