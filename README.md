@@ -28,7 +28,7 @@ This application provides a streamlined interface for generating different types
 1. Clone this repository:
    ```
    git clone <repository-url>
-   cd videoGenerator-Anchit
+   cd Google-AI-media-gen
    ```
 
 2. Install the required dependencies:
