@@ -1,0 +1,67 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+ENV/
+env/
+test-env
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Google Cloud & API keys
+.env
+*.json
+credentials/
+keys/
+
+# IDEs and editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS specific
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Project specific
+*.mp4
+*.webm
+*.mov
+*.avi
+*.webp
+tmp/
+*_url.txt
+*_player.html 
+*.wav
+codefile.txt
+combine_files.py
+/temp_processing_space/
+rough

@@ -1,0 +1,4116 @@
+"""
+Veo2 Video Generator - A Streamlit app for generating high-quality videos
+from text prompts and images using Google's Veo 2.0 API.
+"""
+import os
+import uuid
+import time
+import json
+import tempfile
+import io
+import sys
+import pandas as pd
+from datetime import datetime
+from PIL import Image
+import streamlit as st
+import requests
+from moviepy.editor import VideoFileClip, concatenate_videoclips
+import numpy as np
+import firebase_admin
+from firebase_admin import credentials, firestore
+from collections import OrderedDict
+import shutil
+from werkzeug.utils import secure_filename
+
+
+# Import project modules
+import config.config as config
+import apis.gemini_helper as gemini_helper
+import apis.history_manager as history_manager
+from apis.veo2_api import Veo2API
+
+# Initialize the Veo2 API client globally for shared use
+client = Veo2API(config.PROJECT_ID)
+db_id = config.DB_ID
+
+
+# Initialize Firestore
+try:
+    # This will use the GOOGLE_APPLICATION_CREDENTIALS environment variable.
+    # Make sure it's set in your deployment environment.
+    if not firebase_admin._apps:
+        # Initialize the app if it hasn't been initialized yet
+        firebase_admin.initialize_app()
+    db = firestore.client(database_id=db_id) #The line below specifies which db will be used when initializing
+    FIRESTORE_AVAILABLE = True
+    print("Firestore initialized successfully!")
+except Exception as e:
+    print(f"Failed to initialize Firestore: {e}", file=sys.stderr)
+    db = None
+    FIRESTORE_AVAILABLE = False
+
+
+# Helper function to generate signed URLs
+def generate_signed_url(uri, expiration=3600):
+    """
+    Generate a signed URL for a GCS URI.
+    
+    Args:
+        uri (str): GCS URI to generate a signed URL for
+        expiration (int): Expiration time in seconds
+        
+    Returns:
+        str: Signed URL for accessing the resource
+    """
+    # Use the global client to generate a signed URL
+    return client.generate_signed_url(uri, expiration_minutes=expiration//60)
+
+# Class for simulating file uploads from different sources
+class SimulatedUploadFile:
+    def __init__(self, name, content):
+        self.name = name
+        self.content = content
+        self.size = len(content)
+        self._position = 0
+    
+    def getvalue(self):
+        return self.content
+        
+    def read(self, size=-1):
+        """Read content from current position, like a file object."""
+        if size < 0:
+            # Read all content from current position
+            data = self.content[self._position:]
+            self._position = len(self.content)
+        else:
+            # Read only 'size' bytes
+            data = self.content[self._position:self._position + size]
+            self._position += len(data)
+        return data
+    
+    def seek(self, offset, whence=0):
+        """Change the current position like a file object."""
+        if whence == 0:  # Absolute position
+            self._position = offset
+        elif whence == 1:  # Relative to current position
+            self._position += offset
+        elif whence == 2:  # Relative to end
+            self._position = len(self.content) + offset
+        # Ensure position is within bounds
+        self._position = max(0, min(self._position, len(self.content)))
+        return self._position
+    
+    def tell(self):
+        """Return the current position in the file."""
+        return self._position
+    
+    # Make compatible with contextlib.closing and context managers
+    def close(self):
+        """Close the file-like object."""
+        pass
+    
+    def __enter__(self):
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+# Check if Google Cloud Storage SDK is available
+try:
+    from google.cloud import storage
+    GCS_SDK_AVAILABLE = True
+except ImportError:
+    GCS_SDK_AVAILABLE = False
+
+# Create a cleaner logger
+class Logger:
+    """Simple logger with section formatting for cleaner console output."""
+    
+    def __init__(self, debug=False):
+        self.sections = []
+        self.debug_mode = debug
+    
+    def start_section(self, name):
+        """Start a new log section."""
+        section = name.upper()
+        border = "=" * (len(section) + 4)
+        print(f"\n{border}")
+        print(f"| {section} |")
+        print(f"{border}")
+        self.sections.append(name)
+    
+    def end_section(self):
+        """End the current log section."""
+        if self.sections:
+            section = self.sections.pop()
+            print(f"--- END {section.upper()} ---\n")
+    
+    def info(self, message):
+        """Log an info message."""
+        print(f"INFO: {message}")
+    
+    def success(self, message):
+        """Log a success message."""
+        print(f"✅ {message}")
+    
+    def warning(self, message):
+        """Log a warning message."""
+        print(f"⚠️ {message}", file=sys.stderr)
+    
+    def error(self, message):
+        """Log an error message."""
+        print(f"❌ {message}", file=sys.stderr)
+    
+    def debug(self, message):
+        """Log a debug message (only when debug is enabled)."""
+        if self.debug_mode:
+            print(f"DEBUG: {message}")
+
+# Initialize logger
+logger = Logger(debug=config.DEBUG_MODE)
+
+logger.start_section("Application Startup")
+logger.info(f"Starting Veo2 Video Generator App (v0.2.0)")
+logger.info(f"Python version: {sys.version}")
+logger.info(f"Working directory: {os.getcwd()}")
+logger.end_section()
+
+# Configure the Streamlit page
+st.set_page_config(
+    page_title="Google Media Gen Tool",
+    page_icon="🎬",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Custom CSS to improve app appearance
+st.markdown("""
+<style>
+    /* Overall app styling */
+    .main .block-container {
+        padding-top: 0 !important;
+        padding-bottom: 2rem;
+        max-width: 100%;
+    }
+    
+    /* Hide default Streamlit elements */
+    header {
+        visibility: hidden !important;
+        height: 0 !important;
+        padding: 0 !important;
+        margin: 0 !important;
+        display: none !important;
+    }
+    
+    /* Remove default margins */
+    .st-emotion-cache-1wmy9hl e1f1d6gn0,
+    .st-emotion-cache-7ym5gk,
+    .st-emotion-cache-16txtl3,
+    .st-emotion-cache-uf99v8 {
+        margin-top: 0 !important;
+        padding-top: 0 !important;
+        display: none !important;
+    }
+    
+    /* Hide top decoration bar */
+    div[data-testid="stDecoration"],
+    div[data-testid="stToolbar"] {
+        display: none !important;
+        height: 0 !important;
+        padding: 0 !important;
+        margin: 0 !important; 
+        visibility: hidden !important;
+    }
+    
+    /* Override any internal padding */
+    .st-emotion-cache-z5fcl4 {
+        padding-top: 0 !important;
+    }
+    
+    /* Fix top whitespace */
+    div.appview-container {
+        margin-top: 0 !important;
+        padding-top: 0 !important;
+    }
+    
+    .main .element-container:first-of-type {
+        margin-top: 0 !important;
+        padding-top: 0 !important;
+    }
+    
+    /* Remove empty input bars */
+    .stTextInput, .stNumberInput {
+        margin-bottom: 0 !important;
+    }
+    
+    /* Ensure consistent widths */
+    .stButton, .stButton > button {
+        width: 100%;
+    }
+    
+    /* Fix the Generate Video button width */
+    [data-testid="column"] .stButton {
+        width: 100% !important;
+    }
+    
+    /* Title row styling */
+    .title-row {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin: 0;
+        padding: 0.5rem 0;
+    }
+    
+    /* Title heading style */
+    .title-row h2 {
+        margin: 0 !important;
+        padding: 0 !important;
+        font-size: 1.5rem !important;
+    }
+    
+    /* Card-like containers */
+    .card {
+        background-color: white;
+        border-radius: 10px;
+        padding: 20px;
+        margin-bottom: 20px;
+        border: 1px solid #e0e0e0;
+        box-shadow: 0 2px 5px rgba(0, 0, 0, 0.05);
+    }
+    
+    /* Button styles */
+    .success-button {
+        background-color: #28a745;
+        color: white;
+        padding: 0.25rem 0.75rem;
+        border-radius: 0.25rem;
+        text-decoration: none;
+        font-weight: bold;
+        display: inline-block;
+    }
+    .warning-button {
+        background-color: #dc3545;
+        color: white;
+        padding: 0.25rem 0.75rem;
+        border-radius: 0.25rem;
+        text-decoration: none;
+        font-weight: bold;
+        display: inline-block;
+    }
+    
+    /* Spinner styling */
+    .stSpinner > div > div {
+        border-color: #4caf50 #f3f3f3 #f3f3f3 !important;
+    }
+    
+    /* Image container */
+    .image-preview {
+        border: 1px solid #e0e0e0;
+        border-radius: 5px;
+        padding: 10px;
+        background-color: #f9f9f9;
+    }
+    
+    /* Prompt text area container */
+    .prompt-textarea {
+        border-radius: 5px;
+    }
+    
+    /* Space between elements */
+    .spacer {
+        margin-top: 20px;
+    }
+    
+    /* Tabs styling */
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 8px;
+    }
+    
+    .stTabs [data-baseweb="tab"] {
+        height: 40px;
+        border-radius: 5px 5px 0 0;
+        padding: 0 20px;
+        font-weight: 500;
+    }
+    
+    /* Make tabs more compact */
+    .stTabs [data-baseweb="tab-list"] button [data-testid="stMarkdownContainer"] p {
+        font-size: 0.9rem;
+        margin-bottom: 0;
+    }
+    
+    /* Decrease padding around tab content */
+    .stTabs [data-baseweb="tab-panel"] {
+        padding-top: 1rem;
+    }
+    
+    /* Table styling */
+    .stDataFrame {
+        border-radius: 5px;
+    }
+    
+    /* Sidebar styling */
+    .css-1d391kg {
+        padding-top: 2rem;
+    }
+    
+    .sidebar .sidebar-content {
+        background-color: #f8f9fa;
+    }
+    
+     /* --- Start: Sidebar Collapse Arrow Fix --- */
+     /* Make collapsed sidebar wider to accommodate the arrow */
+     section[data-testid="stSidebar"][aria-collapsed="true"] {
+         width: 50px !important;
+         min-width: 50px !important;
+     }
+
+     /* Adjust button position and styling */
+     section[data-testid="stSidebar"][aria-collapsed="true"] button[data-testid="stSidebarCollapseButton"] {
+         transform: rotate(180deg); /* Flip the arrow */
+         position: absolute;
+         top: 50%; /* Center vertically */
+         left: 0;
+         margin-top: -1.5rem; /* Adjust for button height */
+         width: 100%;
+         height: 3rem;
+         border-radius: 0;
+         border: none;
+         background-color: #f0f2f6; /* Light mode background */
+     }
+
+     /* Hover effect for the button */
+     section[data-testid="stSidebar"][aria-collapsed="true"] button[data-testid="stSidebarCollapseButton"]:hover {
+         background-color: #e6e6e6;
+     }
+
+     /* Hide content in collapsed sidebar for clarity */
+     section[data-testid="stSidebar"][aria-collapsed="true"] [data-testid="stSidebarUserContent"] {
+         display: none;
+     }
+     /* --- End: Sidebar Collapse Arrow Fix --- */
+
+    .upload-container {
+        border: 2px dashed #aaaaaa;
+        border-radius: 8px;
+        padding: 20px 10px;
+        text-align: center;
+        margin-bottom: 15px;
+        background-color: #f9f9f9;
+    }
+    .image-preview-container {
+        border: 1px solid #e0e0e0;
+        border-radius: 8px;
+        padding: 15px;
+        margin-bottom: 20px;
+        background-color: #f8f8f8;
+    }
+    .prompt-container {
+        border-radius: 4px;
+        padding: 0;
+        margin-top: 5px;
+        margin-bottom: 10px;
+        background-color: transparent;
+    }
+    
+    /* Custom header styling */
+    .main-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 2rem;
+        padding-bottom: 1rem;
+        border-bottom: 1px solid #f0f0f0;
+    }
+    
+    .header-logo {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+    }
+    
+    .header-logo img {
+        height: 50px;
+    }
+    
+    .header-status {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        background-color: #f8f9fa;
+        padding: 8px 15px;
+        border-radius: 50px;
+        box-shadow: 0 2px 5px rgba(0,0,0,0.05);
+    }
+    
+    .status-indicator {
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        background-color: #4CAF50;
+    }
+    
+    /* Footer styling - fixed at bottom */
+    .footer {
+        position: fixed;
+        left: 0;
+        bottom: 0;
+        width: 100%;
+        background-color: white;
+        border-top: 1px solid #f0f0f0;
+        padding: 0.5rem 0;
+        text-align: center;
+        color: #888;
+        font-size: 0.8rem;
+        z-index: 100;
+    }
+    
+    /* Add padding to ensure content isn't hidden beneath footer */
+    .main .block-container {
+        padding-bottom: 3rem !important;
+    }
+    
+    /* Remove any specific row or element causing empty spaces */
+    div[data-testid="stExpander"] .streamlit-expanderContent {
+        overflow: hidden;
+    }
+    
+    /* Reduce all section heading margins */
+    h1, h2, h3, h4, h5, h6 {
+        margin-top: 0.5rem !important;
+        margin-bottom: 0.5rem !important;
+        padding-top: 0 !important;
+    }
+    
+    /* Remove margins between UI elements */
+    .element-container {
+        margin-top: 0.3rem !important;
+        margin-bottom: 0.3rem !important;
+    }
+    
+    /* History styling improvements */
+    .history-grid {
+        display: grid;
+        grid-template-columns: repeat(2, 1fr) !important;
+        grid-gap: 20px;
+        margin-bottom: 20px;
+        width: 100%;
+    }
+    
+    .history-card {
+        border: 1px solid #e0e0e0;
+        border-radius: 8px;
+        overflow: hidden;
+        background-color: white;
+        box-shadow: 0 2px 5px rgba(0,0,0,0.05);
+        height: 100%;
+        display: flex;
+        flex-direction: column;
+        width: 100%;
+        max-width: 100%;
+        padding-top: 0;
+        margin-top: 0;
+    }
+    
+    .history-card-content {
+        padding: 10px;
+        flex-grow: 1;
+    }
+    
+    .history-card-toolbar {
+        display: flex;
+        justify-content: space-between;
+        padding: 8px;
+        background-color: #f8f9fa;
+        border-top: 1px solid #e0e0e0;
+    }
+    
+    /* Ensure videos and images display consistently */
+    .history-card video, .history-card img,
+    .history-card [data-testid="stVideo"] video,
+    .history-card [data-testid="stImage"] img {
+        width: 100% !important;
+        max-height: 250px !important;
+        object-fit: contain !important;
+        background-color: #f0f0f0;
+    }
+    
+    /* Control video width */
+    .history-card [data-testid="stVideo"] {
+        width: 100% !important;
+        max-width: 100% !important;
+    }
+    
+    /* Style markdown content in cards for better readability */
+    .history-card [data-testid="stMarkdownContainer"] p {
+        margin: 5px 0;
+        font-size: 0.9rem;
+    }
+    
+    .history-card [data-testid="stMarkdownContainer"] strong {
+        color: #555;
+    }
+    
+    /* Fix width consistency issues */
+    .stApp {
+        max-width: 100%;
+    }
+    
+    /* Ensure all containers have consistent width */
+    .stButton, .stButton > button, .stSpinner {
+        width: 100% !important;
+        max-width: 100% !important;
+    }
+    
+    /* Ensure notification banners have consistent width */
+    [data-testid="stNotificationContent"] {
+        width: 100% !important;
+        max-width: 100% !important;
+    }
+    
+    /* Center all generated output */
+    [data-testid="column"] > div {
+        width: 100% !important;
+    }
+    
+    /* Overall app simplification */
+    .streamlit-container {
+        max-width: 100%;
+    }
+    
+    /* Simplified UI approach */
+    .simplified-card {
+        background-color: #f9f9f9;
+        border-radius: 8px;
+        padding: 15px;
+        margin-bottom: 15px;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+    }
+    
+    /* Reduce visual clutter */
+    .streamlit-expanderHeader {
+        font-size: 0.9rem !important;
+        font-weight: normal !important;
+        color: #555 !important;
+    }
+    
+    /* Simplify form controls */
+    .stSlider, .stSelectbox {
+        margin-top: 0 !important;
+        margin-bottom: 0.5rem !important;
+    }
+    
+    /* More subtle info messages */
+    .stAlert {
+        padding: 0.5rem !important;
+        margin-top: 0.5rem !important;
+        margin-bottom: 0.5rem !important;
+    }
+    
+    /* Cleaner text areas */
+    .stTextArea > div > div {
+        border-radius: 6px !important;
+        border-color: #ddd !important;
+    }
+    
+    /* Cleaner expandable sections */
+    div[data-testid="stExpander"] {
+        border: none !important;
+        box-shadow: none !important;
+        background-color: #f9f9f9 !important;
+        margin-bottom: 0.5rem !important;
+    }
+    
+    /* More explicit control for videos in history cards */
+    .history-card iframe,
+    .history-card [data-testid="stVideo"] iframe {
+        max-width: 100% !important;
+        width: 100% !important;
+        height: auto !important;
+        max-height: 250px !important;
+    }
+    
+    /* Ensure streamlit element containers in history cards don't exceed card width */
+    .history-card .element-container,
+    .history-card .stVideo,
+    .history-card .stImage {
+        width: 100% !important;
+        max-width: 100% !important;
+    }
+    
+    /* Remove video/image overflow */
+    .history-card > div {
+        width: 100% !important;
+        max-width: 100% !important;
+        overflow: hidden !important;
+    }
+    
+    /* App-wide Styling */
+    .sidebar-section {
+        margin-bottom: 20px;
+        padding-bottom: 20px;
+        border-bottom: 1px solid #e6e6e6;
+    }
+    
+    .sidebar-title {
+        font-weight: bold;
+        margin-bottom: 10px;
+    }
+    
+    /* Video Container Styling */
+    .video-container {
+        position: relative;
+        width: 100%;
+        max-width: 640px;
+        margin: 0 auto 20px auto;
+        border-radius: 10px;
+        overflow: hidden;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        max-height: calc(100vh - 200px); /* Limit height to viewport minus some space */
+    }
+    
+    /* Special handling for vertical (9:16) videos */
+    .video-container.vertical {
+        max-width: 360px; /* Narrower width for vertical videos */
+        max-height: calc(100vh - 200px); /* Ensure it fits in viewport height */
+    }
+    
+    .video-container video {
+        width: 100%;
+        display: block;
+        max-height: calc(100vh - 200px);
+        object-fit: contain;
+    }
+    
+    /* History Tab Styling */
+    .history-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 20px;
+        margin-bottom: 30px;
+    }
+    
+    .history-card {
+        padding: 15px;
+        border-radius: 10px;
+        background-color: #f9f9f9;
+        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
+        height: 100%;
+        display: flex;
+        flex-direction: column;
+    }
+    
+    .history-card img, .history-card video {
+        width: 100%;
+        border-radius: 8px;
+        margin-bottom: 10px;
+        max-height: 300px;
+        object-fit: contain;
+    }
+    
+    .history-prompt {
+        margin: 10px 0;
+        font-size: 0.9rem;
+        color: #555;
+        max-height: 100px;
+        overflow-y: auto;
+    }
+    
+    .history-meta {
+        font-size: 0.8rem;
+        color: #777;
+        margin-top: auto;
+    }
+    
+    .button-row {
+        display: flex;
+        justify-content: space-between;
+        margin-top: 10px;
+        gap: 10px;
+    }
+    
+    .button-row > button, .button-row > a {
+        flex: 1;
+    }
+    
+    /* Settings Tab Styling */
+    .settings-section {
+        margin-bottom: 30px;
+        padding-bottom: 20px;
+        border-bottom: 1px solid #e6e6e6;
+    }
+    
+    .settings-title {
+        font-weight: bold;
+        margin-bottom: 15px;
+    }
+    
+    /* Make fullscreen images/videos more constrained */
+    .fullscreen-content img, .fullscreen-content video {
+        max-width: 100%;
+        max-height: calc(100vh - 200px);
+        margin: 0 auto;
+        display: block;
+        object-fit: contain;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# App state initialization
+def init_state():
+    """Initialize all session state variables."""
+    logger.start_section("Initializing App State")
+    
+    # Add dark mode state
+    if "dark_mode" not in st.session_state:
+        logger.info("Initializing 'dark_mode' in session state")
+        st.session_state.dark_mode = False
+        
+    # Initialize session state variables if they don't exist
+    if "generated_videos" not in st.session_state:
+        logger.info("Initializing 'generated_videos' in session state")
+        st.session_state.generated_videos = []
+    
+    if "history_loaded" not in st.session_state:
+        logger.info("Initializing 'history_loaded' in session state")
+        st.session_state.history_loaded = False
+        
+    if "history_initialized" not in st.session_state:
+        logger.info("Initializing 'history_initialized' in session state")
+        st.session_state.history_initialized = False
+    
+    if "confirm_clear_history" not in st.session_state:
+        logger.debug("Initializing 'confirm_clear_history' in session state")
+        st.session_state.confirm_clear_history = False
+    
+    if "generated_prompt" not in st.session_state:
+        logger.debug("Initializing 'generated_prompt' in session state")
+        st.session_state.generated_prompt = None
+    
+    if "active_tab" not in st.session_state:
+        logger.debug("Initializing 'active_tab' in session state")
+        st.session_state.active_tab = "text_to_video"
+    
+    # Initialize image-related session variables
+    if "current_image" not in st.session_state:
+        logger.debug("Initializing 'current_image' in session state")
+        st.session_state.current_image = None
+        
+    if "current_uploaded_file" not in st.session_state:
+        logger.debug("Initializing 'current_uploaded_file' in session state")
+        st.session_state.current_uploaded_file = None
+        
+    if "current_image_url" not in st.session_state:
+        logger.debug("Initializing 'current_image_url' in session state")
+        st.session_state.current_image_url = ""
+        
+    if "last_entered_prompt" not in st.session_state:
+        logger.debug("Initializing 'last_entered_prompt' in session state")
+        st.session_state.last_entered_prompt = ""
+    
+    # Add cache for signed URLs
+    if "signed_url_cache" not in st.session_state:
+        logger.info("Initializing 'signed_url_cache' in session state")
+        st.session_state.signed_url_cache = {}
+    
+    # Ensure the history file exists in GCS, but only do this once per session
+    if not st.session_state.get('history_initialized', False):
+        # History is now managed in Firestore. The collection will be created on first write.
+        # We just need to mark the state as initialized to avoid re-checks.
+        logger.info("History tracking is configured for Firestore.")
+        st.session_state.history_initialized = True
+        # Force history to be loaded freshly on first run
+        st.session_state.history_loaded = False
+    
+    logger.end_section()
+
+def main():
+    """Main function to run the Streamlit app."""
+    logger.start_section("App Initialization")
+    
+    # Initialize session state
+    init_state()
+    
+    # Define Dark Mode CSS
+    DARK_MODE_CSS = """
+    <style>
+        /* General Dark Mode Styles */
+        body, .main, .stApp, .st-emotion-cache-z5fcl4, [data-testid="stAppViewContainer"] {
+            background-color: #0e1117 !important;
+            color: #fafafa !important;
+        }
+        h1, h2, h3, h4, h5, h6 {
+            color: #fafafa !important;
+        }
+
+        /* Sidebar */
+        [data-testid="stSidebar"] > div:first-child {
+            background-color: #1a1c22 !important;
+            border-right: 1px solid #31333F;
+        }
+        .sidebar-section {
+            border-bottom: 1px solid #31333F;
+        }
+
+        /* Cards and Containers */
+        .card, .simplified-card, .history-card, .image-preview-container, .upload-container, div[data-testid="stExpander"], .image-preview {
+            background-color: #1c1c1c !important;
+            border: 1px solid #31333F !important;
+            color: #fafafa;
+            box-shadow: none !important;
+        }
+        .history-card-toolbar {
+            background-color: #262730 !important;
+            border-top: 1px solid #31333F !important;
+        }
+
+        /* Widgets */
+        .stTextInput > div > div > input, 
+        .stNumberInput > div > div > input,
+        .stTextArea > div > div > textarea,
+        .stSelectbox div[data-baseweb="select"] > div {
+            background-color: #262730 !important;
+            color: #fafafa !important;
+            border-color: #4d4d4d !important;
+        }
+
+        /* Tabs */
+        .stTabs [data-baseweb="tab-list"] {
+            border-bottom-color: #31333F !important;
+        }
+        .stTabs [data-baseweb="tab"][aria-selected="true"] {
+            color: #fafafa;
+            background-color: #262730;
+        }
+
+        /* History and Media */
+        .history-card video, .history-card img {
+            background-color: #262730 !important;
+        }
+        .history-meta, .history-prompt { color: #a0a0a0; }
+        .history-card [data-testid="stMarkdownContainer"] strong { color: #cccccc; }
+        
+        /* Alerts */
+        .stAlert { background-color: #262730 !important; }
+         /* --- Start: Sidebar Collapse Arrow Fix for Dark Mode --- */
+         section[data-testid="stSidebar"][aria-collapsed="true"] button[data-testid="stSidebarCollapseButton"] {
+             background-color: #1a1c22; /* Dark mode background */
+         }
+
+         /* Hover effect for the button in dark mode */
+         section[data-testid="stSidebar"][aria-collapsed="true"] button[data-testid="stSidebarCollapseButton"]:hover {
+             background-color: #262730;
+         }
+
+         /* Ensure arrow icon is visible in dark mode */
+         section[data-testid="stSidebar"][aria-collapsed="true"] button[data-testid="stSidebarCollapseButton"] svg {
+             fill: #fafafa; /* White arrow */
+             opacity: 1;
+         }
+         /* --- End: Sidebar Collapse Arrow Fix for Dark Mode --- */
+    </style>
+    """
+
+    # Apply dark mode if toggled
+    if st.session_state.get("dark_mode", False):
+        st.markdown(DARK_MODE_CSS, unsafe_allow_html=True)
+        
+    # Sidebar for configuration
+    with st.sidebar:
+        # App title
+        st.markdown("## ⚙️ Settings")
+        
+        # Google Cloud Settings
+        st.markdown('<div class="sidebar-section">', unsafe_allow_html=True)
+        st.markdown("### Google Cloud Settings")
+        
+        # Project ID
+        project_id = st.text_input(
+            "Project ID", 
+            value=config.PROJECT_ID,
+            help="Your Google Cloud Project ID"
+        )
+        
+        
+        # Update session state for project ID if changed
+        if "project_id" not in st.session_state or st.session_state.project_id != project_id:
+            st.session_state.project_id = project_id
+            logger.info(f"Updated project_id in session state: {project_id}")
+        
+        # Storage URI
+        storage_uri = st.text_input(
+            "Storage URI", 
+            value=config.STORAGE_URI,
+            help="GCS URI for storing generated videos (gs://bucket-name)"
+        )
+        
+        # Update session state for storage URI if changed
+        if "storage_uri" not in st.session_state or st.session_state.storage_uri != storage_uri:
+            st.session_state.storage_uri = storage_uri
+            logger.info(f"Updated storage_uri in session state: {storage_uri}")
+        
+        st.markdown('</div>', unsafe_allow_html=True)
+        
+        # Advanced Settings in a cleaner collapsible section
+        st.markdown('<div class="sidebar-section">', unsafe_allow_html=True)
+        st.markdown("### Advanced Settings")
+        
+        with st.expander("API Options", expanded=False):
+            # Polling settings
+            st.markdown("#### Polling Settings")
+            wait_for_completion = st.checkbox(
+                "Wait for completion", 
+                value=config.DEFAULT_WAIT_FOR_COMPLETION,
+                help="Wait for the video to complete generation"
+            )
+            
+            # Update session state
+            if "wait_for_completion" not in st.session_state or st.session_state.wait_for_completion != wait_for_completion:
+                st.session_state.wait_for_completion = wait_for_completion
+            
+            if wait_for_completion:
+                col1, col2 = st.columns(2)
+                with col1:
+                    poll_interval = st.number_input(
+                        "Poll interval (seconds)", 
+                        min_value=1, 
+                        max_value=60, 
+                        value=config.DEFAULT_POLL_INTERVAL,
+                        help="How often to check for completion"
+                    )
+                    
+                    # Update session state
+                    if "poll_interval" not in st.session_state or st.session_state.poll_interval != poll_interval:
+                        st.session_state.poll_interval = poll_interval
+                
+                with col2:
+                    max_poll_attempts = st.number_input(
+                        "Max poll attempts", 
+                        min_value=1, 
+                        max_value=100, 
+                        value=config.DEFAULT_MAX_POLL_ATTEMPTS,
+                        help="Max number of times to check for completion"
+                    )
+                    
+                    # Update session state
+                    if "max_poll_attempts" not in st.session_state or st.session_state.max_poll_attempts != max_poll_attempts:
+                        st.session_state.max_poll_attempts = max_poll_attempts
+        
+        with st.expander("Display Options", expanded=False):
+            # Display settings
+            show_full_response = st.checkbox(
+                "Show API responses", 
+                value=config.DEFAULT_SHOW_FULL_RESPONSE,
+                help="Display the full API response JSON"
+            )
+            
+            # Update session state
+            if "show_full_response" not in st.session_state or st.session_state.show_full_response != show_full_response:
+                st.session_state.show_full_response = show_full_response
+            
+            enable_streaming = st.checkbox(
+                "Enable video streaming", 
+                value=config.DEFAULT_ENABLE_STREAMING,
+                help="Stream videos directly from Google Cloud Storage"
+            )
+            
+            # Update session state
+            if "enable_streaming" not in st.session_state or st.session_state.enable_streaming != enable_streaming:
+                st.session_state.enable_streaming = enable_streaming
+            
+            # Debug mode
+            debug_mode = st.checkbox(
+                "Debug Mode", 
+                value=config.DEBUG_MODE,
+                help="Show detailed logging information"
+            )
+            
+            # Update session state and logger config
+            if "debug_mode" not in st.session_state or st.session_state.debug_mode != debug_mode:
+                st.session_state.debug_mode = debug_mode
+                logger.debug_mode = debug_mode
+        
+        # Add a reset button for clearing current session data (but not history)
+        st.markdown('</div>', unsafe_allow_html=True)
+        st.markdown('<div class="sidebar-section">', unsafe_allow_html=True)
+        st.markdown("### Reset Current Session")
+        
+        if st.button("🔄 Reset Current Image", help="Clear the current image data without affecting history"):
+            # Clear current image-related data from session state
+            keys_to_clear = [
+                'current_image', 
+                'current_uploaded_file', 
+                'current_image_url',
+                'generated_prompt',
+                'last_entered_prompt'
+            ]
+            
+            for key in keys_to_clear:
+                if key in st.session_state:
+                    del st.session_state[key]
+            
+            # Don't delete image_prompt directly as it's linked to a widget
+            # Instead set it back to the default
+            if 'image_prompt' in st.session_state:
+                st.session_state.image_prompt = config.DEFAULT_IMAGE_PROMPT
+                
+            # Reset active tab tracking
+            if 'active_upload_tab' in st.session_state:
+                st.session_state.active_upload_tab = 0
+            
+            st.success("✅ Current image data has been cleared. You can now upload a new image.")
+            # Add small delay to ensure the success message is seen
+            time.sleep(0.5)
+            # Rerun to refresh the UI
+            st.rerun()
+        
+        st.info("Use this to clear the current image without affecting your history.")
+        st.markdown('</div>', unsafe_allow_html=True)
+        
+        # Display configuration summary if in debug mode
+        if debug_mode:
+            with st.expander("Current Configuration", expanded=False):
+                st.write("Project ID:", project_id)
+                st.write("Storage URI:", storage_uri)
+                st.write("Wait for completion:", wait_for_completion)
+                if wait_for_completion:
+                    st.write("Poll interval:", poll_interval)
+                    st.write("Max poll attempts:", max_poll_attempts)
+                st.write("Show full response:", show_full_response)
+                st.write("Enable streaming:", enable_streaming)
+                st.write("Session State Keys:", list(st.session_state.keys()))
+    
+    # Check for critical configuration issues
+    if not project_id:
+        st.error("⚠️ Project ID is required. Please set it in the sidebar.")
+        logger.error("Project ID is missing")
+        return
+    
+    if not storage_uri and st.session_state.active_tab != "text_to_video":
+        st.warning("⚠️ Storage URI is required for image-to-video generation and history features.")
+        logger.warning("Storage URI is missing")
+    
+    # Add a file change notification at the top
+    # st.caption(f"App last updated: {time.strftime('%Y-%m-%d')}")
+    
+    # Main content area with tabs - simple approach without extra complexity
+    title_col, toggle_col = st.columns([5, 1])
+    with title_col:
+        st.title("AI Media Generator")
+    with toggle_col:
+        # Add some padding to vertically align the toggle with the title
+        st.markdown('<div style="padding-top: 1.5rem;"></div>', unsafe_allow_html=True)
+        st.toggle("🌙 Dark Mode", key="dark_mode", help="Toggle between light and dark themes.")
+
+    # Create tabs without using the active_tab logic which might be causing issues
+    tab1, tab2, tab_t2i, tab3, tab4, tab5, tab6 = st.tabs([
+        "🎬 Text-to-Video", "🖼️ Image-to-Video", "🎨 Text-to-Image",
+        "🎵 Text-to-Audio", "🎤 Text-to-Voiceover", "✂️ Video Editing", "📋 History"
+    ])
+
+    # Display content for each tab without conditional logic
+    with tab1:
+        text_to_video_tab()
+
+    with tab2:
+        image_to_video_tab()
+
+    with tab_t2i:
+        text_to_image_tab()
+
+    with tab3:
+        text_to_audio_tab()  # Add this function
+
+    with tab4:
+        text_to_voiceover_tab()  # Add this function
+
+    with tab5:
+        video_editing_tab()
+
+    with tab6:
+        history_tab()
+
+    # Remove the footer which might be causing spacing issues
+    # st.markdown('<div class="footer">', unsafe_allow_html=True)
+    # st.markdown('Veo2 Video Generator • Built with Streamlit • Powered by Google Cloud')
+    # st.markdown('</div>', unsafe_allow_html=True)
+    
+    logger.end_section()
+
+def text_to_image_tab():
+    """Text-to-Image generation tab."""
+    st.header("Text-to-Image Generation with Imagen")
+
+    prompt = st.text_area(
+        "Prompt",
+        value="A majestic lion with a glowing mane, standing on a cliff overlooking a futuristic city at sunset, cinematic lighting.",
+        height=100,
+        help="Describe the image you want to generate.",
+        key="t2i_prompt"
+    )
+
+    col1, col2 = st.columns(2)
+    with col1:
+        model = st.selectbox(
+            "Model",
+            # Using placeholder names as requested. User can change if needed.
+            options=["imagen-3.0-generate-002","imagen-3.0-fast-generate-001", "imagen-4.0-fast-generate-preview-06-06", "imagen-4.0-generate-preview-06-06"],
+            index=0,
+            help="Choose the Imagen model for generation.",
+            key="t2i_model"
+        )
+    with col2:
+        aspect_ratio = st.selectbox(
+            "Aspect Ratio",
+            options=["1:1", "9:16", "16:9", "3:4", "4:3"],
+            index=0,
+            help="Choose the aspect ratio of the generated image.",
+            key="t2i_aspect_ratio"
+        )
+
+    sample_count = st.slider(
+        "Number of Images",
+        min_value=1,
+        max_value=4,
+        value=1,
+        help="How many image variations to generate.",
+        key="t2i_sample_count"
+    )
+
+    enhance_prompt = st.checkbox(
+        "Enhance Prompt",
+        value=True,
+        help="Use Gemini to enhance your prompt.",
+        key="t2i_enhance_prompt"
+    )
+
+
+    with st.expander("Advanced Options"):
+        negative_prompt = st.text_area(
+            "Negative Prompt",
+            value="blurry, low quality, ugly, deformed, text, watermark",
+            help="Describe what to avoid in the image.",
+            key="t2i_negative_prompt"
+        )
+
+        col1_adv, col2_adv = st.columns(2)
+        with col1_adv:
+            person_generation = st.selectbox(
+                "Person Generation",
+                options=["Allow (All ages)", "Allow (Adults only)", "Don't Allow"],
+                index=0,
+                help="Allow or disallow the generation of human faces.",
+                key="t2i_person_generation"
+            )
+
+        with col2_adv:
+            safety_filter_threshold = st.selectbox(
+                "Safety Filter Strength",
+                options=["block_most", "block_few", "block_some",],
+                index=2,
+                help="Set the threshold for safety filters.",
+                key="t2i_safety_threshold"
+            )
+
+    if st.button("🎨 Generate Image", key="t2i_generate", type="primary"):
+        generate_image(
+            project_id=st.session_state.get("project_id", config.PROJECT_ID),
+            prompt=prompt,
+            model=model,
+            negative_prompt=negative_prompt,
+            sample_count=sample_count,
+            aspect_ratio=aspect_ratio,
+            seed=None, # Seed not exposed in this UI for simplicity
+            person_generation=person_generation,
+            safety_filter_level=safety_filter_threshold,
+            enhance_prompt=enhance_prompt,
+            storage_uri=st.session_state.get("storage_uri", config.STORAGE_URI),
+        )
+
+def text_to_video_tab():
+    """Text-to-Video generation tab."""
+    st.header("Text-to-Video Generation")
+    
+    # Text prompt
+    prompt = st.text_area(
+        "Prompt", 
+        value=config.DEFAULT_TEXT_PROMPT,
+        height=100,
+        help="Describe the video you want to generate",
+        key="text_prompt"
+    )
+
+    model = st.selectbox(
+        "Model",
+        options=["veo-2.0-generate-001", "veo-3.0-generate-preview"],  # Assuming these are the model IDs
+        index=0,  # Default to Veo 2
+        help="Choose the video generation model (Veo 2 or Veo 3)",
+        key="text_model"
+    )
+
+    # Audio and resolution options (Veo 3.0 only)
+    enable_audio = st.checkbox("Add Audio", value=False if model == "veo-2.0-generate-001" else True, disabled=model != "veo-3.0-generate-preview", key="text_enable_audio")
+    resolution = st.selectbox("Resolution", options=["720p"] if model == "veo-2.0-generate-001" else ["720p", "1080p"], index=0, disabled=model != "veo-3.0-generate-preview", key="text_resolution")
+
+    
+    # Video settings
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        aspect_ratio = st.selectbox(
+            "Aspect Ratio", 
+            options=["16:9"] if model == "veo-3.0-generate-preview" else ["16:9", "9:16"],
+            index=0,
+            disabled=(model == "veo-3.0-generate-preview"),
+            help="Choose landscape (16:9) or portrait (9:16) orientation. Veo 3.0 is fixed to 16:9.",
+            key="text_aspect_ratio"
+        )
+    with col2:
+        duration = st.slider(
+            "Duration (seconds)", 
+            min_value=5, 
+            max_value=8,
+            value=config.DEFAULT_DURATION_SECONDS,
+            help="Length of the generated video",
+            key="text_duration"
+        )
+    with col3:
+        sample_count = st.slider(
+            "Number of Videos", 
+            min_value=1, 
+            max_value=4,
+            value=config.DEFAULT_SAMPLE_COUNT,
+            help="Generate multiple variations (requires storage_uri)",
+            key="text_sample_count"
+        )
+    
+    # Advanced options
+    with st.expander("Advanced Options"):
+        negative_prompt = st.text_area(
+            "Negative Prompt", 
+            value=config.DEFAULT_NEGATIVE_PROMPT,
+            height=100,
+            help="Describe what you want to avoid in the video",
+            key="text_negative_prompt"
+        )
+            
+        col1, col2 = st.columns(2)
+        with col1:
+            person_generation = st.selectbox(
+                "Person Generation", 
+                options=["allow_adult", "disallow"],
+                index=0,
+                help="Safety setting for people/faces",
+                key="text_person_generation"
+            )
+        with col2:
+            enhance_prompt = st.checkbox(
+                "Enhance Prompt",
+                value=True,
+                help="Use Gemini to enhance your prompt",
+                key="text_enhance_prompt"
+            )
+        
+        seed = st.number_input(
+            "Seed",
+            min_value=0,
+            max_value=4294967295,
+            value=None,
+            help="Optional seed for deterministic generation",
+            key="text_seed"
+        )
+        if seed is not None and seed == 0:
+            seed = None  # Treat 0 as None
+    
+    # Generate button
+
+    if st.button("🚀 Generate Video", key="text_generate"):
+        generate_video(
+            project_id=st.session_state.get("project_id", config.PROJECT_ID),
+            prompt=prompt,
+            input_image=None,
+            aspect_ratio=aspect_ratio,
+            negative_prompt=negative_prompt,
+            person_generation=person_generation,
+            resolution=resolution,
+            enable_audio=enable_audio,
+            model=model,  # Pass the selected model
+            sample_count=sample_count,
+            seed=seed,
+            storage_uri=st.session_state.get("storage_uri", config.STORAGE_URI),
+            duration_seconds=duration,
+            enhance_prompt=enhance_prompt,
+            wait_for_completion=st.session_state.get("wait_for_completion", True),
+            poll_interval=st.session_state.get("poll_interval", config.DEFAULT_POLL_INTERVAL),
+            max_attempts=st.session_state.get("max_poll_attempts", config.DEFAULT_MAX_POLL_ATTEMPTS),
+            show_full_response=st.session_state.get("show_full_response", False),
+            enable_streaming=st.session_state.get("enable_streaming", True),
+        )
+
+def text_to_audio_tab():
+    """Text-to-Audio generation tab."""
+    st.header("Text-to-Audio Generation")
+
+    # Text prompt for audio
+    prompt = st.text_area(
+        "Prompt",
+        value="A futuristic synthwave track with a driving bassline and atmospheric pads.",
+        height=100,
+        help="Describe the audio you want to generate",
+        key="audio_prompt"
+    )
+
+    # Number of results slider
+    # sample_count = st.slider(
+    #     "Number of Results",
+    #     min_value=1,
+    #     max_value=4,
+    #     value=1,
+    #     help="Generate multiple audio variations",
+    #     key="audio_sample_count"
+    # )
+
+    # Seed input and Sample count interaction
+    # seed_disabled = sample_count > 1
+    # seed_help_text = "Optional seed for deterministic generation"
+    # if seed_disabled:
+    #     seed_help_text += " (disabled for more than one sample)"
+    seed = st.number_input(
+        "Seed",
+        min_value=0,
+        max_value=4294967295,
+        value=None,
+        # help=seed_help_text,
+        key="audio_seed",
+        # disabled=seed_disabled
+    )
+    if seed is not None and seed == 0:
+        seed = None  # Treat 0 as None
+
+    # Disable sample count if seed is provided
+    sample_count_disabled = seed is not None
+
+    # Advanced options for audio
+    with st.expander("Advanced Options"):
+        negative_prompt = st.text_area(
+            "Negative Prompt",
+            value="low quality, muffled, distorted",
+            help="Describe sounds or qualities to avoid",
+            key="audio_negative_prompt"
+        )
+
+    base_uri = st.session_state.get("storage_uri", config.STORAGE_URI)
+
+    # Generate button 
+    if st.button("🎵 Generate Audio", key="audio_generate"):
+        generate_audio(
+            project_id=st.session_state.get("project_id", config.PROJECT_ID),
+            prompt=prompt,
+            sample_count=1,
+            negative_prompt=negative_prompt,
+            seed=seed,
+            storage_uri=f"{base_uri.rstrip('/')}/generated_audio/",
+            wait_for_completion=st.session_state.get("wait_for_completion", True),
+            poll_interval=st.session_state.get("poll_interval", config.DEFAULT_POLL_INTERVAL),
+            max_attempts=st.session_state.get("max_poll_attempts", config.DEFAULT_MAX_POLL_ATTEMPTS),
+            show_full_response=st.session_state.get("show_full_response", False),
+            enable_streaming=st.session_state.get("enable_streaming", True),
+    )
+
+
+def text_to_voiceover_tab():
+    """Text-to-Voiceover generation tab based on the provided UI image."""
+    st.header("Generate Speech")
+
+    # --- Initialize State ---
+    if 'voiceover_dialogs' not in st.session_state:
+        st.session_state.voiceover_dialogs = [
+            {
+                "id": 1,
+                "name": "Speaker 1",
+                "text": "Hello! We're excited to show you our native speech capabilities",
+                "voice": "Zar"
+            },
+            {
+                "id": 2,
+                "name": "Speaker 2",
+                "text": "Where you can direct a voice, create realistic dialog, and so much more. Edit these placeholders to get started.",
+                "voice": "Puck"
+            }
+        ]
+    if 'voiceover_mode' not in st.session_state:
+        st.session_state.voiceover_mode = 'Multi-speaker audio'
+    if 'next_speaker_id' not in st.session_state:
+        st.session_state.next_speaker_id = 3
+    if 'voiceover_run_setting' not in st.session_state:
+        st.session_state.voiceover_run_setting = "gemini-2.5-flash-preview-tts"
+
+    # Define available voices
+    VOICE_OPTIONS = ["Zar", "Puck", "Chirp", "Echo", "Onyx", "Nova", "Alloy", "Fable", "Shimmer"]
+
+    # --- Main Layout ---
+    left_col, right_col = st.columns(2)
+
+    with left_col:
+        st.subheader("Script builder")
+
+        # Style instructions
+        style_instructions = st.text_area(
+            "Style instructions",
+            "Read aloud in a warm, welcoming tone.",
+            height=100,
+            key="voiceover_style"
+        )
+
+        # Handle single vs. multi-speaker mode for script input
+        if st.session_state.voiceover_mode == 'Single-speaker audio':
+            # If there's more than one speaker, consolidate their text
+            if len(st.session_state.voiceover_dialogs) > 1:
+                full_text = "\n".join([d['text'] for d in st.session_state.voiceover_dialogs])
+                # Keep the first speaker's settings but update the text
+                st.session_state.voiceover_dialogs = [st.session_state.voiceover_dialogs[0]]
+                st.session_state.voiceover_dialogs[0]['text'] = full_text
+            
+            # Display single text area
+            st.session_state.voiceover_dialogs[0]['text'] = st.text_area(
+                "Script",
+                value=st.session_state.voiceover_dialogs[0]['text'],
+                height=250,
+                key="single_speaker_text"
+            )
+
+        else: # Multi-speaker mode
+            # Dynamically display dialog entries
+            for i, dialog in enumerate(st.session_state.voiceover_dialogs):
+                with st.container(border=True):
+                    col1, col2 = st.columns([0.9, 0.1])
+                    with col1:
+                        st.markdown(f"**{dialog['name']}**")
+                    with col2:
+                        # Add a delete button, but not for the last remaining speaker
+                        if len(st.session_state.voiceover_dialogs) > 1:
+                            if st.button("✖", key=f"delete_{dialog['id']}", help="Remove this dialog"):
+                                st.session_state.voiceover_dialogs.pop(i)
+                                st.rerun()
+                    
+                    # Text input for the dialog
+                    new_text = st.text_area(
+                        "Dialog",
+                        value=dialog['text'],
+                        key=f"text_{dialog['id']}",
+                        label_visibility="collapsed"
+                    )
+                    st.session_state.voiceover_dialogs[i]['text'] = new_text
+
+            # "Add dialog" button
+            if st.button("➕ Add dialog"):
+                new_speaker_id = st.session_state.next_speaker_id
+                st.session_state.voiceover_dialogs.append({
+                    "id": new_speaker_id,
+                    "name": f"Speaker {new_speaker_id}",
+                    "text": "",
+                    "voice": VOICE_OPTIONS[0]
+                })
+                st.session_state.next_speaker_id += 1
+                st.rerun()
+
+    with right_col:
+        st.subheader("Settings")
+
+        # Run setting selection
+        st.session_state.voiceover_run_setting = st.selectbox(
+            "Run setting",
+            options=["gemini-2.5-flash-preview-tts", "gemini-2.5-pro-preview-tts"],
+            key="voiceover_run_select",
+            help="Choose the Text-to-Speech model for generation."
+        )
+
+        # Mode selection
+        st.session_state.voiceover_mode = st.radio(
+            "Mode",
+            ['Single-speaker audio', 'Multi-speaker audio'],
+            index=1 if st.session_state.voiceover_mode == 'Multi-speaker audio' else 0,
+            key="voiceover_mode_radio",
+            horizontal=True
+        )
+
+        # --- Voice Settings ---
+        st.markdown("##### Voice settings")
+        if st.session_state.voiceover_mode == 'Single-speaker audio':
+            # Ensure there's at least one speaker to configure
+            if not st.session_state.voiceover_dialogs:
+                 st.session_state.voiceover_dialogs.append({
+                    "id": 1, "name": "Speaker 1", "text": "", "voice": VOICE_OPTIONS[0]
+                })
+            
+            # Display settings for the single speaker
+            speaker = st.session_state.voiceover_dialogs[0]
+            with st.container(border=True):
+                col1, col2 = st.columns(2)
+                with col1:
+                    speaker['name'] = st.text_input("Name", value=speaker['name'], key="name_single")
+                with col2:
+                    speaker['voice'] = st.selectbox("Voice", VOICE_OPTIONS, index=VOICE_OPTIONS.index(speaker['voice']), key="voice_single")
+
+        else: # Multi-speaker mode
+            for i, dialog in enumerate(st.session_state.voiceover_dialogs):
+                with st.container(border=True):
+                    st.markdown(f"**Speaker {i+1} settings**")
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        # Editable speaker name
+                        new_name = st.text_input("Name", value=dialog['name'], key=f"name_{dialog['id']}")
+                        st.session_state.voiceover_dialogs[i]['name'] = new_name
+                    with col2:
+                        # Voice selection
+                        current_voice = dialog.get('voice', VOICE_OPTIONS[0])
+                        if current_voice not in VOICE_OPTIONS:
+                            current_voice = VOICE_OPTIONS[0]
+                        voice_index = VOICE_OPTIONS.index(current_voice)
+                        new_voice = st.selectbox("Voice", VOICE_OPTIONS, index=voice_index, key=f"voice_{dialog['id']}")
+                        st.session_state.voiceover_dialogs[i]['voice'] = new_voice
+
+    st.divider()
+    # --- Bottom bar emulation ---
+    st.subheader("Script Templates")
+    template_cols = st.columns(4)
+    with template_cols[0]:
+        if st.button("🎙️ Podcast Intro"):
+            st.session_state.voiceover_mode = 'Multi-speaker audio'
+            st.session_state.voiceover_dialogs = [
+                {"id": 1, "name": "Host", "text": "Welcome back to Tech Forward, the podcast that looks at the future of technology. I'm your host, Alex.", "voice": "Alloy"},
+                {"id": 2, "name": "Co-host", "text": "And I'm Jordan. Today, we have a fascinating topic: the rise of generative AI in creative fields.", "voice": "Echo"}
+            ]
+            st.session_state.next_speaker_id = 3
+            st.rerun()
+
+    with template_cols[1]:
+        if st.button("🎬 Movie Scene"):
+            st.session_state.voiceover_mode = 'Multi-speaker audio'
+            st.session_state.voiceover_dialogs = [
+                {"id": 1, "name": "Detective K", "text": "The files... they're gone. Wiped clean. There's nothing left.", "voice": "Onyx"},
+                {"id": 2, "name": "Agent S", "text": "Nothing is ever truly gone. They left a trace. They always do.", "voice": "Fable"}
+            ]
+            st.session_state.next_speaker_id = 3
+            st.rerun()
+
+    with template_cols[2]:
+        if st.button("📢 Ad Read"):
+            st.session_state.voiceover_mode = 'Single-speaker audio'
+            st.session_state.voiceover_dialogs = [
+                {"id": 1, "name": "Announcer", "text": "Tired of slow internet? Upgrade to Quantum-Link today and experience speeds you've only dreamed of. Visit quantumlink.com to learn more.", "voice": "Nova"},
+            ]
+            st.session_state.next_speaker_id = 2
+            st.rerun()
+
+    # --- Run Button ---
+    if st.button("▶️ Run", type="primary", use_container_width=True):
+        try:
+            # Collect the style instructions
+            full_script = style_instructions + "\n"
+            
+            # Build the script based on mode
+            if st.session_state.voiceover_mode == 'Single-speaker audio':
+                speaker = st.session_state.voiceover_dialogs[0]
+                full_script += f"{speaker['name']}: {speaker['text']}"
+            else: # Multi-speaker
+                for dialog in st.session_state.voiceover_dialogs:
+                    full_script += f"{dialog['name']}: {dialog['text']}\n"
+
+            # Call the voiceover generation
+            with st.spinner("Generating voiceover..."):
+                # Call the external function from gemini_TTS_api.py
+                # The call is modified to use the new function structure.
+                # Assuming generate_voiceover() now takes the script as an argument
+                # and returns a list of local file paths.
+                voiceover_model = st.session_state.voiceover_run_setting
+                import apis.gemini_TTS_api as gemini_TTS_api
+                file_paths = gemini_TTS_api.generate_voiceover(full_script, voiceover_model)
+                if file_paths:
+                    st.success("Voiceover generated successfully!")
+                    print(f"File saved to to: {file_paths}")
+                    # Play each audio file
+                    base_uri = st.session_state.get("storage_uri", config.STORAGE_URI)
+                    # Construct a clean path for the voiceovers folder, avoiding the f-string syntax error.
+                    storage_uri = f"{base_uri.rstrip('/')}/voiceovers/"
+                    uploaded_uris = gemini_TTS_api.upload_audio_to_gcs(file_paths, storage_uri)
+                    if uploaded_uris:
+                        # Add to history
+                        if FIRESTORE_AVAILABLE:
+                            logger.info(f"Adding {len(uploaded_uris)} voice entries to Firestore history.")
+                            voice_params = {
+                                'model': voiceover_model,
+                                'mode': st.session_state.voiceover_mode,
+                                'style_instructions': style_instructions
+                            }
+                            for uri in uploaded_uris:
+                                try:
+                                    doc_ref = db.collection('history').document()
+                                    doc_ref.set({
+                                        'timestamp': firestore.SERVER_TIMESTAMP,
+                                        'type': 'voice',
+                                        'uri': uri,
+                                        'prompt': full_script, # The full script used for generation
+                                        'params': voice_params
+                                    })
+                                    logger.debug(f"Added voice {uri} to Firestore history.")
+                                except Exception as e:
+                                    logger.error(f"Could not add voice {uri} to history: {str(e)}")
+                        st.success("Files successfully uploaded to GCS")
+                        for i, uri in enumerate(uploaded_uris):
+                            with st.expander(f"Voiceover Segment {i + 1}", expanded=True):
+                                try:
+                                    st.markdown(f"**File URI:** {uri}")
+                                    st.audio(client.generate_signed_url(uri), format="audio/wav")
+                                except Exception as e:
+                                    st.error(f"Error playing or displaying audio: {str(e)}")                                   
+                    else:
+                        st.error("Failed to upload files to GCS.")
+                    
+                        with st.expander(f"Voiceover Segment {i + 1}", expanded=True):
+                            st.audio(file_paths)
+                else:
+                    st.error("Voiceover generation failed to return audio files.")
+
+                try:
+                    # Delete the temporary file
+                    os.remove(file_paths)
+                    print(f"Deleted temporary file: {file_paths}")
+                except Exception as e:
+                    st.error(f"Error deleting temporary audio file: {str(e)}")
+        except Exception as e:
+            st.error(f"An error occurred: {str(e)}")
+
+def video_editing_tab():
+    """Video editing features tab."""
+    st.header("Video Editing Tools")
+
+    BUCKET_NAME = None
+    storage_uri_config = st.session_state.get("storage_uri", config.STORAGE_URI)
+    if storage_uri_config and storage_uri_config.startswith("gs://"):
+        BUCKET_NAME = storage_uri_config.replace("gs://", "").split("/")[0]
+    else:
+        st.warning("A valid GCS Storage URI is required for video editing.")
+        return
+
+    edit_option = st.radio(
+        "Choose an editing tool:",
+        ("Concatenate Videos", "Change Playback Speed", "Frame Interpolation"),
+        horizontal=True,
+        key="video_edit_option"
+    )
+
+    if edit_option == "Concatenate Videos":
+        st.subheader("Concatenate Multiple Videos")
+        uploaded_videos = st.file_uploader(
+            "Upload videos to concatenate (MP4, MOV, AVI)",
+            type=["mp4", "mov", "avi"],
+            accept_multiple_files=True,
+            key="concat_videos"
+        )
+
+        if uploaded_videos and len(uploaded_videos) > 1:
+            if st.button("🔗 Concatenate Videos", type="primary"):
+                # Initialize variables to None before the try block for safe cleanup
+                temp_files, clips = [], []
+                output_filename, final_clip = None, None
+                with st.spinner("Concatenating and uploading..."):
+                    try:
+                        for uploaded_video in uploaded_videos:
+                            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
+                                tmp.write(uploaded_video.read())
+                                temp_files.append(tmp.name)
+
+                        clips = [VideoFileClip(f) for f in temp_files]
+                        final_clip = concatenate_videoclips(clips, method="compose")
+
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as out:
+                            final_clip.write_videofile(out.name, codec="libx264", audio_codec="aac", threads=4, preset="ultrafast")
+                            output_filename = out.name
+                        
+                        final_video_uri = video_upload_to_gcs(output_filename, BUCKET_NAME, "concatenated-video.mp4")
+                        
+                        if final_video_uri:
+                            signed_url = client.generate_signed_url(final_video_uri)
+                            st.subheader("Concatenated Video Preview")
+                            st.video(signed_url)
+                            if FIRESTORE_AVAILABLE:
+                                db.collection('history').add({
+                                    'timestamp': firestore.SERVER_TIMESTAMP,
+                                    'type': 'video',
+                                    'uri': final_video_uri,
+                                    'prompt': f'{len(uploaded_videos)} videos concatenated.',
+                                    'params': {'operation': 'concatenate_videos'}
+                                })
+                    except Exception as e:
+                        st.error(f"An error occurred during concatenation: {e}")
+                    finally:
+                        # Safely clean up all temporary files and moviepy clips
+                        if final_clip: final_clip.close()
+                        for clip in clips: clip.close()
+                        for f in temp_files:
+                            if os.path.exists(f): os.remove(f)
+                        if output_filename and os.path.exists(output_filename):
+                            os.remove(output_filename)
+
+                        # with open(output_filename, "rb") as f:
+                        #     video_bytes = f.read()
+
+                        # st.video(video_bytes)
+                        # st.download_button(
+                        #     label="Download Concatenated Video",
+                        #     data=video_bytes,
+                        #     file_name="concatenated_video.mp4",
+                        #     mime="video/mp4"
+                        # )
+
+                        # # Clean up
+                        # final_clip.close()
+                        # for clip in clips:
+                        #     clip.close()
+                        # os.remove(output_filename)
+                        # for f in temp_files:
+                        #     os.remove(f)
+
+                    # except Exception as e:
+                    #     st.error(f"An error occurred during concatenation: {e}")
+
+        elif uploaded_videos:
+            st.warning("Please upload at least two videos to concatenate.")
+
+    elif edit_option == "Change Playback Speed":
+        st.subheader("Alter Video Playback Speed")
+        uploaded_video = st.file_uploader(
+            "Upload a video to alter its speed (MP4, MOV, AVI)",
+            type=["mp4", "mov", "avi"],
+            key="speed_video"
+        )
+
+        if uploaded_video:
+            speed_factor = st.number_input(
+                "Playback Speed Factor",
+                min_value=0.1,
+                value=1.0,
+                step=0.1,
+                format="%.1f",
+                help="0.5 for half speed, 1.0 for normal, 2.0 for double speed."
+            )
+
+            if st.button("⏩ Apply Speed Change", type="primary"):
+                input_filename, output_filename = None, None
+                clip, final_clip = None, None
+                with st.spinner("Applying speed change and uploading..."):
+                    try:
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_in:
+                            tmp_in.write(uploaded_video.read())
+                            input_filename = tmp_in.name
+
+                        clip = VideoFileClip(input_filename)
+                        final_clip = clip.speedx(speed_factor)
+
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_out:
+                            final_clip.write_videofile(tmp_out.name, codec="libx264", audio_codec="aac", threads=4, preset="ultrafast")
+                            output_filename = tmp_out.name
+
+                        final_video_uri = video_upload_to_gcs(output_filename, BUCKET_NAME, f"speed-edited-{uploaded_video.name}")
+                        
+                        if final_video_uri:
+                            signed_url = client.generate_signed_url(final_video_uri)
+                            st.subheader("Edited Video Preview")
+                            st.video(signed_url)
+                            if FIRESTORE_AVAILABLE:
+                                db.collection('history').add({
+                                    'timestamp': firestore.SERVER_TIMESTAMP,
+                                    'type': 'video', 'uri': final_video_uri,
+                                    'prompt': f'Video speed changed by factor of {speed_factor}',
+                                    'params': {'operation': 'change_speed', 'factor': speed_factor}
+                                })
+                    except Exception as e:
+                        st.error(f"An error occurred: {e}")
+                    finally:
+                        # Safely clean up all temporary files and moviepy clips
+                        if clip: clip.close()
+                        if final_clip: final_clip.close()
+                        if input_filename and os.path.exists(input_filename): os.remove(input_filename)
+                        if output_filename and os.path.exists(output_filename): os.remove(output_filename)
+
+                    # except Exception as e:
+                    #     st.error(f"An error occurred while changing speed: {e}")
+
+
+    elif edit_option == "Frame Interpolation":
+        st.subheader("Frame Interpolation")
+        st.markdown("Upload pairs of images with 'imgName_first_slate' or 'imgName_last_slate' as filenames")
+        uploaded_images = st.file_uploader(
+            "Upload images for frame interpolation (JPG, PNG, JPEG)",
+            type=["jpg", "png", "jpeg"],
+            accept_multiple_files=True,
+            key="interpolate_images"
+        )
+
+        if uploaded_images and len(uploaded_images) > 1:
+            st.write(f"{len(uploaded_images)} images selected:")
+            for image in uploaded_images:
+                st.write(f"- {image.name}")
+
+            playback_speed_factor = st.number_input(
+                "Playback Speed Factor",
+                min_value=0.1,
+                value=1.0,
+                step=0.1,
+                format="%.1f",
+                help="0.5 for half speed, 1.0 for normal, 2.0 for double speed."
+            )
+
+            interpolation_prompt = st.text_area(
+                "Prompt",
+                value="Seamlessly transition from the first frame to last frame.",
+                height=100,
+                help="Describe the audio you want to generate",
+                key="frame_interpolation_prompt"
+            )
+
+            enable_concatenation = st.checkbox(
+                "Enable Concatenation",
+                value=False
+            )
+
+            aspect_ratio = st.selectbox(
+                "Aspect Ratio", 
+                options=["16:9", "9:16"]   
+            )
+
+            if st.button("✨ Interpolate Frames", type="primary"):
+                run_temp_dir = None
+                with st.spinner("Interpolating frames and uploading..."):
+                    try:
+                        # 1. SETUP TEMPORARY DIRECTORY
+                        run_id = str(uuid.uuid4())
+                        run_temp_dir = os.path.join("temp_processing_space", run_id)
+                        os.makedirs(os.path.join(run_temp_dir, "original_images"), exist_ok=True)
+                        os.makedirs(os.path.join(run_temp_dir, "interpolated_videos"), exist_ok=True)
+
+                        dir_paths = {
+                            "original_images": os.path.join(run_temp_dir, "0_original_images"),
+                            "interpolated_videos": os.path.join(run_temp_dir, "1_interpolated_videos"),
+                            "final_output": os.path.join(run_temp_dir, "2_final_output")
+                        }
+
+                         # Create all directories from the dictionary
+                        for path in dir_paths.values():
+                            os.makedirs(path, exist_ok=True)
+
+
+                        # 2. PREPARE INPUT IMAGE PAIRS
+
+                        local_image_paths_map = OrderedDict()
+                        
+                        # Save uploaded files to a temporary location first
+                        for uploaded_file in uploaded_images:
+                            # Create a destination path in your temporary directory
+                            dst_path = os.path.join(dir_paths["original_images"], uploaded_file.name)
+                            
+                            # Write the file's content to the destination path
+                            with open(dst_path, "wb") as f:
+                                f.write(uploaded_file.getbuffer())
+                            
+                            # Now, store the actual disk path in your map
+                            local_image_paths_map[uploaded_file.name] = dst_path
+
+                        sorted_product_slate_pairs = OrderedDict()
+                        for original_filename, original_path in local_image_paths_map.items():
+                            if "_first_slate" in original_filename: key = original_filename.split("_first_slate")[0]
+                            elif "_last_slate" in original_filename: key = original_filename.split("_last_slate")[0]
+                            else: continue
+                            if key not in sorted_product_slate_pairs: sorted_product_slate_pairs[key] = {}
+                            if "_first_slate" in original_filename: sorted_product_slate_pairs[key]['first'] = original_path
+                            elif "_last_slate" in original_filename: sorted_product_slate_pairs[key]['last'] = original_path
+                        
+                        valid_pairs = OrderedDict([(k,v) for k,v in sorted_product_slate_pairs.items() if 'first' in v and 'last' in v])
+                        # valid_pairs = _prepare_image_pairs(uploaded_images, os.path.join(run_temp_dir, "original_images"))
+                        if not valid_pairs:
+                            st.error("No valid '_first_slate' and '_last_slate' image pairs found.")
+                            return
+
+                        # 3. GENERATE INTERPOLATED VIDEO SEGMENTS LOCALLY
+                        local_interpolated_paths = []
+                        project_id = st.session_state.get("project_id", config.PROJECT_ID)
+                        api_client = Veo2API(project_id)
+                        
+                        for i, (base_name, slates) in enumerate(valid_pairs.items()):
+                            st.info(f"Interpolating pair {i+1}: {base_name}...")
+                            output_local_path = os.path.join(run_temp_dir, "interpolated_videos", f"{base_name}_interpolated.mp4")
+                            
+                            # This API call should download the generated video to output_local_path
+                            interpolated_video_gcs_uri=client.interpolate_video_veo2(
+                                start_image_path=slates['first'],
+                                end_image_path=slates['last'],
+                                prompt_text=interpolation_prompt,
+                                output_local_video_path=output_local_path,
+                                aspect_ratio=aspect_ratio,
+                                storage_uri=f"gs://{BUCKET_NAME}/interpolated_videos/"
+                            )
+                            base_uri = st.session_state.get("storage_uri", config.STORAGE_URI)
+                                # Construct a clean path for the voiceovers folder, avoiding the f-string syntax error.
+                            base_storage_uri = f"{base_uri.rstrip('/')}/interpolated_videos/"
+                            storage_uri = base_storage_uri # This is the GCS folder where Veo will store the output
+                            path = base_uri[5:]
+                            bucket_name = path.split("/")[0]
+                            link_to_download = interpolated_video_gcs_uri.split(base_uri)[1]
+                                    
+                            Veo2API.download_blob(BUCKET_NAME, link_to_download, output_local_path)
+
+                            if os.path.exists(output_local_path):
+                                st.success(f"Generated segment for {base_name}")
+                                local_interpolated_paths.append(output_local_path)
+                            else:
+                                st.warning(f"Failed to generate segment for {base_name}")
+
+                        if not local_interpolated_paths:
+                            st.error("No video segments were successfully generated.")
+                            return
+                            
+                        # 4. PROCESS FINAL OUTPUT
+                        final_videos_to_process = []
+                        if enable_concatenation and len(local_interpolated_paths) > 1:
+                            st.info("Concatenating video segments...")
+                            final_path = os.path.join(run_temp_dir, "final_concatenated.mp4")
+                            # Using the Veo2API helper for consistency
+                            Veo2API.concatenate_videos(local_interpolated_paths, final_path, run_temp_dir)
+                            final_videos_to_process.append((final_path, "interpolated-concatenated.mp4"))
+                        else:
+                            final_videos_to_process = [(p, os.path.basename(p)) for p in local_interpolated_paths]
+
+                        # 5. APPLY SPEED CHANGE IF NEEDED
+                        if playback_speed_factor != 1.0:
+                            st.info(f"Applying speed factor of {playback_speed_factor}x...")
+                            speed_altered_videos = []
+                            for path, name in final_videos_to_process:
+                                new_path = os.path.join(run_temp_dir, f"speed_{name}")
+                                # Using the Veo2API helper for consistency
+                                Veo2API.alter_video_speed(path, new_path, playback_speed_factor, run_temp_dir)
+                                speed_altered_videos.append((new_path, name))
+                            final_videos_to_process = speed_altered_videos
+                        
+                        # 6. UPLOAD AND DISPLAY FINAL VIDEOS
+                        st.subheader("Interpolation Results")
+                        for local_path, original_name in final_videos_to_process:
+                            final_gcs_uri = video_upload_to_gcs(local_path, BUCKET_NAME, original_name)
+                            if final_gcs_uri:
+                                signed_url = client.generate_signed_url(final_gcs_uri)
+                                st.video(signed_url)
+                                if FIRESTORE_AVAILABLE:
+                                    db.collection('history').add({
+                                        'timestamp': firestore.SERVER_TIMESTAMP,
+                                        'type': 'video', 'uri': final_gcs_uri,
+                                        'prompt': f'Video interpolated and changed by factor of {playback_speed_factor}',
+                                        'params': {'operation': 'Interpolation and change_speed', 'factor': playback_speed_factor}
+                                    })
+                        
+                    except Exception as e:
+                        st.error(f"An error occurred during frame interpolation: {e}")
+                        import traceback
+                        st.code(traceback.format_exc())
+                    finally:
+                        # 7. SAFE CLEANUP
+                        if run_temp_dir and os.path.exists(run_temp_dir):
+                            shutil.rmtree(run_temp_dir)
+                            logger.info(f"Cleaned up temporary directory: {run_temp_dir}")
+
+        elif uploaded_images:
+            st.warning("Please upload at least two images for frame interpolation.")
+
+
+def image_to_video_tab():
+    """Image-to-Video generation tab."""
+    logger.start_section("Image-to-Video Tab")
+    logger.info("Rendering Image-to-Video tab")
+    st.header("Image-to-Video Generation")
+    
+    # Function to clear current image data
+    def clear_current_image_data():
+        if 'current_image' in st.session_state:
+            del st.session_state.current_image
+        if 'current_uploaded_file' in st.session_state:
+            del st.session_state.current_uploaded_file
+        logger.info("Cleared current image data from session state")
+    
+    # Create tabs for different input methods
+    upload_tabs = st.tabs(["Upload Image", "Enter Image URL"])
+    
+    # Track which tab is active
+    if "active_upload_tab" not in st.session_state:
+        st.session_state.active_upload_tab = 0  # Default to first tab
+    
+    # Check if we have image data in session state from previous interactions
+    if 'current_image' in st.session_state:
+        image = st.session_state.current_image
+        logger.info("Retrieved image from session state")
+    else:
+        image = None
+    
+    if 'current_uploaded_file' in st.session_state:
+        uploaded_file = st.session_state.current_uploaded_file
+        logger.info("Retrieved uploaded file from session state")
+    else:
+        uploaded_file = None
+    
+    # Upload Image Tab
+    with upload_tabs[0]:
+        # Check if we switched tabs
+        if st.session_state.active_upload_tab != 0:
+            # We switched to the file upload tab, clear URL-based image
+            if 'current_image_url' in st.session_state:
+                # Only clear if we previously had a URL
+                if st.session_state.current_image_url:
+                    clear_current_image_data()
+                st.session_state.current_image_url = ""
+            st.session_state.active_upload_tab = 0
+            
+        new_upload = st.file_uploader(
+            "Upload an image to transform into a video (JPG, JPEG, PNG, WEBP)",
+            type=["jpg", "jpeg", "png", "webp"],
+            key="image_upload",
+            help="Upload an image to transform into a video. Maximum size: 20MB."
+        )
+        
+        # If a new file was uploaded, update our variable and session state
+        if new_upload is not None:
+            if uploaded_file is None or new_upload.name != uploaded_file.name:
+                logger.info(f"New file uploaded: {new_upload.name}")
+                # We have a new upload, clear previous data
+                clear_current_image_data()
+                
+            uploaded_file = new_upload
+            st.session_state.current_uploaded_file = uploaded_file
+    
+    # URL Input Tab
+    with upload_tabs[1]:
+        # Check if we switched tabs
+        if st.session_state.active_upload_tab != 1:
+            # We switched to the URL tab from file upload, clear file-based image
+            if uploaded_file is not None and uploaded_file.name != "image_from_url.jpg":
+                clear_current_image_data()
+            st.session_state.active_upload_tab = 1
+            
+        st.markdown("### Enter Image URL")
+        
+        # Check if we have a URL in session state
+        if 'current_image_url' not in st.session_state:
+            st.session_state.current_image_url = ""
+        
+        image_url = st.text_input(
+            "Enter a public URL or GCS URI (gs://bucket/path/to/image.jpg)",
+            value=st.session_state.current_image_url,
+            placeholder="https://example.com/image.jpg or gs://bucket-name/path/to/image.jpg",
+            help="You can enter either a public URL (https://) or a Google Cloud Storage URI (gs://)",
+            key="url_input"
+        )
+        
+        # Update URL in session state if changed
+        if image_url != st.session_state.current_image_url:
+            # URL changed, clear any previous image data
+            if st.session_state.current_image_url:
+                clear_current_image_data()
+            st.session_state.current_image_url = image_url
+        
+        # Create containers for the preview and message
+        url_preview_container = st.empty()
+        url_message_container = st.empty()
+        
+        # Add button to load from URL
+        if image_url and st.button("Load Image from URL", type="primary"):
+            with st.spinner("Loading image from URL..."):
+                try:
+                    # Handle different URL types
+                    if image_url.startswith("gs://"):
+                        # GCS URI handling
+                        logger.info(f"Loading image from GCS URI: {image_url}")
+                        
+                        # Extract bucket and path
+                        bucket_name = image_url.replace("gs://", "").split("/")[0]
+                        blob_path = "/".join(image_url.replace(f"gs://{bucket_name}/", "").split("/"))
+                        
+                        # First try to generate a signed URL
+                        try:
+                            signed_url = generate_signed_url(image_url, expiration=3600)
+                            response = requests.get(signed_url)
+                        except Exception as e:
+                            # Fallback to direct access (needs public bucket)
+                            logger.warning(f"Could not generate signed URL, trying direct access: {str(e)}")
+                            img_url = f"https://storage.googleapis.com/{bucket_name}/{blob_path}"
+                            response = requests.get(img_url)
+                    else:
+                        # Regular HTTP(S) URL
+                        logger.info(f"Loading image from public URL: {image_url}")
+                        response = requests.get(image_url)
+                    
+                    # Check response
+                    if response.status_code == 200:
+                        # Create a temporary file object
+                        tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+                        tmp_file.write(response.content)
+                        tmp_file.close()
+                        
+                        # Open the image with PIL
+                        image = Image.open(tmp_file.name)
+                        
+                        # Store image in session state
+                        st.session_state.current_image = image
+                        
+                        # Create a simulated upload file
+                        with open(tmp_file.name, "rb") as f:
+                            image_data = f.read()
+                        
+                        filename = image_url.split("/")[-1]
+                        uploaded_file = SimulatedUploadFile(
+                            name=filename,
+                            content=image_data
+                        )
+                        
+                        # Store uploaded file in session state
+                        st.session_state.current_uploaded_file = uploaded_file
+                        
+                        # Display a success message - don't display image here
+                        url_message_container.success(f"Successfully loaded image: {filename}")
+                        
+                        # Clean up the temporary file
+                        os.unlink(tmp_file.name)
+                    else:
+                        url_message_container.error(f"Failed to load image. HTTP status code: {response.status_code}")
+                except Exception as e:
+                    url_message_container.error(f"Error loading image from URL: {str(e)}")
+                    if "Access Denied" in str(e):
+                        url_message_container.info("If using a GCS URI, make sure the bucket is publicly accessible or you have proper permissions.")
+    
+    # If an image is uploaded through the file uploader or already in session state, process and display it
+    if uploaded_file is not None:
+        try:
+            # If we don't already have the image loaded, read it from the uploaded file
+            if image is None:
+                # Read the image
+                image = Image.open(uploaded_file)
+                # Store in session state
+                st.session_state.current_image = image
+                
+            logger.info(f"Image available: {uploaded_file.name}, size: {uploaded_file.size} bytes")
+            logger.info(f"Image properties: format={image.format}, size={image.size}, mode={image.mode}")
+            
+            # Convert WebP to PNG if needed
+            convert_needed = uploaded_file.name.lower().endswith('.webp')
+            if convert_needed:
+                logger.info("WebP image detected, will convert to PNG")
+                st.info("WebP image detected. It will be automatically converted to PNG for compatibility.")
+            
+            # Display the image preview and details in a cleaner layout
+            st.subheader("Image Preview")
+            
+            # Create two columns for the image and details
+            preview_col, details_col = st.columns([3, 2])
+            
+            with preview_col:
+                # Display the image in the left column
+                st.image(
+                    image, 
+                    caption=f"{uploaded_file.name}",
+                    use_container_width=True
+                )
+            
+            with details_col:
+                # Show image details in the right column
+                st.markdown(f"**Filename:** {uploaded_file.name}")
+                st.markdown(f"**Size:** {image.size[0]} × {image.size[1]} pixels")
+                st.markdown(f"**Format:** {image.format}")
+                st.markdown(f"**Mode:** {image.mode}")
+                
+                # Add file size
+                file_size_kb = uploaded_file.size / 1024
+                if file_size_kb > 1024:
+                    file_size_display = f"{file_size_kb/1024:.2f} MB"
+                else:
+                    file_size_display = f"{file_size_kb:.2f} KB"
+                st.markdown(f"**File Size:** {file_size_display}")
+        
+        except Exception as e:
+            st.error(f"Error loading image: {str(e)}")
+            logger.error(f"Error displaying image: {str(e)}")
+            image = None
+            if 'current_image' in st.session_state:
+                del st.session_state.current_image
+    
+    # If no image is loaded, show a helpful message
+    if uploaded_file is None and image is None:
+        # Only show this if neither upload method provided an image
+        st.info("👆 Please upload an image or provide an image URL to get started.")
+        logger.end_section()
+        return
+    
+    # Rest of the tab content only if we have an image
+    if image or uploaded_file:
+        # Store image in session state to persist across interactions
+        if 'current_image' not in st.session_state and image is not None:
+            st.session_state.current_image = image
+        elif image is not None:
+            st.session_state.current_image = image
+        
+        # Use image from session state if available
+        if 'current_image' in st.session_state and image is None:
+            image = st.session_state.current_image
+        
+        # Ensure the file handle is also persisted
+        if 'current_uploaded_file' not in st.session_state and uploaded_file is not None:
+            st.session_state.current_uploaded_file = uploaded_file
+        elif uploaded_file is not None:
+            st.session_state.current_uploaded_file = uploaded_file
+        
+        # Use file from session state if available
+        if 'current_uploaded_file' in st.session_state and uploaded_file is None:
+            uploaded_file = st.session_state.current_uploaded_file
+        
+        # Prompt section
+        st.markdown("### Video Prompt")
+        
+        # Initialize or get the prompt from session state
+        if 'generated_prompt' not in st.session_state or st.session_state.generated_prompt is None:
+            default_prompt = config.DEFAULT_IMAGE_PROMPT
+        else:
+            default_prompt = st.session_state.generated_prompt
+        
+        # Gemini button and checkbox in a more compact layout
+        gemini_col1, gemini_col2 = st.columns([3, 1])
+        with gemini_col1:
+            generate_button = st.button(
+                "✨ Generate Prompt with Gemini AI", 
+                key="generate_prompt", 
+                help="Use Google's Gemini AI to generate a detailed prompt based on your image"
+            )
+        with gemini_col2:
+            clear_prompt = st.checkbox(
+                "Replace text", 
+                value=True, 
+                key="clear_prompt",
+                help="Clear the current prompt before generating a new one"
+            )
+        
+        # Prompt text area directly (no container)
+        # Store the current text area value to detect user edits
+        prompt = st.text_area(
+            "Describe how the image should be transformed into a video:",
+            value=default_prompt,
+            height=150,
+            key="image_prompt"
+        )
+        
+        # Model selection
+        model = st.selectbox(
+            "Model",
+            options=["veo-2.0-generate-001", "veo-3.0-generate-preview"],  # Assuming these are the model IDs
+            index=0,  # Default to Veo 2
+            help="Choose the video generation model (Veo 2 or Veo 3)",
+            key="image_model"
+        )
+
+        # Audio and resolution options (Veo 3.0 only)
+        enable_audio = st.checkbox(
+            "Add Audio", 
+            value=False if model == "veo-2.0-generate-001" else True, 
+            disabled=model != "veo-3.0-generate-preview", 
+            key="image_enable_audio"
+        )
+        resolution = st.selectbox(
+            "Resolution", 
+            options=["720p"] if model == "veo-2.0-generate-001" else ["720p", "1080p"], 
+            index=0, 
+            disabled=model != "veo-3.0-generate-preview", 
+            key="image_resolution"
+        )
+
+        # Capture the user's manually entered prompt
+        if 'image_prompt' in st.session_state:
+            # Only update if it's different from the generated prompt
+            # This prevents overwriting the generated prompt with itself
+            current_prompt = st.session_state.image_prompt
+            if 'generated_prompt' not in st.session_state or current_prompt != st.session_state.generated_prompt:
+                st.session_state.last_entered_prompt = current_prompt
+        
+        # Handle Gemini prompt generation
+        if generate_button:
+            logger.start_section("Prompt Generation")
+            logger.info("Generate Prompt button clicked")
+            
+            if image is None:
+                st.error("No image is available. Please upload an image or provide a URL first.")
+                logger.error("Generate prompt clicked but no image available")
+                logger.end_section()
+                return
+                
+            try:
+                # Use a better spinner with more information
+                spinner_text = "Analyzing image and crafting a detailed prompt with Gemini AI..."
+                with st.spinner(spinner_text):
+                    # Generate the prompt
+                    logger.info("Calling gemini_helper.generate_prompt_from_image()")
+                    generated_prompt = gemini_helper.generate_prompt_from_image(image)
+                    
+                    # Log the prompt
+                    logger.debug(f"Generated prompt: {generated_prompt[:50]}...")
+                    
+                    # Update session state based on clear preference
+                    if clear_prompt:
+                        # Replace the entire prompt
+                        st.session_state.generated_prompt = generated_prompt
+                        logger.info("Replacing prompt with generated text")
+                    else:
+                        # Add to the existing prompt
+                        current = st.session_state.get("last_entered_prompt", "")
+                        if current.strip():
+                            combined_prompt = f"{current}\n\n{generated_prompt}"
+                            st.session_state.generated_prompt = combined_prompt
+                            logger.info("Appending generated text to existing prompt")
+                        else:
+                            st.session_state.generated_prompt = generated_prompt
+                            logger.info("Setting prompt to generated text (existing was empty)")
+                    
+                    logger.success("Updated generated_prompt in session state")
+                    
+                    # Don't modify image_prompt directly - it's linked to the text area widget
+                    # Instead, show success message and rerun to refresh the UI with new prompt
+                    st.success("✅ Prompt generated successfully! Updating the text area...")
+                    time.sleep(0.5)  # Small delay so user can see the success message
+                    st.rerun()  # Rerun to refresh the UI with the new prompt
+                    
+            except Exception as e:
+                logger.error(f"Error generating prompt: {str(e)}")
+                st.error(f"Error generating prompt: {str(e)}")
+                if "403" in str(e):
+                    st.info("This could be due to Gemini API access issues. Check your credentials and permissions.")
+            logger.end_section()
+        
+        # Video settings with better organization
+        st.markdown("### Video Settings")
+        
+        # Create a simplified settings layout in single container
+        settings_row = st.columns(3)
+        with settings_row[0]:
+            aspect_ratio = st.selectbox(
+                "Aspect Ratio", 
+                options=["16:9"] if model == "veo-3.0-generate-preview" else ["16:9", "9:16"],
+                index=0,
+                disabled=(model == "veo-3.0-generate-preview"),
+                help="Choose orientation. Veo 3.0 is fixed to 16:9.",
+                key="image_aspect_ratio"
+            )
+        with settings_row[1]:
+            duration = st.slider(
+                "Duration (seconds)", 
+                min_value=5, 
+                max_value=8,
+                value=config.DEFAULT_DURATION_SECONDS,
+                help="Video length",
+                key="image_duration"
+            )
+        with settings_row[2]:
+            sample_count = st.slider(
+                "Number of Videos", 
+                min_value=1, 
+                max_value=4,
+                value=config.DEFAULT_SAMPLE_COUNT,
+                help="Generate variations",
+                key="image_sample_count"
+            )
+        
+        # Advanced options in a cleaner expandable section
+        with st.expander("Advanced Options", expanded=False):
+            neg_prompt_col, options_col = st.columns([2, 1])
+            
+            with neg_prompt_col:
+                # Negative prompt with guidance
+                negative_prompt = st.text_area(
+                    "Negative Prompt (elements to avoid)", 
+                    value=config.DEFAULT_NEGATIVE_PROMPT,
+                    height=80,
+                    key="image_negative_prompt"
+                )
+                
+            with options_col:
+                # Streamlined options
+                person_generation = st.radio(
+                    "People", 
+                    options=["allow_adult", "disallow"],
+                    horizontal=True,
+                    key="image_person_generation",
+                    help="Safety setting"
+                )
+                
+                enhance_prompt = st.checkbox(
+                    "AI Enhancement",
+                    value=True,
+                    key="image_enhance_prompt",
+                    help="Improve prompt"
+                )
+                
+                seed = st.number_input(
+                    "Seed (optional)",
+                    min_value=0,
+                    max_value=4294967295,
+                    value=None,
+                    key="image_seed",
+                    help="For reproducibility"
+                )
+                if seed is not None and seed == 0:
+                    seed = None  # Treat 0 as None
+        
+        # Generate button - more prominent with better placement
+        st.markdown("<div style='margin-top: 20px; margin-bottom: 20px;'></div>", unsafe_allow_html=True)
+        if st.button("🚀 Generate Video", key="image_generate", type="primary", use_container_width=True):
+            if uploaded_file is None and image is None:
+                st.error("No image is available. Please upload an image or provide a URL first.")
+                return
+                
+            try:
+                # Save the current prompt to session state to persist it
+                if 'image_prompt' in st.session_state:
+                    st.session_state.last_entered_prompt = st.session_state.image_prompt
+                
+                # Create a temporary file for the image
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp_file:
+                    # If we're working with a PIL image object directly (from URL)
+                    if uploaded_file is None and image is not None:
+                        # Save the PIL image to the temporary file
+                        if image.mode == 'RGBA':
+                            # Convert RGBA to RGB for JPEG compatibility
+                            background = Image.new('RGB', image.size, (255, 255, 255))
+                            background.paste(image, mask=image.split()[3])
+                            background.save(tmp_file.name, format='JPEG')
+                        else:
+                            image.save(tmp_file.name, format='JPEG')
+                        
+                        # Create a simulated upload file if needed
+                        if uploaded_file is None:
+                            with open(tmp_file.name, "rb") as f:
+                                image_data = f.read()
+                            
+                            filename = "image_from_url.jpg"
+                            if 'current_image_url' in st.session_state and st.session_state.current_image_url:
+                                # Extract filename from URL if available
+                                url_filename = st.session_state.current_image_url.split("/")[-1]
+                                if url_filename and '.' in url_filename:
+                                    filename = url_filename
+                            
+                            uploaded_file = SimulatedUploadFile(
+                                name=filename,
+                                content=image_data
+                            )
+                            
+                            # Save to session state
+                            st.session_state.current_uploaded_file = uploaded_file
+                    else:
+                        # We have a regular uploaded_file
+                        tmp_file.write(uploaded_file.getvalue())
+                
+                tmp_image_path = tmp_file.name
+                image_path = tmp_image_path
+                
+                # Convert WebP to PNG if needed
+                if image_path.lower().endswith('.webp'):
+                    with st.spinner("Converting WebP to PNG..."):
+                        png_path = image_path.rsplit('.', 1)[0] + '.png'
+                        img = Image.open(image_path)
+                        img.save(png_path, 'PNG')
+                        image_path = png_path
+                        st.success("WebP image successfully converted to PNG")
+                
+                # Upload image to history
+                try:
+                    # Make sure image is in session state
+                    if image is None and 'current_image' in st.session_state:
+                        image = st.session_state.current_image
+                    
+                    if image is not None:
+                        uploaded_image_uri = history_manager.upload_image_to_history(image)
+                        if uploaded_image_uri:
+                            # Add to history - store proper JSON for parameters
+                            image_params = {
+                                "filename": uploaded_file.name,
+                                "size": f"{image.size[0]}x{image.size[1]}",
+                                "format": image.format if hasattr(image, 'format') else "Unknown",
+                                "mode": image.mode if hasattr(image, 'mode') else "Unknown"
+                            }
+                            # Add image entry to Firestore
+                            if FIRESTORE_AVAILABLE:
+                                doc_ref = db.collection('history').document()
+                                doc_ref.set({
+                                    'timestamp': firestore.SERVER_TIMESTAMP,
+                                    'type': 'image',
+                                    'uri': uploaded_image_uri,
+                                    'prompt': 'Input image',
+                                    'params': image_params
+                                })
+                                logger.info(f"Added image {uploaded_image_uri} to Firestore history.")
+                    else:
+                        st.warning("Could not save image to history: No image data available")
+                except Exception as e:
+                    st.warning(f"Could not save image to history: {str(e)}")
+                
+                # Generate the video
+                generate_video(
+                    project_id=st.session_state.get("project_id", config.PROJECT_ID),
+                    prompt=prompt,
+                    input_image_path=image_path,
+                    aspect_ratio=aspect_ratio,
+                    negative_prompt=negative_prompt,
+                    model=model, #Add model parameter
+                    person_generation=person_generation,
+                    resolution=resolution,
+                    enable_audio=enable_audio,
+                    sample_count=sample_count,
+                    seed=seed,
+                    storage_uri=st.session_state.get("storage_uri", config.STORAGE_URI),
+                    duration_seconds=duration,
+                    enhance_prompt=enhance_prompt,
+                    wait_for_completion=st.session_state.get("wait_for_completion", True),
+                    poll_interval=st.session_state.get("poll_interval", config.DEFAULT_POLL_INTERVAL),
+                    max_attempts=st.session_state.get("max_poll_attempts", config.DEFAULT_MAX_POLL_ATTEMPTS),
+                    show_full_response=st.session_state.get("show_full_response", False),
+                    enable_streaming=st.session_state.get("enable_streaming", True)
+                )
+            except Exception as e:
+                st.error(f"Error generating video: {str(e)}")
+                logger.error(f"Error during video generation: {str(e)}")
+            finally:
+                # Clean up the temporary files
+                try:
+                    if 'tmp_image_path' in locals() and os.path.exists(tmp_image_path):
+                        os.unlink(tmp_image_path)
+                    
+                    # Also remove PNG conversion if it was created
+                    if 'tmp_image_path' in locals() and tmp_image_path.lower().endswith('.webp'):
+                        png_path = tmp_image_path.rsplit('.', 1)[0] + '.png'
+                        if os.path.exists(png_path):
+                            os.unlink(png_path)
+                except Exception as cleanup_error:
+                    logger.error(f"Error cleaning up temporary files: {str(cleanup_error)}")
+    
+    logger.end_section()
+
+
+def get_history_from_firestore(limit=200):
+    """
+    Get the history of generated content from Firestore.
+    
+    Args:
+        limit (int): Maximum number of entries to return
+        
+    Returns:
+        pandas.DataFrame: DataFrame containing the history entries
+    """
+    if not FIRESTORE_AVAILABLE:
+        logger.error("Firestore is not available. Cannot get history.")
+        return pd.DataFrame(columns=['timestamp', 'type', 'uri', 'prompt', 'params'])
+
+    try:
+        history_ref = db.collection('history').order_by(
+            'timestamp', direction=firestore.Query.DESCENDING
+        ).limit(limit)
+        
+        docs = history_ref.stream()
+        
+        history_list = [doc.to_dict() for doc in docs]
+            
+        if not history_list:
+            return pd.DataFrame(columns=['timestamp', 'type', 'uri', 'prompt', 'params'])
+            
+        df = pd.DataFrame(history_list)
+        # Ensure timestamp column is of datetime type for proper sorting
+        df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
+        return df.sort_values('timestamp', ascending=False)
+
+    except Exception as e:
+        logger.error(f"Error getting history from Firestore: {str(e)}")
+        st.error(f"Error getting history from Firestore: {str(e)}")
+        return pd.DataFrame(columns=['timestamp', 'type', 'uri', 'prompt', 'params'])
+
+def history_tab():
+    """History of generated videos and images."""
+    logger.start_section("History Tab")
+    logger.info("Rendering History tab")
+    
+    # Use header and button in same line with columns
+    header_col, button_col = st.columns([5, 1])
+    with header_col:
+        st.header("Generation History")
+    with button_col:
+        if st.button("🔄 Refresh History", key="refresh_history"):
+            logger.info("Manually refreshing history...")
+            st.session_state.history_loaded = False
+            st.success("Refreshing history...")
+            st.rerun()
+    
+    # Check if we can access Google Cloud Storage
+    if not GCS_SDK_AVAILABLE:
+        st.warning("Google Cloud Storage SDK not available. History tracking requires this library.")
+        st.markdown("Please install it with: `pip install google-cloud-storage`")
+        return
+    
+    # Check if storage URI is set
+    if not config.STORAGE_URI:
+        st.error("⚠️ Storage URI is not set. Please configure a GCS storage URI in the sidebar.")
+        return
+    
+    # Debug information
+    if st.session_state.get("debug_mode", False):
+        with st.expander("History Debug Info", expanded=False):
+            st.write("History Loaded:", st.session_state.get("history_loaded", False))
+            st.write("History Initialized:", st.session_state.get("history_initialized", False))
+            st.write("Storage URI:", config.STORAGE_URI)
+            st.write("History Folder:", config.HISTORY_FOLDER)
+            st.write("History File:", config.HISTORY_FILE)
+            st.write("GCS SDK Available:", GCS_SDK_AVAILABLE)
+            st.write("Session State Keys:", list(st.session_state.keys()))
+    
+    # Initialize history data variable
+    history_data = None
+    
+    # Load history data with spinner if not already loaded or force refresh
+    try:
+        # Check if we need to load history data
+        if not st.session_state.get("history_loaded", False) or "history_data" not in st.session_state:
+            with st.spinner("Loading history data..."):
+                logger.info("Loading history data from Firestore...")
+                
+                # Get history data from Firestore
+                history_data = get_history_from_firestore(limit=200) # Fetch more to allow filtering
+                
+                # Store in session state
+                st.session_state.history_data = history_data
+                st.session_state.history_loaded = True
+                
+                if history_data.empty:
+                    logger.info("No history data found")
+                else:
+                    logger.success(f"Successfully loaded {len(history_data)} history entries")
+        else:
+            # Use cached data
+            history_data = st.session_state.history_data
+            logger.info(f"Using cached history data with {len(history_data)} entries")
+    except Exception as e:
+        error_msg = f"Error loading history: {str(e)}"
+        st.error(error_msg)
+        logger.error(error_msg)
+        
+        # Display more information about the error for debugging
+        if st.session_state.get("debug_mode", False):
+            st.error(f"Error details: {type(e).__name__}")
+            import traceback
+            st.code(traceback.format_exc())
+        
+        # Create an empty DataFrame as a fallback
+        history_data = pd.DataFrame(columns=['timestamp', 'type', 'uri', 'prompt', 'params'])
+        st.session_state.history_data = history_data
+        st.session_state.history_loaded = True
+    
+    # If we somehow still don't have history data, use an empty DataFrame
+    if history_data is None:
+        logger.warning("History data is None, using empty DataFrame")
+        history_data = pd.DataFrame(columns=['timestamp', 'type', 'uri', 'prompt', 'params'])
+    
+    if history_data.empty:
+        st.info("No generation history found. Generate some videos or images to see them here!")
+        logger.end_section()
+        return
+    
+    # Create tabs for different history views
+    history_tabs = st.tabs(["🎬 Recent Videos", "🎵 Recent Audios", "🎤 Recent Voices", "🖼️ All Images", "📋 All History"])
+    
+    # Recent Videos Tab
+    with history_tabs[0]:
+        # Filter videos only
+        video_history = history_data[history_data['type'] == 'video'].copy()
+        
+        if video_history.empty:
+            st.info("No videos in history yet. Generate some videos to see them here!")
+        else:
+            # Header and clear button in same row
+            video_header_col, clear_col = st.columns([5, 1])
+            with video_header_col:
+                st.markdown(f"### Recent Generated Videos ({len(video_history)})")
+            with clear_col:
+                if st.button("🗑️ Clear All", key="clear_history_btn", type="secondary"):
+                    if st.session_state.get("confirm_clear_history", False):
+                        if not FIRESTORE_AVAILABLE:
+                            st.error("Firestore is not available. Cannot clear history.")
+                            st.session_state.confirm_clear_history = False # Reset confirmation
+                            st.rerun()
+                            return
+
+                        # User has already confirmed, proceed with clearing
+                        try:
+                            clear_history()
+                            st.success("History cleared successfully!")
+                            st.session_state.history_loaded = False
+                            st.session_state.confirm_clear_history = False
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Error clearing history: {str(e)}")
+                    else:
+                        # Ask for confirmation
+                        st.session_state.confirm_clear_history = True
+                        st.warning("⚠️ This will permanently delete all history. Are you sure?")
+                        
+                        confirm_col1, confirm_col2 = st.columns(2)
+                        with confirm_col1:
+                            if st.button("✅ Yes, Delete All"):
+                                try:
+                                    clear_history()
+                                    st.success("History cleared successfully!")
+                                    st.session_state.history_loaded = False
+                                    st.session_state.confirm_clear_history = False
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Error clearing history: {str(e)}")
+                        with confirm_col2:
+                            if st.button("❌ Cancel"):
+                                st.session_state.confirm_clear_history = False
+                                st.rerun()
+            
+            # Sort by timestamp descending
+            video_history = video_history.sort_values('timestamp', ascending=False)
+            
+            # Add pagination for videos
+            total_videos = len(video_history)
+            items_per_page = 10
+            
+            # Calculate max pages and add pagination controls
+            max_pages = (total_videos + items_per_page - 1) // items_per_page  # Ceiling division
+            
+            # Initialize or update page number in session state
+            if "video_page" not in st.session_state:
+                st.session_state.video_page = 0
+                
+            # Add pagination controls at the top
+            col1, col2, col3 = st.columns([1, 3, 1])
+            with col1:
+                if st.button("◀ Previous", disabled=(st.session_state.video_page <= 0), key="prev_video"):
+                    st.session_state.video_page = max(0, st.session_state.video_page - 1)
+                    st.rerun()
+            
+            with col2:
+                st.markdown(f"**Page {st.session_state.video_page + 1} of {max(1, max_pages)}** (showing {min(items_per_page, total_videos - st.session_state.video_page * items_per_page)} of {total_videos} videos)")
+                
+            with col3:
+                if st.button("Next ▶", disabled=(st.session_state.video_page >= max_pages - 1), key="next_video"):
+                    st.session_state.video_page = min(max_pages - 1, st.session_state.video_page + 1)
+                    st.rerun()
+            
+            # Get the videos for the current page
+            start_idx = st.session_state.video_page * items_per_page
+            end_idx = min(start_idx + items_per_page, total_videos)
+            page_videos = video_history.iloc[start_idx:end_idx]
+            
+            # Create a grid layout using custom CSS
+            st.markdown('<div class="history-grid">', unsafe_allow_html=True)
+            
+            # Create rows for every 2 videos to ensure proper grid layout
+            rows = [page_videos.iloc[i:i+2] for i in range(0, len(page_videos), 2)]
+            
+            for row_items in rows:
+                cols = st.columns(2)
+                
+                for i, (_, row) in enumerate(row_items.iterrows()):
+                    if i < len(cols):
+                        with cols[i]:
+                            # Remove the empty div and just display the card contents directly
+                            display_history_video_card(row)
+            
+            st.markdown('</div>', unsafe_allow_html=True)
+            
+            # Add pagination controls at the bottom too
+            col1, col2, col3 = st.columns([1, 3, 1])
+            with col1:
+                if st.button("◀ Previous", disabled=(st.session_state.video_page <= 0), key="prev_video_bottom"):
+                    st.session_state.video_page = max(0, st.session_state.video_page - 1)
+                    st.rerun()
+            
+            with col2:
+                st.markdown(f"**Page {st.session_state.video_page + 1} of {max(1, max_pages)}**")
+                
+            with col3:
+                if st.button("Next ▶", disabled=(st.session_state.video_page >= max_pages - 1), key="next_video_bottom"):
+                    st.session_state.video_page = min(max_pages - 1, st.session_state.video_page + 1)
+                    st.rerun()
+    
+    # Recent Audios Tab
+    with history_tabs[1]:
+        st.markdown("### Recent Generated Audios")
+        audio_history = history_data[history_data['type'] == 'audio'].copy()
+        
+        if audio_history.empty:
+            st.info("No audio generation history found.")
+        else:
+            st.markdown(f"Found {len(audio_history)} audio generations.")
+            audio_history = audio_history.sort_values('timestamp', ascending=False)
+            
+            # Display in a grid
+            st.markdown('<div class="history-grid">', unsafe_allow_html=True)
+            rows = [audio_history.iloc[i:i+2] for i in range(0, len(audio_history), 2)]
+            for row_items in rows:
+                cols = st.columns(2)
+                for i, (_, row) in enumerate(row_items.iterrows()):
+                    if i < len(cols):
+                        with cols[i]:
+                            with st.container(border=True, height=350):
+                                display_history_audio_card(row)
+            st.markdown('</div>', unsafe_allow_html=True)
+
+    # Recent Voices Tab
+    with history_tabs[2]:
+        st.markdown("### Recent Generated Voiceovers")
+        voice_history = history_data[history_data['type'] == 'voice'].copy()
+        
+        if voice_history.empty:
+            st.info("No voiceover generation history found.")
+        else:
+            st.markdown(f"Found {len(voice_history)} voiceover generations.")
+            voice_history = voice_history.sort_values('timestamp', ascending=False)
+
+            # Display in a grid
+            st.markdown('<div class="history-grid">', unsafe_allow_html=True)
+            rows = [voice_history.iloc[i:i+2] for i in range(0, len(voice_history), 2)]
+            for row_items in rows:
+                cols = st.columns(2)
+                for i, (_, row) in enumerate(row_items.iterrows()):
+                    if i < len(cols):
+                        with cols[i]:
+                            with st.container(border=True, height=350):
+                                display_history_voice_card(row)
+            st.markdown('</div>', unsafe_allow_html=True)
+
+    # All Images Tab
+    with history_tabs[3]:
+        # Filter images only
+        image_history = history_data[history_data['type'] == 'image'].copy()
+        
+        if image_history.empty:
+            st.info("No source images in history yet.")
+        else:
+            # Removed the direct image selection dropdown - it's no longer needed
+            
+            # Filtering options
+            st.markdown("### Filter Source Images")
+            col1, col2 = st.columns([3, 2])
+            with col1:
+                search_term = st.text_input("Search by filename:", key="image_search", 
+                                          placeholder="Enter filename or leave empty to show all")
+            with col2:
+                sort_order = st.selectbox("Sort by:", ["Newest first", "Oldest first"], 
+                                        key="image_sort")
+            
+            # Apply filters
+            if search_term:
+                # Search in parameters for filename
+                image_history = image_history[image_history['params'].apply(
+                    lambda x: search_term.lower() in json.loads(x).get('filename', '').lower() 
+                    if pd.notna(x) and x else False
+                )]
+            
+            # Sort images
+            if sort_order == "Newest first":
+                image_history = image_history.sort_values('timestamp', ascending=False)
+            else:
+                image_history = image_history.sort_values('timestamp', ascending=True)
+            
+            # Add pagination for images
+            total_images = len(image_history)
+            items_per_page = 10
+            
+            # Calculate max pages and add pagination controls
+            max_pages = (total_images + items_per_page - 1) // items_per_page  # Ceiling division
+            
+            # Initialize or update page number in session state
+            if "image_page" not in st.session_state:
+                st.session_state.image_page = 0
+                
+            st.markdown(f"### Source Images ({total_images})")
+            
+            # Add pagination controls
+            col1, col2, col3 = st.columns([1, 3, 1])
+            with col1:
+                if st.button("◀ Previous", disabled=(st.session_state.image_page <= 0), key="prev_image"):
+                    st.session_state.image_page = max(0, st.session_state.image_page - 1)
+                    st.rerun()
+            
+            with col2:
+                st.markdown(f"**Page {st.session_state.image_page + 1} of {max(1, max_pages)}** (showing {min(items_per_page, total_images - st.session_state.image_page * items_per_page)} of {total_images} images)")
+                
+            with col3:
+                if st.button("Next ▶", disabled=(st.session_state.image_page >= max_pages - 1), key="next_image"):
+                    st.session_state.image_page = min(max_pages - 1, st.session_state.image_page + 1)
+                    st.rerun()
+            
+            # Get the images for the current page
+            start_idx = st.session_state.image_page * items_per_page
+            end_idx = min(start_idx + items_per_page, total_images)
+            page_images = image_history.iloc[start_idx:end_idx]
+            
+            # Create a grid layout using custom CSS
+            st.markdown('<div class="history-grid">', unsafe_allow_html=True)
+            
+            # Create rows for every 2 images to ensure proper grid layout
+            rows = [page_images.iloc[i:i+2] for i in range(0, len(page_images), 2)]
+            
+            for row_items in rows:
+                cols = st.columns(2)
+                
+                for i, (_, row) in enumerate(row_items.iterrows()):
+                    if i < len(cols):
+                        with cols[i]:
+                            # Remove the empty div and just display the card contents directly
+                            display_history_image_card(row)
+            
+            st.markdown('</div>', unsafe_allow_html=True)
+            
+            # Add pagination controls at the bottom too
+            col1, col2, col3 = st.columns([1, 3, 1])
+            with col1:
+                if st.button("◀ Previous", disabled=(st.session_state.image_page <= 0), key="prev_image_bottom"):
+                    st.session_state.image_page = max(0, st.session_state.image_page - 1)
+                    st.rerun()
+            
+            with col2:
+                st.markdown(f"**Page {st.session_state.image_page + 1} of {max(1, max_pages)}**")
+                
+            with col3:
+                if st.button("Next ▶", disabled=(st.session_state.image_page >= max_pages - 1), key="next_image_bottom"):
+                    st.session_state.image_page = min(max_pages - 1, st.session_state.image_page + 1)
+                    st.rerun()
+    
+    # All History Tab
+    with history_tabs[4]:
+        st.markdown("### Complete History")
+        
+        # Add filter options
+        col1, col2, col3, col4 = st.columns([1, 1, 1, 1])
+        with col1:
+            filter_type = st.selectbox("Filter by type:", ["All", "Video", "Image"], key="type_filter")
+        with col2:
+            sort_field = st.selectbox("Sort by:", ["Date", "Type"], key="sort_field")
+        with col3:
+            sort_order = st.selectbox("Order:", ["Newest first", "Oldest first"], key="sort_order")
+        with col4:
+            view_mode = st.selectbox("View as:", ["Table", "Grid"], key="view_mode")
+        
+        # Apply filters
+        filtered_history = history_data.copy()
+        
+        if filter_type == "Video":
+            filtered_history = filtered_history[filtered_history['type'] == 'video']
+        elif filter_type == "Image":
+            filtered_history = filtered_history[filtered_history['type'] == 'image']
+        
+        # Apply sort
+        if sort_field == "Date":
+            if sort_order == "Newest first":
+                filtered_history = filtered_history.sort_values('timestamp', ascending=False)
+            else:
+                filtered_history = filtered_history.sort_values('timestamp', ascending=True)
+        else:  # Sort by type
+            if sort_order == "Newest first":
+                filtered_history = filtered_history.sort_values(['type', 'timestamp'], ascending=[True, False])
+            else:
+                filtered_history = filtered_history.sort_values(['type', 'timestamp'], ascending=[True, True])
+        
+        # Display data based on selected view mode
+        if filtered_history.empty:
+            st.info("No history data found with these filters.")
+        else:
+            if view_mode == "Table":
+                # Create a more readable dataframe for display
+                display_df = filtered_history.copy()
+                
+                # Convert timestamp
+                display_df['timestamp'] = pd.to_datetime(display_df['timestamp']).dt.strftime("%Y-%m-%d %H:%M:%S")
+                
+                # Rename columns
+                display_df = display_df.rename(columns={
+                    'timestamp': 'Generated',
+                    'type': 'Type',
+                    'uri': 'URI',
+                    'prompt': 'Prompt'
+                })
+                
+                # Drop params column as it's not very readable in a table
+                if 'params' in display_df.columns:
+                    display_df = display_df.drop(columns=['params'])
+                
+                # Truncate prompt for better display
+                display_df['Prompt'] = display_df['Prompt'].apply(lambda x: x[:50] + "..." if isinstance(x, str) and len(x) > 50 else x)
+                
+                # Display table with better formatting
+                st.dataframe(
+                    display_df,
+                    use_container_width=True,
+                    column_config={
+                        "Generated": st.column_config.DatetimeColumn(
+                            "Generated",
+                            help="When this item was created",
+                            format="MMM DD, YYYY, hh:mm a",
+                            width="medium"
+                        ),
+                        "Type": st.column_config.TextColumn(
+                            "Type",
+                            help="Item type (video or image)",
+                            width="small"
+                        ),
+                        "URI": st.column_config.TextColumn(
+                            "URI",
+                            help="Google Cloud Storage URI",
+                            width="large"
+                        ),
+                        "Prompt": st.column_config.TextColumn(
+                            "Prompt",
+                            help="Prompt used for generation",
+                            width="large"
+                        )
+                    }
+                )
+            else:  # Grid view
+                # Create a grid layout using custom CSS
+                st.markdown('<div class="history-grid">', unsafe_allow_html=True)
+                
+                # Create rows for every 2 items to ensure proper grid layout
+                rows = [filtered_history.iloc[i:i+2] for i in range(0, len(filtered_history), 2)]
+                
+                for row_items in rows:
+                    cols = st.columns(2)
+                    
+                    for i, (_, row) in enumerate(row_items.iterrows()):
+                        if i < len(cols):
+                            with cols[i]:
+                                # Remove the empty div and just display the card contents directly
+                                # Fix: Only call the appropriate display function based on type
+                                if row['type'] == 'video':
+                                    display_history_video_card(row)
+                                else:
+                                    display_history_image_card(row)
+                
+                st.markdown('</div>', unsafe_allow_html=True)
+            
+            # Add export options
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("Download as CSV"):
+                    # Prepare data for download
+                    csv = filtered_history.to_csv(index=False)
+                    
+                    # Create download button
+                    st.download_button(
+                        label="Download CSV",
+                        data=csv,
+                        file_name="veo2_history.csv",
+                        mime="text/csv"
+                    )
+    
+    # Fullscreen view removed as the buttons that triggered it have been removed
+    # Direct links to open videos/images in new tabs are now provided directly in the cards
+    
+    logger.end_section()
+
+def display_history_video_card(row):
+    """Display a video history card with details and buttons."""
+    uri = row['uri']
+    timestamp = row['timestamp']
+    prompt = row.get('prompt', 'No prompt available.')
+    params = _parse_history_params(row.get('params', {}))
+
+    # Generate a signed URL for the video
+    try:
+        # Check if we already have a cached signed URL for this video
+        cache_key = f"signed_url_{uri}"
+        if cache_key in st.session_state and st.session_state[cache_key]["expiry"] > time.time():
+            signed_url = st.session_state[cache_key]["url"]
+
+            print(f"generated signed url {signed_url}")
+        else:
+            signed_url = generate_signed_url(uri, expiration=3600)  # 1 hour expiration
+            # Cache the signed URL with expiration
+            st.session_state[cache_key] = {
+                "url": signed_url,
+                "expiry": time.time() + 3500  # Cache for slightly less than the actual expiration
+            }
+    except Exception as e:
+        st.error(f"Error generating signed URL: {e}")
+        signed_url = None
+
+    # Display the video
+    if signed_url:
+        print(f"generated signed url {signed_url}")
+        try:
+            st.video(signed_url)
+        except Exception as e:
+            st.error(f"Error displaying video: {e}")
+            st.markdown(f'<a href="{signed_url}" target="_blank">Open video in new tab</a>', unsafe_allow_html=True)
+    else:
+        st.error("Could not generate a signed URL for this video.")
+
+    # Handle the timestamp which may be a datetime object or NaT
+    try:
+        if pd.notna(timestamp):
+            # Format the datetime object
+            formatted_time = timestamp.strftime('%Y-%m-%d %H:%M:%S')
+        else:
+            formatted_time = "Unknown"
+    except AttributeError:
+        # Fallback for older data that might not be a datetime object
+        formatted_time = str(timestamp)
+
+    st.markdown(f'<div class="history-meta">Generated: {formatted_time}</div>', unsafe_allow_html=True)
+
+    # Display URI in a code block for easy copying
+    st.code(uri, language="bash")
+
+    # Create a clean parameters display
+    # Include prompt in the parameters if available
+    display_params = params.copy() if params else {}
+    if prompt and prompt.strip() and prompt != 'No prompt available.':
+        if 'prompt' not in display_params:
+            display_params['prompt'] = prompt
+
+    if display_params:
+        # Ensure parameters use proper API camelCase naming convention
+        if 'negative_prompt' in display_params and 'negativePrompt' not in display_params:
+            display_params['negativePrompt'] = display_params.pop('negative_prompt')
+        if 'aspect_ratio' in display_params and 'aspectRatio' not in display_params:
+            display_params['aspectRatio'] = display_params.pop('aspect_ratio')
+        if 'duration_seconds' in display_params and 'durationSeconds' not in display_params:
+            display_params['durationSeconds'] = display_params.pop('duration_seconds')
+        if 'sample_count' in display_params and 'sampleCount' not in display_params:
+            display_params['sampleCount'] = display_params.pop('sample_count')
+        if 'person_generation' in display_params and 'personGeneration' not in display_params:
+            display_params['personGeneration'] = display_params.pop('person_generation')
+
+        # Display parameters in an expander with a clear title
+        with st.expander("Video Details", expanded=False):
+            params_str = json.dumps(display_params, indent=2)
+            st.code(params_str, language="json")
+
+    # Provide direct link to open in new tab
+    if signed_url:
+        st.markdown(f'<div style="text-align: right;"><a href="{signed_url}" target="_blank" style="font-size: 0.8rem;">Open in new tab</a></div>', unsafe_allow_html=True)
+
+def clear_history():
+    """Clear all history data from Firestore and associated GCS files."""
+    logger.start_section("Clear History")
+
+    if not FIRESTORE_AVAILABLE:
+        logger.error("Attempted to clear history, but Firestore is not available.")
+        raise Exception("Firestore is not available. Cannot clear history.")
+
+    logger.info("Clearing history data...")
+    
+    try:
+        # 1. Delete all documents in the 'history' collection from Firestore using batches
+        history_ref = db.collection('history')
+        docs_deleted_count = 0
+        while True:
+            # Get a batch of documents
+            docs = history_ref.limit(500).stream()
+            batch = db.batch()
+            count_in_batch = 0
+            for doc in docs:
+                batch.delete(doc.reference)
+                count_in_batch += 1
+            
+            if count_in_batch == 0:
+                # No more documents to delete
+                break
+            
+            # Commit the batch
+            batch.commit()
+            docs_deleted_count += count_in_batch
+            logger.debug(f"Deleted {count_in_batch} Firestore documents in a batch.")
+        
+        logger.info(f"Deleted {docs_deleted_count} documents from the 'history' collection in Firestore.")
+
+        # 2. Delete all images in the history images directory from GCS
+        try:
+            storage_client = storage.Client()
+            bucket_name = config.STORAGE_URI.replace("gs://", "").split("/")[0]
+            history_path = config.HISTORY_FOLDER
+            bucket = storage_client.bucket(bucket_name)
+            
+            image_prefix = f"{history_path}/images/"
+            blobs_to_delete = list(bucket.list_blobs(prefix=image_prefix))
+            
+            if blobs_to_delete:
+                for blob in blobs_to_delete:
+                    blob.delete()
+                logger.info(f"Deleted {len(blobs_to_delete)} images from GCS history folder: {image_prefix}")
+            else:
+                logger.info("No images found in GCS history folder to delete.")
+
+        except Exception as gcs_e:
+            logger.error(f"Error clearing GCS history images: {str(gcs_e)}")
+            st.warning(f"Could not clear all GCS history images: {str(gcs_e)}")
+
+        logger.success("History cleared successfully")
+        
+        # 3. Clear session state
+        if "history_data" in st.session_state:
+            st.session_state.history_data = pd.DataFrame(columns=['timestamp', 'type', 'uri', 'prompt', 'params'])
+        st.session_state.history_loaded = False
+        
+        return True
+    except Exception as e:
+        logger.error(f"Error clearing history: {str(e)}")
+        raise e
+
+def _parse_storage_uri(uri):
+    """Parse a GCS URI to extract bucket name and folder path."""
+    # Remove gs:// prefix
+    if uri.startswith('gs://'):
+        uri = uri[5:]
+    
+    # Split into bucket and folder path
+    parts = uri.split('/', 1)
+    bucket_name = parts[0]
+    folder_path = parts[1] if len(parts) > 1 else ''
+    
+    return bucket_name, folder_path
+
+def generate_video(
+    project_id,
+    prompt,
+    input_image=None,
+    input_image_path=None,
+    aspect_ratio="16:9",
+    resolution=None,
+    enable_audio=None,
+    negative_prompt=None,
+    model=None,
+    person_generation="allow_adult",
+    sample_count=1,
+    seed=None,
+    storage_uri=None,
+    duration_seconds=8,
+    enhance_prompt=True,
+    wait_for_completion=True,
+    poll_interval=10,
+    max_attempts=30,
+    show_full_response=False,
+    enable_streaming=True
+):
+    """Generate a video using the Veo2 API and display results in Streamlit.
+    
+    This function handles the entire video generation workflow including:
+    1. Initializing the API client
+    2. Encoding images if provided
+    3. Submitting the generation request with proper API parameters
+    4. Polling for completion
+    5. Processing results
+    6. Adding to history
+    7. Displaying the generated videos
+    
+    Note: The Veo2API client expects snake_case parameters but internally converts them
+    to camelCase as required by the API (aspectRatio, negativePrompt, etc.)
+    """
+    
+    # Input validation
+    if not project_id:
+        st.error("⚠️ Please enter a valid Google Cloud Project ID")
+        return
+    
+    if sample_count > 1 and not storage_uri:
+        st.warning("⚠️ When generating multiple videos, it's recommended to provide a storage URI")
+    
+    # Show a spinner while generating
+    with st.spinner("🎬 Generating your video... This may take several minutes"):
+        try:
+            # Initialize the Veo2 API client
+            client = Veo2API(project_id)
+            
+            # Prepare image if provided
+            if input_image_path:
+                input_image = client.encode_image_file(input_image_path)
+            
+            # Save parameters for history tracking using the exact API parameter names (camelCase)
+            # These match what the Veo2API client will send to the API
+            params = {
+                "prompt": prompt,
+                "aspectRatio": aspect_ratio,
+                "durationSeconds": duration_seconds,
+                "sampleCount": sample_count,
+                "negativePrompt": negative_prompt if negative_prompt else "",
+                "personGeneration": person_generation,
+                "seed": seed if seed else "random"
+            }
+
+            if model == "veo-2.0-generate-001":
+            
+            # Generate the video - The Veo2API client internally converts snake_case to camelCase
+                response = client.generate_video(
+                    prompt=prompt,
+                    input_image=input_image,
+                    aspect_ratio=aspect_ratio,
+                    negative_prompt=negative_prompt,
+                    person_generation=person_generation,
+                    model=model,  # Use the selected model
+                    sample_count=sample_count,
+                    seed=seed,
+                    storage_uri=storage_uri,
+                    duration_seconds=duration_seconds,
+                    enhance_prompt=enhance_prompt
+                )
+            else:
+                response = client.generate_video_veo3(
+                    prompt=prompt,
+                    input_image=input_image,
+                    aspect_ratio=aspect_ratio,
+                    negative_prompt=negative_prompt,
+                    person_generation=person_generation,
+                    model=model,  # Use the selected model
+                    sample_count=sample_count,
+                    # aspect_ratio=aspect_ratio,
+                    resolution=resolution,
+                    seed=seed,
+                    storage_uri=storage_uri,
+                    duration_seconds=duration_seconds,
+                    enhance_prompt=enhance_prompt,
+                    generateAudio=enable_audio
+                )
+            
+            st.markdown(f"{model} model is being used")
+
+            # Extract operation ID
+            operation_name = response.get("name", "")
+            if not operation_name:
+                st.error("⚠️ Failed to start video generation")
+                st.json(response)
+                return
+            
+            operation_id = operation_name.split("/")[-1]
+            st.info(f"✅ Operation started: {operation_id}")
+            
+            # Wait for completion if requested
+            if wait_for_completion:
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                
+                for attempt in range(max_attempts):
+                    progress = min(attempt / max_attempts, 0.95)  # Cap at 95% until complete
+                    progress_bar.progress(progress)
+                    status_text.text(f"Checking status... Attempt {attempt+1}/{max_attempts}")
+                    
+                    response = client.poll_operation(operation_id)
+                    
+                    if response.get("done", False):
+                        progress_bar.progress(1.0)
+                        status_text.text("Video generation complete!")
+                        break
+                    
+                    if attempt < max_attempts - 1:
+                        status_text.text(f"Still processing... Waiting {poll_interval} seconds")
+                        time.sleep(poll_interval)
+                else:
+                    st.warning("⚠️ Operation timeout - The video generation is still in progress but we've stopped waiting")
+                    st.warning(f"You can check the status later with operation ID: {operation_id}")
+                    return
+                
+                result = response
+                
+                # Check if there's an error in the response
+                if "error" in result:
+                    error_msg = result.get("error", {}).get("message", "Unknown error")
+                    st.error(f"⚠️ Video generation failed: {error_msg}")
+                    if show_full_response:
+                        with st.expander("Error details"):
+                            st.json(result)
+                    return
+                
+                # Display the results
+                st.success("✅ Video generation complete!")
+                
+                # Display the full response if requested
+                if show_full_response:
+                    with st.expander("Full API Response"):
+                        st.json(result)
+                
+                # Extract video URIs
+                video_uris = client.extract_video_uris(result)
+                
+                if video_uris:
+                    # Store videos in session state
+                    if 'generated_videos' not in st.session_state:
+                        st.session_state.generated_videos = []
+                    
+                    # Add new videos to session state and history
+                    for uri in video_uris:
+                        # Only add if not already in the list
+                        if uri not in [v['uri'] for v in st.session_state.generated_videos]:
+                            # Create timestamp for this video
+                            timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+                            
+                            # Add to session state
+                            st.session_state.generated_videos.append({
+                                'uri': uri,
+                                'timestamp': timestamp
+                            })
+                            
+                            # Add to history - ONLY done after successful generation
+                            try:
+                                logger.info(f"Adding video to history: {uri}")
+                                if FIRESTORE_AVAILABLE:
+                                    doc_ref = db.collection('history').document()
+                                    doc_ref.set({
+                                        'timestamp': firestore.SERVER_TIMESTAMP,
+                                        'type': "video", 'uri': uri, 'prompt': prompt, 'params': params
+                                    })
+                                    logger.info(f"Added video {uri} to Firestore history.")
+
+                                logger.success("Successfully added video to Firestore history")
+                            except Exception as e:
+                                logger.error(f"Could not add video to history: {str(e)}")
+                                st.warning(f"Could not add video to history: {str(e)}")
+                    
+                    display_videos(video_uris, client, enable_streaming)
+                else:
+                    st.warning("No video URIs found in the response. The video might still be processing or available in a different format.")
+                    if not show_full_response:
+                        st.info("Try enabling 'Show full API response' in the sidebar to see the complete response.")
+            else:
+                st.info(f"✅ Operation started: {operation_id}")
+                st.info("Check back later for results")
+        
+        except Exception as e:
+            logger.error(f"Error during video generation: {str(e)}")
+            st.error(f"⚠️ Error: {str(e)}")
+            st.exception(e)
+
+def generate_image(
+    project_id,
+    prompt,
+    model,
+    negative_prompt,
+    sample_count,
+    aspect_ratio,
+    seed,
+    person_generation,
+    safety_filter_level,
+    storage_uri,
+    enhance_prompt,
+):
+    """Generate an image using Imagen and display results."""
+    if not project_id:
+        st.error("⚠️ Please enter a valid Google Cloud Project ID.")
+        return
+    if not storage_uri:
+        st.error("⚠️ Please provide a GCS Storage URI in the settings to save generated images.")
+        return
+
+    with st.spinner("🎨 Generating your image with Imagen..."):
+        try:
+            client = Veo2API(project_id) # Reusing the client
+
+            response = client.generate_image_imagen(
+                prompt=prompt,
+                model=model,
+                negative_prompt=negative_prompt,
+                sample_count=sample_count,
+                aspect_ratio=aspect_ratio,
+                seed=seed,
+                person_generation= person_generation,
+                safety_filter_level=safety_filter_level,
+                storage_uri=storage_uri,
+                enhance_prompt=enhance_prompt
+            )
+
+            if "error" in response:
+                error_msg = response.get("error", {}).get("message", "Unknown error")
+                st.error(f"⚠️ Image generation failed: {error_msg}")
+                st.json(response)
+                return
+
+            # Try to get URIs first, as this is the expected response when storage_uri is provided
+            image_uris = client.extract_image_uris(response)
+            image_data_list = []
+
+            # If no URIs are found, fall back to checking for base64 encoded data
+            if not image_uris:
+                image_data_list = client.extract_image_data(response)
+
+            if not image_uris and not image_data_list:
+                st.warning("Image generation succeeded, but no images were returned. This could be due to safety filters.")
+                st.json(response)
+                return
+
+            st.success(f"✅ Successfully generated {len(image_uris) or len(image_data_list)} image(s)!")
+
+            # If we received base64 data, we need to upload it to GCS to get a URI
+            if image_data_list:
+                st.info("Uploading generated images to your history bucket...")
+                uploaded_uris = []
+                for i, image_data in enumerate(image_data_list):
+                    image_to_upload = Image.open(io.BytesIO(image_data))
+                    # Use history manager to upload
+                    uri = history_manager.upload_image_to_history(image_to_upload, image_name=f"imagen_{uuid.uuid4().hex}.png")
+                    uploaded_uris.append(uri)
+                # The final list of URIs is the one we just uploaded
+                image_uris = uploaded_uris
+
+            # Add to history
+            if image_uris and FIRESTORE_AVAILABLE:
+                params = {
+                    "prompt": prompt, "model": model, "negativePrompt": negative_prompt,
+                    "sampleCount": sample_count, "aspectRatio": aspect_ratio, "seed": seed if seed else "random",
+                    "person_generation": person_generation, "safetyFilterThreshold": safety_filter_level,
+                }
+                for uri in image_uris:
+                    db.collection('history').document().set({
+                        'timestamp': firestore.SERVER_TIMESTAMP, 'type': 'image', 'uri': uri,
+                        'prompt': prompt, 'params': params
+                    })
+
+            # Display images
+            display_images(image_uris)
+
+        except Exception as e:
+            logger.error(f"Error during image generation: {str(e)}")
+            st.error(f"⚠️ Error: {str(e)}")
+            st.exception(e)
+
+
+def display_videos(video_uris, client, enable_streaming=True):
+    """Display a list of videos in Streamlit."""
+    if not video_uris:
+        st.warning("No videos were generated")
+        return
+    
+    st.subheader(f"Generated {len(video_uris)} video(s):")
+    
+    for i, uri in enumerate(video_uris):
+        # Create a collapsible section for each video
+        with st.expander(f"Video {i+1}", expanded=True):
+            display_single_video(uri, client, enable_streaming)
+
+def display_single_video(uri, client, enable_streaming):
+    """Helper function to display a single video."""
+    # Display the raw URI
+    st.markdown(f"**URI**: {uri}")
+    
+    # Always display GCS links clearly
+    if uri.startswith("gs://"):
+        st.code(uri, language="bash")
+    
+    try:
+        # Handle different URI types
+        if uri.startswith("http") and not uri.startswith("[Base64"):
+            # Direct HTTP URL - can be embedded directly
+            st.markdown(f"**Direct streaming link**: [Open in new tab]({uri})")
+            
+            # Embed with HTML for better controls including fullscreen
+            st.markdown(
+                f"""
+                <div style="position: relative; padding-bottom: 56.25%; height: 0;">
+                    <iframe src="{uri}" style="position: absolute; top: 0; left: 0; width: 100%; height: 100%;" 
+                        frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; fullscreen" 
+                        allowfullscreen>
+                    </iframe>
+                </div>
+                """, 
+                unsafe_allow_html=True
+            )
+            
+        elif uri.startswith("gs://") and enable_streaming:
+            # GCS URI - use cached URL if available, otherwise generate a new one
+            auth_url = None
+            current_time = time.time()
+            
+            # Check if URL is cached and still valid
+            if uri in st.session_state.signed_url_cache:
+                cached_url, expiry_time = st.session_state.signed_url_cache[uri]
+                if current_time < expiry_time:
+                    auth_url = cached_url
+                    logger.debug(f"Using cached URL for {uri}, valid for {int(expiry_time - current_time)} more seconds")
+            
+            # Generate a new URL if not cached or expired
+            if auth_url is None:
+                with st.spinner("Generating streaming URL..."):
+                    try:
+                        auth_url = client.generate_signed_url(uri)
+                        
+                        # Cache the URL with a 50-minute expiry (tokens typically last 1 hour)
+                        expiry_time = current_time + (50 * 60)  # 50 minutes in seconds
+                        st.session_state.signed_url_cache[uri] = (auth_url, expiry_time)
+                        logger.debug(f"Generated and cached new URL for {uri}, expires in 50 minutes")
+                        
+                        st.success(f"✅ Streaming URL generated")
+                    except Exception as e:
+                        st.error(f"⚠️ Failed to generate streaming URL: {str(e)}")
+                        st.info("""
+                        To access the video manually:
+                        1. Use the Google Cloud Console: https://console.cloud.google.com/storage/browser
+                        2. Navigate to the bucket and folder
+                        3. Download the video file
+                        """)
+                        return
+            
+            # Show direct streaming link
+            st.markdown(f"**Streaming link**: [Open in new tab]({auth_url})")
+            
+            # Embed with HTML for better controls including fullscreen
+            st.markdown(
+                f"""
+                <div style="position: relative; padding-bottom: 56.25%; height: 0;">
+                    <video controls style="position: absolute; top: 0; left: 0; width: 100%; height: 100%;">
+                        <source src="{auth_url}" type="video/mp4">
+                        Your browser does not support the video tag.
+                    </video>
+                </div>
+                """, 
+                unsafe_allow_html=True
+            )
+        
+        elif uri.startswith("gs://") and not enable_streaming:
+            # GCS URI without streaming
+            st.info("""
+            ⚠️ Video is available in Google Cloud Storage. To access it:
+            1. Use the Google Cloud Console: https://console.cloud.google.com/storage/browser
+            2. Navigate to the bucket and folder
+            3. Download the video file
+            
+            You can enable streaming in the sidebar to view the video directly here.
+            """)
+            
+        elif uri.startswith("[Base64"):
+            # Base64 encoded data
+            st.info("The video is available as base64-encoded data in the API response. Enable 'Show full API response' to see it.")
+            
+        else:
+            # Unknown format
+            st.warning(f"Unknown URI format: {uri}")
+            
+    except Exception as e:
+        st.error(f"Error displaying video: {str(e)}")
+
+def display_images(image_uris):
+    """Display a list of generated images."""
+    if not image_uris:
+        return
+
+    num_images = len(image_uris)
+    cols = st.columns(num_images) if num_images > 0 else [st]
+    for i, uri in enumerate(image_uris):
+        with cols[i % len(cols)]:
+            try:
+                signed_url = get_cached_signed_url(uri)
+                st.image(signed_url, caption=f"Generated Image {i+1}", use_container_width=True)
+                st.markdown(f'<div style="text-align: center;"><a href="{signed_url}" target="_blank" style="font-size: 0.8rem;">Open in new tab</a></div>', unsafe_allow_html=True)
+            except Exception as e:
+                st.error(f"Error displaying image {i+1}: {e}")
+
+def get_cached_signed_url(uri, expiration=3600):
+    """Get a cached signed URL or generate a new one."""
+    cache_key = f"signed_url_{uri}"
+    current_time = time.time()
+    
+    if cache_key in st.session_state and st.session_state[cache_key]["expiry"] > current_time:
+        signed_url = st.session_state[cache_key]["url"]
+        logger.debug(f"Using cached URL for {uri}")
+        return signed_url
+    else:
+        logger.debug(f"Generating new signed URL for {uri}")
+        signed_url = generate_signed_url(uri, expiration=expiration)
+        # Cache the URL with expiration
+        st.session_state[cache_key] = {
+            "url": signed_url,
+            "expiry": current_time + (expiration - 100)  # Cache for slightly less than the actual expiration
+        }
+        return signed_url
+
+def _parse_history_params(params_json):
+    """Safely parse the params JSON/string from a history record."""
+    try:
+        if isinstance(params_json, dict):
+            return params_json
+        if not isinstance(params_json, str):
+            return {}
+        # First try to parse as JSON
+        try:
+            return json.loads(params_json)
+        except (json.JSONDecodeError, TypeError):
+            # If that fails, try to evaluate as a string representation of a dict
+            import ast
+            try:
+                return ast.literal_eval(params_json)
+            except (SyntaxError, ValueError):
+                return {}
+    except Exception as e:
+        print(f"Error parsing params: {e}")
+        return {}
+
+def display_history_audio_card(row):
+    """Display an audio history card with details and buttons."""
+    uri = row['uri']
+    timestamp = row['timestamp']
+    prompt = row.get('prompt', 'No prompt available.')
+    params = _parse_history_params(row.get('params', {}))
+
+    try:
+        signed_url = get_cached_signed_url(uri)
+    except Exception as e:
+        st.error(f"Error generating signed URL: {e}")
+        signed_url = None
+
+    if signed_url:
+        st.audio(signed_url, format="audio/wav") # The API saves as WAV
+    else:
+        st.error("Could not generate a signed URL for this audio.")
+
+    try:
+        if pd.notna(timestamp):
+            formatted_time = timestamp.strftime('%Y-%m-%d %H:%M:%S')
+        else:
+            formatted_time = "Unknown"
+    except AttributeError:
+        formatted_time = str(timestamp)
+    
+    st.markdown(f'<div class="history-meta">Generated: {formatted_time}</div>', unsafe_allow_html=True)
+    st.code(uri, language="bash")
+
+    with st.expander("Audio Details", expanded=False):
+        st.markdown(f"**Prompt:**")
+        st.text(prompt)
+        if params:
+            st.markdown(f"**Parameters:**")
+            st.json(params)
+
+    if signed_url:
+        st.markdown(f'<div style="text-align: right;"><a href="{signed_url}" target="_blank" style="font-size: 0.8rem;">Open in new tab</a></div>', unsafe_allow_html=True)
+
+def display_history_voice_card(row):
+    """Display a voiceover history card with details and buttons."""
+    uri = row['uri']
+    timestamp = row['timestamp']
+    script = row.get('prompt', 'No script available.')
+    params = _parse_history_params(row.get('params', {}))
+
+    try:
+        signed_url = get_cached_signed_url(uri)
+    except Exception as e:
+        st.error(f"Error generating signed URL: {e}")
+        signed_url = None
+
+    if signed_url:
+        st.audio(signed_url, format="audio/wav") # TTS often produces WAV
+    else:
+        st.error("Could not generate a signed URL for this voiceover.")
+
+    try:
+        if pd.notna(timestamp):
+            formatted_time = timestamp.strftime('%Y-%m-%d %H:%M:%S')
+        else:
+            formatted_time = "Unknown"
+    except AttributeError:
+        formatted_time = str(timestamp)
+    
+    st.markdown(f'<div class="history-meta">Generated: {formatted_time}</div>', unsafe_allow_html=True)
+    st.code(uri, language="bash")
+
+    with st.expander("Voiceover Details", expanded=False):
+        st.markdown(f"**Script:**")
+        st.text(script)
+        if params:
+            st.markdown(f"**Parameters:**")
+            st.json(params)
+
+    if signed_url:
+        st.markdown(f'<div style="text-align: right;"><a href="{signed_url}" target="_blank" style="font-size: 0.8rem;">Open in new tab</a></div>', unsafe_allow_html=True)
+
+def generate_audio(
+    project_id,
+    prompt,
+    sample_count=1,
+    negative_prompt=None,
+    seed=None,
+    storage_uri=None,
+    wait_for_completion=True,
+    poll_interval=10,
+    max_attempts=30,
+    show_full_response=False,
+    enable_streaming=True
+):
+    """Generate audio using the generative audio API and display results in Streamlit."""
+    # Input validation (as needed)
+    if not project_id:
+        st.error("⚠️ Please enter a valid Google Cloud Project ID")
+        return
+
+    if sample_count > 1 and not storage_uri:
+        st.warning("⚠️ When generating multiple audio samples, it's recommended to provide a storage URI")
+
+    # Placeholder spinner
+    with st.spinner("🎵 Generating your audio... This may take a moment"):
+        try:
+            # Prepare API parameters for history
+            params = {
+                "prompt": prompt,
+                "sampleCount": sample_count,
+                "negativePrompt": negative_prompt if negative_prompt else "",
+                "seed": seed if seed else "random",
+            }
+
+            # Make the API call
+            response = client.generate_audio(
+                prompt=prompt,
+                sample_count=sample_count,
+                negative_prompt=negative_prompt,
+                seed=seed,
+                storage_uri=storage_uri,
+            )
+
+            # The response will contain the URIs of the generated audio files.
+            audio_uris = response if isinstance(response, list) else []
+
+            # Add to history if URIs were generated
+            if audio_uris and FIRESTORE_AVAILABLE:
+                logger.info(f"Adding {len(audio_uris)} audio entries to Firestore history.")
+                for uri in audio_uris:
+                    try:
+                        doc_ref = db.collection('history').document()
+                        doc_ref.set({
+                            'timestamp': firestore.SERVER_TIMESTAMP,
+                            'type': "audio",
+                            'uri': uri,
+                            'prompt': prompt,
+                            'params': params
+                        })
+                        logger.debug(f"Added audio {uri} to Firestore history.")
+                    except Exception as e:
+                        logger.error(f"Could not add audio {uri} to history: {str(e)}")
+                logger.success("Successfully added audio generation details to Firestore.")
+
+        except Exception as e:
+            logger.error(f"Error during audio generation: {str(e)}")
+            st.error(f"⚠️ Error: {str(e)}")
+            st.exception(e)
+
+
+def display_audios(audio_uris, enable_streaming=True):
+    """Display a list of audio samples in Streamlit (placeholder)."""
+    if not audio_uris:
+        st.warning("No audio samples were generated (placeholder)")
+        return
+
+    st.subheader(f"Generated {len(audio_uris)} audio sample(s): (Placeholder)")
+
+    for i, uri in enumerate(audio_uris):
+        # Create a collapsible section for each audio
+        with st.expander(f"Audio {i+1}", expanded=True):
+            display_single_audio(uri, enable_streaming)
+
+
+def display_single_audio(uri, enable_streaming):
+    """Helper function to display a single audio sample (placeholder)."""
+    # Display the raw URI
+    st.markdown(f"**URI**: {uri} (Placeholder)")
+
+    # Always display GCS links clearly
+    if uri.startswith("gs://"):
+        st.code(uri, language="bash")
+
+    try:
+        # Handle different URI types (adjust for your audio API)
+        if uri.startswith("http") and not uri.startswith("[Base64"):
+            # Direct HTTP URL - can be embedded directly (adjust if needed for audio)
+            st.markdown(f"**Direct link**: [Open in new tab]({uri}) (Placeholder)")
+            st.audio(uri)  # Use st.audio for playback
+        elif uri.startswith("gs://") and enable_streaming:
+            # GCS URI - generate a signed URL (if needed by your audio API)
+            auth_url = None
+            # You might need to adjust the logic here depending on your audio API's
+            # streaming capabilities and authentication requirements.
+            # auth_url = client.generate_signed_url(uri)  # Example (adjust as needed)
+            auth_url = uri # Placeholder - assuming direct access or other logic
+
+            if auth_url:
+                st.markdown(f"**Streaming link**: [Open in new tab]({auth_url}) (Placeholder)")
+                st.audio(auth_url)  # Use st.audio for playback
+            else:
+                st.error("⚠️ Failed to generate streaming URL (placeholder)")
+        elif uri.startswith("gs://") and not enable_streaming:
+            # GCS URI without streaming (provide instructions)
+            st.info("""
+            ⚠️ Audio is available in Google Cloud Storage. To access it:
+            1. Use the Google Cloud Console: https://console.cloud.google.com/storage/browser
+            2. Navigate to the bucket and folder
+            3. Download the audio file
+
+            You can enable streaming in the sidebar to attempt direct playback.
+            """)
+        elif uri.startswith("[Base64"):
+            # Base64 encoded data (handle as needed by your audio API)
+            st.info("The audio is available as base64-encoded data (placeholder)")
+            # You'd need to decode and handle the audio data here.
+        else:
+            # Unknown format
+            st.warning(f"Unknown URI format: {uri} (Placeholder)")
+
+    except Exception as e:
+        st.error(f"Error displaying audio: {str(e)} (Placeholder)")
+
+
+# --- Helper Function to Upload to GCS ---
+def upload_to_gcs(file_obj, bucket_name: str) -> str | None:
+    """
+    Uploads a file-like object to a GCS bucket.
+
+    Args:
+        file_obj: The file-like object to upload (e.g., from st.file_uploader or BytesIO).
+        bucket_name: The name of the target GCS bucket.
+
+    Returns:
+        The GCS URI of the uploaded file (gs://bucket/object), or None on failure.
+    """
+    if not bucket_name:
+        st.error("GCS_BUCKET_NAME environment variable is not set.")
+        logger.error("GCS_BUCKET_NAME is not set.")
+        return None
+
+    try:
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(bucket_name)
+
+        # Secure the original filename and add a unique prefix
+        original_filename = secure_filename(file_obj.name)
+        unique_filename = f"{uuid.uuid4()}-{original_filename}"
+
+        blob = bucket.blob(unique_filename)
+
+        # Reset file pointer to the beginning before reading
+        file_obj.seek(0)
+
+        # Upload the file
+        content_type = getattr(file_obj, 'content_type', file_obj.type)
+        blob.upload_from_file(file_obj, content_type=content_type)
+
+        gcs_uri = f"gs://{bucket_name}/{unique_filename}"
+        logger.info(f"Successfully uploaded file to {gcs_uri}")
+        st.success(f"✅ Image uploaded to Cloud Storage: {unique_filename}")
+        return gcs_uri
+
+    except Exception as e:
+        logger.error(f"Failed to upload to GCS: {e}")
+        st.error(f"Error uploading to Cloud Storage: {e}")
+        return None
+
+def video_upload_to_gcs(file_path: str, bucket_name: str, object_name: str) -> str | None:
+    """Uploads a local video file to a GCS bucket."""
+    if not bucket_name:
+        st.error("GCS Bucket Name is not configured correctly.")
+        return None
+    try:
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(bucket_name)
+        
+        unique_object_name = f"edited-videos/{uuid.uuid4()}-{secure_filename(object_name)}"
+        blob = bucket.blob(unique_object_name)
+
+        blob.upload_from_filename(file_path, content_type="video/mp4")
+
+        gcs_uri = f"gs://{bucket_name}/{unique_object_name}"
+        logger.info(f"Successfully uploaded video to {gcs_uri}")
+        st.success("✅ Edited video uploaded to Cloud Storage.")
+        return gcs_uri
+    except Exception as e:
+        logger.error(f"Failed to upload video to GCS: {e}")
+        st.error(f"Error uploading video to Cloud Storage: {e}")
+        return None
+
+
+def display_history_image_card(row):
+    """Display an image history card with details and buttons."""
+    # Extract data
+    uri = row['uri']
+    # Generate a unique identifier for this image based on more of the URI
+    unique_id = uri.replace("/", "_").replace(".", "_").replace(":", "_")[-20:]
+    
+    timestamp = row['timestamp']
+    params_json = row['params'] if pd.notna(row['params']) else "{}"
+    
+    # Extract the filename from the URI if nothing else is available
+    default_filename = uri.split('/')[-1] if uri else "Unknown file"
+    
+    # Parse params to get filename and other info
+    params = _parse_history_params(params_json)
+    is_generated = 'model' in params and 'imagen' in params.get('model', '')
+    filename = params.get('filename', default_filename)
+    
+    # Generate a signed URL for the image
+    try:
+
+        signed_url = get_cached_signed_url(uri)
+    except Exception as e:
+        st.error(f"Error generating signed URL: {e}")
+        signed_url = None
+    
+    # Display the image with controlled size
+    if signed_url:
+        try:
+            st.image(signed_url, use_container_width=True)
+        except Exception as e:
+            st.error(f"Error displaying image: {e}")
+            st.markdown(f'<a href="{signed_url}" target="_blank">Open image in new tab</a>', unsafe_allow_html=True)
+    else:
+        st.error("Could not generate a signed URL for this image.")
+    
+    # Display image details
+    # Handle the timestamp which may be a datetime object or NaT
+    try:
+        if pd.notna(timestamp):
+            # Format the datetime object
+            formatted_time = timestamp.strftime('%Y-%m-%d %H:%M:%S')
+        else:
+            formatted_time = "Unknown"
+    except AttributeError:
+        # Fallback for older data that might not be a datetime object
+        formatted_time = str(timestamp)
+    
+    label = "Generated" if is_generated else "Uploaded"
+    st.markdown(f'<div class="history-meta">{label}: {formatted_time}</div>', unsafe_allow_html=True)
+    if not is_generated:
+        st.markdown(f'<div class="history-meta">Filename: {filename}</div>', unsafe_allow_html=True)
+    
+    # Display parameters info if available
+    if params:
+        with st.expander("Image Details", expanded=False):
+            params_str = json.dumps(params, indent=2)
+            st.code(params_str, language="json")
+    
+    # Display URI for copying - make it more visible
+    st.markdown("**GCS URI:**")
+    st.code(uri, language="bash")
+    
+    # Provide direct link to open in new tab
+    if signed_url:
+        st.markdown(f'<div style="text-align: right;"><a href="{signed_url}" target="_blank" style="font-size: 0.8rem;">Open in new tab</a></div>', unsafe_allow_html=True)
+
+if __name__ == "__main__":
+    # Initialize minimal session state variables
+    if "selected_video_uri" not in st.session_state:
+        st.session_state.selected_video_uri = None
+        
+    if "selected_video_prompt" not in st.session_state:
+        st.session_state.selected_video_prompt = None
+    
+    # Removed the history image selection state
+    # if "selected_source_image" not in st.session_state:
+    #     st.session_state.selected_source_image = None
+    
+    if "confirm_clear_history" not in st.session_state:
+        st.session_state.confirm_clear_history = False
+    
+    # Create a custom logger instance
+    logger = Logger(debug=config.DEBUG_MODE)
+    logger.info("Starting Veo2 Video Generator app")
+    
+    # Run the app
+    main() 

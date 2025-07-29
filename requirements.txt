@@ -1,0 +1,14 @@
+requests>=2.25.1
+streamlit>=1.20.0
+pillow>=9.0.0
+python-dotenv>=1.0.0
+google-cloud-storage>=2.10.0
+pandas>=1.5.0
+google-cloud-aiplatform>=1.36.0
+google-genai
+moviepy==1.0.3
+firebase-admin
+google-cloud-firestore
+werkzeug>=2.1.0
+
+
