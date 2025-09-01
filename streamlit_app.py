@@ -3,6 +3,7 @@ Veo2 Video Generator - A Streamlit app for generating high-quality videos
 from text prompts and images using Google's Veo 2.0 API.
 """
 import os
+import mimetypes
 import uuid
 import time
 import json
@@ -10,6 +11,7 @@ import tempfile
 import io
 import sys
 import pandas as pd
+import subprocess
 from datetime import datetime
 from PIL import Image
 import streamlit as st
@@ -19,6 +21,7 @@ import numpy as np
 import firebase_admin
 from firebase_admin import credentials, firestore
 from collections import OrderedDict
+from typing import Dict, List, Optional, Union, Any
 import shutil
 from werkzeug.utils import secure_filename
 
@@ -1104,8 +1107,8 @@ def main():
         st.toggle("🌙 Dark Mode", key="dark_mode", help="Toggle between light and dark themes.")
 
     # Create tabs without using the active_tab logic which might be causing issues
-    tab1, tab2, tab_t2i, tab3, tab4, tab5, tab6 = st.tabs([
-        "🎬 Text-to-Video", "🖼️ Image-to-Video", "🎨 Text-to-Image",
+    tab1, tab2, tab_t2i, tab_i2i, tab3, tab4, tab5, tab6 = st.tabs([
+        "🎬 Text-to-Video", "🖼️ Image-to-Video", "🎨 Text-to-Image", "✨ Image Editing",
         "🎵 Text-to-Audio", "🎤 Text-to-Voiceover", "✂️ Video Editing", "📋 History"
     ])
 
@@ -1118,6 +1121,9 @@ def main():
 
     with tab_t2i:
         text_to_image_tab()
+
+    with tab_i2i:
+        image_editing_tab()
 
     with tab3:
         text_to_audio_tab()  # Add this function
@@ -1155,7 +1161,7 @@ def text_to_image_tab():
         model = st.selectbox(
             "Model",
             # Using placeholder names as requested. User can change if needed.
-            options=["imagen-3.0-generate-002","imagen-3.0-fast-generate-001", "imagen-4.0-fast-generate-preview-06-06", "imagen-4.0-generate-preview-06-06"],
+            options=["imagen-3.0-generate-002","imagen-3.0-fast-generate-001","imagen-4.0-generate-001", "imagen-4.0-ultra-generate-001", "imagen-4.0-fast-generate-001" ],
             index=0,
             help="Choose the Imagen model for generation.",
             key="t2i_model"
@@ -1169,14 +1175,25 @@ def text_to_image_tab():
             key="t2i_aspect_ratio"
         )
 
-    sample_count = st.slider(
-        "Number of Images",
-        min_value=1,
-        max_value=4,
-        value=1,
-        help="How many image variations to generate.",
-        key="t2i_sample_count"
-    )
+    col1, col2 = st.columns(2)
+    with col1:
+        sample_count = st.slider(
+            "Number of Images",
+            min_value=1,
+            max_value=4,
+            value=1,
+            help="How many image variations to generate.",
+            key="t2i_sample_count"
+        )
+    with col2:
+        resolution = st.selectbox(
+            "Output Resolution", 
+            options=["1K", "2K"] if model == "imagen-4.0-generate-001" or model == "imagen-4.0-ultra-generate-001" else ["1k"], 
+            index=0, 
+            disabled=model != "imagen-4.0-generate-001" and model != "imagen-4.0-ultra-generate-001", 
+            help="Choose the resolution of the generated image.", 
+            key="text_image_resolution"
+        )
 
     enhance_prompt = st.checkbox(
         "Enhance Prompt",
@@ -1220,6 +1237,7 @@ def text_to_image_tab():
             model=model,
             negative_prompt=negative_prompt,
             sample_count=sample_count,
+            resolution=resolution,
             aspect_ratio=aspect_ratio,
             seed=None, # Seed not exposed in this UI for simplicity
             person_generation=person_generation,
@@ -1227,6 +1245,75 @@ def text_to_image_tab():
             enhance_prompt=enhance_prompt,
             storage_uri=st.session_state.get("storage_uri", config.STORAGE_URI),
         )
+
+def image_editing_tab():
+    """Image editing tab."""
+    st.header("Image Editing with Imagen")
+    
+    input_image_files = st.file_uploader(
+        "Upload images to edit",
+        type=["jpg", "jpeg", "png", "webp"],
+        key="edit_input_image",
+        accept_multiple_files=True 
+    )
+
+    # Display uploaded images
+    if input_image_files:
+        st.image(input_image_files, caption="Input Images", width=128)
+
+    prompt = st.text_area(
+        "Prompt",
+        value="Make the lion's mane glow brighter and change the sky to a deep purple.",
+        height=100,
+        help="Describe the edits you want to make.",
+        key="i2i_prompt"
+    )
+
+    model = st.selectbox(
+        "Model",
+        options=["gemini-2.5-flash-image-preview"],
+        index=0,
+        help="Choose the model for editing.",
+        key="i2i_model"
+    )
+
+    enhance_prompt = st.checkbox(
+        "Enhance Prompt",
+        value=True,
+        help="Use Gemini to enhance your prompt.",
+        key="i2i_enhance_prompt"
+    )
+
+    if st.button("🎨 Edit Image", key="i2i_generate", type="primary"):
+        
+        if not input_image_files:
+            st.error("Please upload an input image to edit.")
+            return
+
+       
+        input_image_paths = []
+        try:
+            
+            for uploaded_file in input_image_files:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(uploaded_file.name)[1]) as tmp_in:
+                    tmp_in.write(uploaded_file.getvalue())
+                    input_image_paths.append(tmp_in.name)
+
+            edit_image(
+                project_id=st.session_state.get("project_id", config.PROJECT_ID),
+                prompt=prompt,
+                model=model,
+                seed=None,
+                person_generation="Don't Allow",
+                safety_filter_level="OFF",
+                enhance_prompt=enhance_prompt,
+                storage_uri=st.session_state.get("storage_uri", config.STORAGE_URI),
+                input_image_paths=input_image_paths,
+            )
+        finally:
+            # Clean up temporary files
+            for path in input_image_paths:
+                os.unlink(path)
 
 def text_to_video_tab():
     """Text-to-Video generation tab."""
@@ -1243,15 +1330,15 @@ def text_to_video_tab():
 
     model = st.selectbox(
         "Model",
-        options=["veo-2.0-generate-001", "veo-3.0-generate-preview"],  # Assuming these are the model IDs
+        options=["veo-2.0-generate-001", "veo-3.0-generate-preview", "veo-3.0-fast-generate-001"],  # Assuming these are the model IDs
         index=0,  # Default to Veo 2
         help="Choose the video generation model (Veo 2 or Veo 3)",
         key="text_model"
     )
 
     # Audio and resolution options (Veo 3.0 only)
-    enable_audio = st.checkbox("Add Audio", value=False if model == "veo-2.0-generate-001" else True, disabled=model != "veo-3.0-generate-preview", key="text_enable_audio")
-    resolution = st.selectbox("Resolution", options=["720p"] if model == "veo-2.0-generate-001" else ["720p", "1080p"], index=0, disabled=model != "veo-3.0-generate-preview", key="text_resolution")
+    enable_audio = st.checkbox("Add Audio", value=False if model == "veo-2.0-generate-001" else True, disabled=model == "veo-2.0-generate-001", key="text_enable_audio")
+    resolution = st.selectbox("Resolution", options=["720p"] if model == "veo-2.0-generate-001" else ["720p", "1080p"], index=0, disabled=model == "veo-2.0-generate-001", key="text_video_resolution")
 
     
     # Video settings
@@ -1695,7 +1782,7 @@ def video_editing_tab():
 
     edit_option = st.radio(
         "Choose an editing tool:",
-        ("Concatenate Videos", "Change Playback Speed", "Frame Interpolation"),
+        ("Concatenate Videos", "Change Playback Speed", "Frame Interpolation", "Dubbing"),
         horizontal=True,
         key="video_edit_option"
     )
@@ -2020,6 +2107,65 @@ def video_editing_tab():
         elif uploaded_images:
             st.warning("Please upload at least two images for frame interpolation.")
 
+    elif edit_option == "Dubbing":
+        st.subheader("Dub Video")
+        uploaded_video = st.file_uploader(
+            "Upload a video to dub (MP4, MOV, AVI)",
+            type=["mp4", "mov", "avi"],
+            key="dub_video"
+        )
+
+        if uploaded_video:
+            languages = [
+                "Arabic (Egyptian)",
+                "English (US)",
+                "French (France)",
+                "Indonesian (Indonesia)",
+                "Japanese (Japan)",
+                "Portuguese (Brazil)",
+                "Dutch (Netherlands)",
+                "Thai (Thailand)",
+                "Vietnamese (Vietnam)",
+                "Ukrainian (Ukraine)",
+                "English (India)",
+                "Tamil (India)",
+                "German (Germany)",
+                "Spanish (US)",
+                "Hindi (India)",
+                "Italian (Italy)",
+                "Korean (Korea)",
+                "Russian (Russia)",
+                "Polish (Poland)",
+                "Turkish (Turkey)",
+                "Romanian (Romania)",
+                "Bengali (Bangladesh)",
+                "Marathi (India)",
+                "Telugu (India)"
+            ]
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                input_language = st.selectbox(
+                    "Original Language",
+                    options=languages,
+                    index=0,
+                    key="input_language",
+                    help="The language spoken in the original video."
+                )
+            with col2:
+                output_language = st.selectbox(
+                    "Target Language",
+                    options=languages,
+                    index=1,
+                    key="output_language",
+                    help="The language to dub the video into."
+                )
+
+            if st.button("🎙️ Dub Video", type="primary"):
+                if not BUCKET_NAME:
+                    st.error("A valid GCS Storage URI must be configured in settings to save and view the dubbed video.")
+                    return
+                dub_video(uploaded_video, input_language, output_language, BUCKET_NAME)
 
 def image_to_video_tab():
     """Image-to-Video generation tab."""
@@ -2304,7 +2450,7 @@ def image_to_video_tab():
         # Model selection
         model = st.selectbox(
             "Model",
-            options=["veo-2.0-generate-001", "veo-3.0-generate-preview"],  # Assuming these are the model IDs
+            options=["veo-2.0-generate-001", "veo-3.0-generate-preview", "veo-3.0-fast-generate-001"],  # Assuming these are the model IDs
             index=0,  # Default to Veo 2
             help="Choose the video generation model (Veo 2 or Veo 3)",
             key="image_model"
@@ -2314,14 +2460,15 @@ def image_to_video_tab():
         enable_audio = st.checkbox(
             "Add Audio", 
             value=False if model == "veo-2.0-generate-001" else True, 
-            disabled=model != "veo-3.0-generate-preview", 
+            disabled=model == "veo-2.0-generate-001", 
             key="image_enable_audio"
         )
         resolution = st.selectbox(
             "Resolution", 
             options=["720p"] if model == "veo-2.0-generate-001" else ["720p", "1080p"], 
             index=0, 
-            disabled=model != "veo-3.0-generate-preview", 
+            disabled=model == "veo-2.0-generate-001", 
+            help="Choose video resolution", 
             key="image_resolution"
         )
 
@@ -3493,6 +3640,7 @@ def generate_image(
     sample_count,
     aspect_ratio,
     seed,
+    resolution,
     person_generation,
     safety_filter_level,
     storage_uri,
@@ -3510,13 +3658,23 @@ def generate_image(
         try:
             client = Veo2API(project_id) # Reusing the client
 
+            # Prepare image if provided
+            # if input_image_path:
+            #     input_image = client.encode_image_file(input_image_path)
+            # if reference_image_path:
+            #     reference_image = client.encode_image_file(reference_image_path)
+
+            # Generate the image
+
             response = client.generate_image_imagen(
+                # input_image=input_image,
                 prompt=prompt,
                 model=model,
                 negative_prompt=negative_prompt,
                 sample_count=sample_count,
                 aspect_ratio=aspect_ratio,
                 seed=seed,
+                resolution=resolution,
                 person_generation= person_generation,
                 safety_filter_level=safety_filter_level,
                 storage_uri=storage_uri,
@@ -3577,7 +3735,107 @@ def generate_image(
             st.error(f"⚠️ Error: {str(e)}")
             st.exception(e)
 
+def edit_image(
+    project_id,
+    prompt,
+    model,
+    seed,
+    person_generation,
+    safety_filter_level,
+    storage_uri,
+    enhance_prompt,
+    input_image_paths: Optional[List[str]] = None, # Expect a list of paths
+):
+    """Edit an image using Gemini and display results."""
+    # ... (project_id and storage_uri checks remain the same) ...
 
+    with st.spinner("🎨 Generating your image with Gemini..."):
+        try:
+            client = Veo2API(project_id)
+
+            # Prepare a list of input images
+            input_images_data = []
+            if input_image_paths:
+                for image_path in input_image_paths:
+                    # 1. Get the base64 encoded data
+                    encoded_dict = client.encode_image_file(image_path)
+                    base64_data = encoded_dict['bytesBase64Encoded']
+
+                    # 2. Determine the mime type from the file extension
+                    mime_type, _ = mimetypes.guess_type(image_path)
+                    if mime_type is None:
+                        # Fallback for unknown types
+                        mime_type = "application/octet-stream"
+
+                    # 3. Construct the correct dictionary and append it
+                    input_images_data.append({
+                        "data": base64_data,
+                        "mime_type": mime_type
+                    })
+
+            # Call the new API function
+            response = client.generate_image_gemini_image_preview(
+                prompt=prompt,
+                input_images=input_images_data, # Pass the list of encoded images
+                model=model,
+                safety_threshold=safety_filter_level,
+                # Note: 'seed' and other unused parameters are ignored by the new function
+            )
+
+            if "error" in response:
+                error_msg = response.get("error", {}).get("message", "Unknown error")
+                st.error(f"⚠️ Image editing failed: {error_msg}")
+                st.json(response)
+                return
+
+            # Try to get URIs first, as this is the expected response when storage_uri is provided
+            image_uris = client.extract_image_uris(response)
+            image_data_list = []
+
+            # If no URIs are found, fall back to checking for base64 encoded data
+            if not image_uris:
+                image_data_list = client.extract_image_data(response)
+
+            if not image_uris and not image_data_list:
+                st.warning("Image editing succeeded, but no images were returned. This could be due to safety filters.")
+                st.json(response)
+                return
+
+            st.success(f"✅ Successfully edited {len(image_uris) or len(image_data_list)} image(s)!")
+
+            # If we received base64 data, we need to upload it to GCS to get a URI
+            if image_data_list:
+                st.info("Uploading edited images to your history bucket...")
+                uploaded_uris = []
+                for i, image_data in enumerate(image_data_list):
+                    image_to_upload = Image.open(io.BytesIO(image_data))
+                    # Use history manager to upload
+                    uri = history_manager.upload_image_to_history(image_to_upload, image_name=f"gemini_edit_{uuid.uuid4().hex}.png")
+                    uploaded_uris.append(uri)
+                # The final list of URIs is the one we just uploaded
+                image_uris = uploaded_uris
+
+            # Add to history
+            if image_uris and FIRESTORE_AVAILABLE:
+                params = {
+                    "prompt": prompt, "model": model, "safetyFilterThreshold": safety_filter_level,
+                    "input_images": [os.path.basename(p) for p in input_image_paths or []]
+                }
+                for uri in image_uris:
+                    db.collection('history').document().set({
+                        'timestamp': firestore.SERVER_TIMESTAMP, 'type': 'image', 'uri': uri,
+                        'prompt': f"Edited image with prompt: {prompt}", 'params': params
+                    })
+
+            # Display images
+            display_images(image_uris)
+
+        except Exception as e:
+            logger.error(f"Error during image editing: {str(e)}")
+            st.error(f"⚠️ Error: {str(e)}")
+            st.exception(e)
+
+            
 def display_videos(video_uris, client, enable_streaming=True):
     """Display a list of videos in Streamlit."""
     if not video_uris:
@@ -3825,6 +4083,97 @@ def display_history_voice_card(row):
     if signed_url:
         st.markdown(f'<div style="text-align: right;"><a href="{signed_url}" target="_blank" style="font-size: 0.8rem;">Open in new tab</a></div>', unsafe_allow_html=True)
 
+def dub_video(uploaded_video, input_language, output_language, bucket_name):
+    """
+    Dubs a video using the command-line interface.
+    """
+    # Dependency check for pydub and Python 3.13+
+    try:
+        import pydub
+        try:
+            import audioop
+        except ImportError:
+            # audioop is removed in Python 3.13, check for pyaudioop
+            import pyaudioop
+    except ImportError:
+        st.error("The 'pydub' and/or 'pyaudioop' packages are not installed. Please run 'pip install pydub pyaudioop' to use the dubbing feature, especially on Python 3.13+.")
+        return
+
+    # 1. Save uploaded video to a temporary file
+    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(uploaded_video.name)[1]) as tmp_in:
+        tmp_in.write(uploaded_video.getvalue())
+        input_video_path = tmp_in.name
+
+    try:
+        # 2. Define output path and filename
+        output_dir = os.path.join(os.getcwd(), "output", "dubbed_videos")
+        os.makedirs(output_dir, exist_ok=True)
+        
+        base_name = os.path.splitext(os.path.basename(uploaded_video.name))[0]
+        
+        # Parse language and sanitize for filename, matching CLI logic
+        output_lang_parsed = output_language.split(' (')[0]
+        safe_output_language = ''.join(c for c in output_lang_parsed if c.isalnum() or c in '-_').lower()
+        output_filename = f"{base_name}_dubbed_{safe_output_language}.mp4"
+        output_video_path = os.path.join(output_dir, output_filename)
+
+        # 3. Construct the command
+        cli_path = os.path.join(os.getcwd(), "apis", "cli", "cli.py")
+        
+        input_lang_parsed = input_language.split(' (')[0]
+
+        command = [
+            sys.executable,
+            cli_path,
+            "--input-video", input_video_path,
+            "--output-path", output_dir,
+            "--input-language", input_lang_parsed,
+            "--output-language", output_lang_parsed,
+            "--gemini-api-key", config.GEMINI_API_KEY
+        ]
+
+        st.info("Running dubbing command...")
+        st.code(f"python {' '.join(command[1:])}")
+
+        # 4. Execute the command and stream output
+        with st.spinner(f"Dubbing video from {input_language} to {output_language}... This may take a while."):
+            log_placeholder = st.empty()
+            log_output = ""
+            
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', bufsize=1)
+
+            for line in iter(process.stdout.readline, ''):
+                log_output += line
+                log_placeholder.code(log_output)
+            
+            process.stdout.close()
+            return_code = process.wait()
+
+            if return_code == 0:
+                st.success("✅ Dubbing process completed successfully!")
+                if os.path.exists(output_video_path):
+                    st.subheader("Dubbed Video Preview")
+                    st.video(output_video_path)
+                    
+                    if FIRESTORE_AVAILABLE:
+                        with st.spinner("Uploading to history..."):
+                            final_video_uri = video_upload_to_gcs(output_video_path, bucket_name, output_filename)
+                            if final_video_uri:
+                                db.collection('history').add({
+                                    'timestamp': firestore.SERVER_TIMESTAMP, 'type': 'video', 'uri': final_video_uri,
+                                    'prompt': f'Video dubbed from {input_language} to {output_language}.',
+                                    'params': {'operation': 'dub_video', 'input_language': input_language, 'output_language': output_language}
+                                })
+                                st.success(f"✅ Dubbed video saved to history: {final_video_uri}")
+            else:
+                st.error(f"⚠️ Dubbing process failed with return code {return_code}.")
+                st.subheader("Dubbing Logs:")
+                st.code(log_output)
+    finally:
+        # 5. Clean up the temporary file
+        if 'input_video_path' in locals() and os.path.exists(input_video_path):
+            os.unlink(input_video_path)
+
 def generate_audio(
     project_id,
     prompt,
@@ -4041,7 +4390,7 @@ def display_history_image_card(row):
     
     # Parse params to get filename and other info
     params = _parse_history_params(params_json)
-    is_generated = 'model' in params and 'imagen' in params.get('model', '')
+    is_generated = 'model' in params
     filename = params.get('filename', default_filename)
     
     # Generate a signed URL for the image

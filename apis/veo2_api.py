@@ -5,7 +5,7 @@ import shutil
 import time
 import re
 import datetime
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Union, Any
 import requests
 import google.auth
 import google.auth.transport.requests
@@ -796,6 +796,7 @@ class Veo2API:
         prompt: str,
         model: str = "imagen-3.0-generate-002",
         negative_prompt: Optional[str] = None,
+        resolution: Optional[str] = "1K",
         sample_count: int = 1,
         aspect_ratio: str = "1:1",
         seed: Optional[int] = None,
@@ -809,6 +810,8 @@ class Veo2API:
 
         Args:
             prompt: Text prompt for image generation.
+            input_image: Optional dictionary with image information.
+            reference_images: Optional list of dictionaries for reference images.
             model: The Imagen model ID to use.
             negative_prompt: Text describing what to avoid.
             sample_count: Number of images to generate.
@@ -839,6 +842,9 @@ class Veo2API:
             parameters["negativePrompt"] = negative_prompt
         if seed is not None:
             parameters["seed"] = seed
+        if resolution:
+            parameters["sampleImageSize"] = resolution
+
 
         harm_categories = [
             "HARM_CATEGORY_HATE_SPEECH",
@@ -861,7 +867,37 @@ class Veo2API:
 
         response = requests.post(url, headers=headers, json=request_body)
         response.raise_for_status() # Raise an exception for bad status codes
-        return response.json()
+        
+        # The response from streamGenerateContent is a list of JSON objects (chunks).
+        # We need to aggregate them to extract the image data.
+        full_response_text = response.text
+        
+        # The response is a stream of JSON objects, not a single one.
+        # We need to parse it line by line or as a list of objects.
+        try:
+            # It's often returned as a JSON array of objects
+            full_response_json = json.loads(full_response_text)
+        except json.JSONDecodeError:
+            # Or sometimes as newline-delimited JSON
+            try:
+                full_response_json = [json.loads(line) for line in full_response_text.strip().split('\n')]
+            except json.JSONDecodeError:
+                raise ValueError(f"Could not parse streaming response from Gemini API: {full_response_text}")
+
+        # For image generation, the content is usually in one of the first chunks.
+        # Let's find the image data and format it like the other Imagen responses.
+        predictions = []
+        for chunk in full_response_json:
+            if "candidates" in chunk:
+                for candidate in chunk["candidates"]:
+                    if "content" in candidate and "parts" in candidate["content"]:
+                        for part in candidate["content"]["parts"]:
+                            if "inlineData" in part and "data" in part["inlineData"]:
+                                predictions.append({
+                                    "bytesBase64Encoded": part["inlineData"]["data"]
+                                })
+        
+        return {"predictions": predictions}
 
     def extract_image_data(self, result: Dict) -> List[bytes]:
         """Extracts base64 encoded image data from an Imagen API result."""
@@ -889,7 +925,116 @@ class Veo2API:
                     image_uris.append(prediction["gcsUri"])
         return image_uris
 
+def generate_image_gemini_image_preview(
+    self,
+    prompt: str,
+    input_images: Optional[List[Dict[str, str]]] = None,
+    model: str = "gemini-2.5-flash-image-preview",
+    temperature: float = 1.0,
+    top_p: float = 0.95,
+    max_output_tokens: int = 32768,
+    safety_threshold: str = "OFF"
+) -> Dict[str, Any]:
+    """
+    Generates or edits an image using Gemini with a text prompt and multiple input images.
 
+    Args:
+        prompt: Text prompt to guide image generation or editing.
+        input_images: Optional list of dictionaries, where each dict contains
+                      'mime_type' and 'data' (base64-encoded string) for an image.
+        model: The Gemini model ID to use.
+        temperature: Controls randomness in generation (0.0-1.0).
+        top_p: Nucleus sampling parameter.
+        max_output_tokens: The maximum number of tokens in the response.
+        safety_threshold: The safety threshold to apply (e.g., "OFF", "BLOCK_FEW").
+
+    Returns:
+        Dict: API response containing the generated text and image content.
+    """
+    # 1. Construct the 'parts' of the request from multiple images and a prompt
+    parts = []
+    if input_images:
+        for image_info in input_images:
+            parts.append({
+                "inlineData": {
+                    "mimeType": image_info['mime_type'],
+                    "data": image_info['data'],
+                }
+            })
+    # The text prompt must be the last part
+    parts.append({"text": prompt})
+
+    # 2. Construct the full request body
+    contents = [{"role": "user", "parts": parts}]
+
+    generation_config = {
+        "temperature": temperature,
+        "maxOutputTokens": max_output_tokens,
+        "responseModalities": ["TEXT", "IMAGE"],
+        "topP": top_p,
+    }
+
+    safety_categories = [
+        "HARM_CATEGORY_HATE_SPEECH", "HARM_CATEGORY_DANGEROUS_CONTENT",
+        "HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_HARASSMENT"
+    ]
+    safety_settings = [
+        {"category": cat, "threshold": safety_threshold} for cat in safety_categories
+    ]
+
+    request_body = {
+        "contents": contents,
+        "generationConfig": generation_config,
+        "safetySettings": safety_settings
+    }
+    
+    # 3. Make the API request
+    api_endpoint = f"aiplatform.googleapis.com"
+    url = (f"https://{api_endpoint}/v1/projects/{self.project_id}/locations/global"
+           f"/publishers/google/models/{model}:streamGenerateContent")
+           
+    headers = {
+        "Authorization": f"Bearer {self._get_access_token()}",
+        "Content-Type": "application/json; charset=utf-8"
+    }
+
+    response = requests.post(url, headers=headers, json=request_body)
+    response.raise_for_status()
+    # The response from streamGenerateContent is a list of JSON objects (chunks).
+    # We need to aggregate them to extract the image data.
+    full_response_text = response.text
+    
+    # The response is a stream of JSON objects, not a single one.
+    # We need to parse it line by line or as a list of objects.
+    try:
+        # It's often returned as a JSON array of objects
+        full_response_json = json.loads(full_response_text)
+    except json.JSONDecodeError:
+        # Or sometimes as newline-delimited JSON
+        try:
+            full_response_json = [json.loads(line) for line in full_response_text.strip().split('\n')]
+        except json.JSONDecodeError:
+            raise ValueError(f"Could not parse streaming response from Gemini API: {full_response_text}")
+
+    # For image generation, the content is usually in one of the first chunks.
+    # Let's find the image data and format it like the other Imagen responses.
+    predictions = []
+    for chunk in full_response_json:
+        if "candidates" in chunk:
+            for candidate in chunk["candidates"]:
+                if "content" in candidate and "parts" in candidate["content"]:
+                    for part in candidate["content"]["parts"]:
+                        if "inlineData" in part and "data" in part["inlineData"]:
+                            predictions.append({
+                                "bytesBase64Encoded": part["inlineData"]["data"]
+                            })
+    
+    return {"predictions": predictions}
+
+# This is a helper function to encode a local image file to base64
+def image_to_base64(filepath: str) -> str:
+    with open(filepath, "rb") as image_file:
+        return base64.b64encode(image_file.read()).decode('utf-8')
 
 def concatenate_videos(video_paths_list: list, output_concatenated_video_path: str, run_temp_dir: str):
     """
@@ -1260,5 +1405,6 @@ Veo2API.download_blob = download_blob
 Veo2API.concatenate_videos = concatenate_videos
 Veo2API.alter_video_speed = alter_video_speed
 Veo2API.upload_to_gcs = upload_to_gcs
+Veo2API.generate_image_gemini_image_preview = generate_image_gemini_image_preview
 
 Veo2API.download_blob = download_blob
