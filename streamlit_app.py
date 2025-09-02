@@ -3,6 +3,7 @@ Veo2 Video Generator - A Streamlit app for generating high-quality videos
 from text prompts and images using Google's Veo 2.0 API.
 """
 import os
+import mimetypes
 import uuid
 import time
 import json
@@ -10,6 +11,7 @@ import tempfile
 import io
 import sys
 import pandas as pd
+import subprocess
 from datetime import datetime
 from PIL import Image
 import streamlit as st
@@ -19,6 +21,7 @@ import numpy as np
 import firebase_admin
 from firebase_admin import credentials, firestore
 from collections import OrderedDict
+from typing import Dict, List, Optional, Union, Any
 import shutil
 from werkzeug.utils import secure_filename
 
@@ -822,7 +825,29 @@ def init_state():
         st.session_state.history_initialized = True
         # Force history to be loaded freshly on first run
         st.session_state.history_loaded = False
+
+    # Initialize history selection state
+    if "selected_history_items" not in st.session_state:
+        logger.debug("Initializing 'selected_history_items' in session state")
+        st.session_state.selected_history_items = {} # Will store {uri: type}
+
+    # Initialize state for the main navigation tabs
+    if "active_main_tab" not in st.session_state:
+        logger.debug("Initializing 'active_main_tab' in session state")
+        st.session_state.active_main_tab = "🎬 Text-to-Video"
+
+    # State for files passed from history to editing tabs
+    if 'edit_image_files' not in st.session_state:
+        st.session_state.edit_image_files = []
+    if 'speed_change_video_file' not in st.session_state:
+        st.session_state.speed_change_video_file = None
+    if 'concat_video_files' not in st.session_state:
+        st.session_state.concat_video_files = []
     
+    if 'active_history_sub_tab' not in st.session_state:
+        logger.debug("Initializing 'active_history_sub_tab' in session state")
+        st.session_state.active_history_sub_tab = "🎬 Recent Videos"
+
     logger.end_section()
 
 def main():
@@ -1103,33 +1128,33 @@ def main():
         st.markdown('<div style="padding-top: 1.5rem;"></div>', unsafe_allow_html=True)
         st.toggle("🌙 Dark Mode", key="dark_mode", help="Toggle between light and dark themes.")
 
-    # Create tabs without using the active_tab logic which might be causing issues
-    tab1, tab2, tab_t2i, tab3, tab4, tab5, tab6 = st.tabs([
-        "🎬 Text-to-Video", "🖼️ Image-to-Video", "🎨 Text-to-Image",
-        "🎵 Text-to-Audio", "🎤 Text-to-Voiceover", "✂️ Video Editing", "📋 History"
+    # Define the main tabs and their corresponding functions
+    TABS = OrderedDict([
+        ("🎬 Text-to-Video", text_to_video_tab),
+        ("🖼️ Image-to-Video", image_to_video_tab),
+        ("🎨 Text-to-Image", text_to_image_tab),
+        ("✨ Image Editing", image_editing_tab),
+        ("🎵 Text-to-Audio", text_to_audio_tab),
+        ("🎤 Text-to-Voiceover", text_to_voiceover_tab),
+        ("✂️ Video Editing", video_editing_tab),
+        ("📋 History", history_tab),
     ])
 
-    # Display content for each tab without conditional logic
-    with tab1:
-        text_to_video_tab()
+    # Use a radio button for main navigation to allow programmatic switching from history
+    active_tab = st.radio(
+        "Main Navigation",
+        options=list(TABS.keys()),
+        index=list(TABS.keys()).index(st.session_state.active_main_tab),
+        horizontal=True,
+        label_visibility="collapsed",
+        key="main_nav_radio"
+    )
 
-    with tab2:
-        image_to_video_tab()
+    # Update the active tab in session state if the user clicks a new one
+    st.session_state.active_main_tab = active_tab
 
-    with tab_t2i:
-        text_to_image_tab()
-
-    with tab3:
-        text_to_audio_tab()  # Add this function
-
-    with tab4:
-        text_to_voiceover_tab()  # Add this function
-
-    with tab5:
-        video_editing_tab()
-
-    with tab6:
-        history_tab()
+    # Call the function for the currently active tab
+    TABS[active_tab]()
 
     # Remove the footer which might be causing spacing issues
     # st.markdown('<div class="footer">', unsafe_allow_html=True)
@@ -1155,7 +1180,7 @@ def text_to_image_tab():
         model = st.selectbox(
             "Model",
             # Using placeholder names as requested. User can change if needed.
-            options=["imagen-3.0-generate-002","imagen-3.0-fast-generate-001", "imagen-4.0-fast-generate-preview-06-06", "imagen-4.0-generate-preview-06-06"],
+            options=["imagen-3.0-generate-002","imagen-3.0-fast-generate-001","imagen-4.0-generate-001", "imagen-4.0-ultra-generate-001", "imagen-4.0-fast-generate-001" ],
             index=0,
             help="Choose the Imagen model for generation.",
             key="t2i_model"
@@ -1169,14 +1194,25 @@ def text_to_image_tab():
             key="t2i_aspect_ratio"
         )
 
-    sample_count = st.slider(
-        "Number of Images",
-        min_value=1,
-        max_value=4,
-        value=1,
-        help="How many image variations to generate.",
-        key="t2i_sample_count"
-    )
+    col1, col2 = st.columns(2)
+    with col1:
+        sample_count = st.slider(
+            "Number of Images",
+            min_value=1,
+            max_value=4,
+            value=1,
+            help="How many image variations to generate.",
+            key="t2i_sample_count"
+        )
+    with col2:
+        resolution = st.selectbox(
+            "Output Resolution", 
+            options=["1K", "2K"] if model == "imagen-4.0-generate-001" or model == "imagen-4.0-ultra-generate-001" else ["1k"], 
+            index=0, 
+            disabled=model != "imagen-4.0-generate-001" and model != "imagen-4.0-ultra-generate-001", 
+            help="Choose the resolution of the generated image.", 
+            key="text_image_resolution"
+        )
 
     enhance_prompt = st.checkbox(
         "Enhance Prompt",
@@ -1220,6 +1256,7 @@ def text_to_image_tab():
             model=model,
             negative_prompt=negative_prompt,
             sample_count=sample_count,
+            resolution=resolution,
             aspect_ratio=aspect_ratio,
             seed=None, # Seed not exposed in this UI for simplicity
             person_generation=person_generation,
@@ -1227,6 +1264,98 @@ def text_to_image_tab():
             enhance_prompt=enhance_prompt,
             storage_uri=st.session_state.get("storage_uri", config.STORAGE_URI),
         )
+
+def image_editing_tab():
+    """Image editing tab."""
+    st.header("Image Editing with Gemini")
+
+    # The file uploader is always present to allow adding/changing images.
+    newly_uploaded_files = st.file_uploader(
+        "Upload images to edit (or load from history)",
+        type=["jpg", "jpeg", "png", "webp"],
+        key="edit_image_uploader",
+        accept_multiple_files=True
+    )
+
+    # If new files are uploaded, they replace the current set.
+    if newly_uploaded_files:
+        st.session_state.edit_image_files = newly_uploaded_files
+        st.info(f"Loaded {len(newly_uploaded_files)} new image(s) for editing.")
+
+    # The primary source of truth for images to be edited.
+    input_image_files = st.session_state.get('edit_image_files', [])
+
+    # Display uploaded images
+    if input_image_files:
+        if st.button("Clear Loaded Images"):
+            st.session_state.edit_image_files = []
+            # Clear the uploader widget's state as well
+            st.session_state.edit_image_uploader = []
+            st.rerun()
+
+        # Convert all file-like objects to PIL Images for display
+        # This handles both Streamlit's UploadedFile and our SimulatedUploadFile
+        try:
+            images_to_display = [Image.open(f) for f in input_image_files]
+            # Create a list of captions from the filenames
+            captions = [f.name for f in input_image_files]
+            st.image(images_to_display, caption=captions, width=128)
+        except Exception as e:
+            st.error(f"Could not display one of the loaded images: {e}")
+
+    prompt = st.text_area(
+        "Prompt",
+        value="Make the lion's mane glow brighter and change the sky to a deep purple.",
+        height=100,
+        help="Describe the edits you want to make.",
+        key="i2i_prompt"
+    )
+
+    model = st.selectbox(
+        "Model",
+        options=["gemini-2.5-flash-image-preview"],
+        index=0,
+        help="Choose the model for editing.",
+        key="i2i_model"
+    )
+
+    enhance_prompt = st.checkbox(
+        "Enhance Prompt",
+        value=True,
+        help="Use Gemini to enhance your prompt.",
+        key="i2i_enhance_prompt"
+    )
+
+    if st.button("🎨 Edit Image", key="i2i_generate", type="primary"):
+        
+        if not input_image_files:
+            st.error("Please upload an input image to edit.")
+            return
+
+       
+        input_image_paths = []
+        try:
+            
+            for uploaded_file in input_image_files:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(uploaded_file.name)[1]) as tmp_in:
+                    tmp_in.write(uploaded_file.getvalue())
+                    input_image_paths.append(tmp_in.name)
+
+            edit_image(
+                project_id=st.session_state.get("project_id", config.PROJECT_ID),
+                prompt=prompt,
+                model=model,
+                seed=None,
+                person_generation="Don't Allow",
+                safety_filter_level="OFF",
+                enhance_prompt=enhance_prompt,
+                storage_uri=st.session_state.get("storage_uri", config.STORAGE_URI),
+                input_image_paths=input_image_paths,
+            )
+        finally:
+            # Clean up temporary files
+            for path in input_image_paths:
+                os.unlink(path)
 
 def text_to_video_tab():
     """Text-to-Video generation tab."""
@@ -1243,15 +1372,15 @@ def text_to_video_tab():
 
     model = st.selectbox(
         "Model",
-        options=["veo-2.0-generate-001", "veo-3.0-generate-preview"],  # Assuming these are the model IDs
+        options=["veo-2.0-generate-001", "veo-3.0-generate-preview", "veo-3.0-fast-generate-preview", "veo-3.0-fast-generate-001", "veo-3.0-generate-001"],  # Assuming these are the model IDs
         index=0,  # Default to Veo 2
         help="Choose the video generation model (Veo 2 or Veo 3)",
         key="text_model"
     )
 
     # Audio and resolution options (Veo 3.0 only)
-    enable_audio = st.checkbox("Add Audio", value=False if model == "veo-2.0-generate-001" else True, disabled=model != "veo-3.0-generate-preview", key="text_enable_audio")
-    resolution = st.selectbox("Resolution", options=["720p"] if model == "veo-2.0-generate-001" else ["720p", "1080p"], index=0, disabled=model != "veo-3.0-generate-preview", key="text_resolution")
+    enable_audio = st.checkbox("Add Audio", value=False if model == "veo-2.0-generate-001" else True, disabled=model == "veo-2.0-generate-001", key="text_enable_audio")
+    resolution = st.selectbox("Resolution", options=["720p"] if model == "veo-2.0-generate-001" else ["720p", "1080p"], index=0, disabled=model == "veo-2.0-generate-001", key="text_video_resolution")
 
     
     # Video settings
@@ -1259,9 +1388,8 @@ def text_to_video_tab():
     with col1:
         aspect_ratio = st.selectbox(
             "Aspect Ratio", 
-            options=["16:9"] if model == "veo-3.0-generate-preview" else ["16:9", "9:16"],
+            options=["16:9", "9:16"],
             index=0,
-            disabled=(model == "veo-3.0-generate-preview"),
             help="Choose landscape (16:9) or portrait (9:16) orientation. Veo 3.0 is fixed to 16:9.",
             key="text_aspect_ratio"
         )
@@ -1684,7 +1812,7 @@ def text_to_voiceover_tab():
 def video_editing_tab():
     """Video editing features tab."""
     st.header("Video Editing Tools")
-
+    
     BUCKET_NAME = None
     storage_uri_config = st.session_state.get("storage_uri", config.STORAGE_URI)
     if storage_uri_config and storage_uri_config.startswith("gs://"):
@@ -1692,22 +1820,45 @@ def video_editing_tab():
     else:
         st.warning("A valid GCS Storage URI is required for video editing.")
         return
-
+    
+    # Manage radio button state to allow programmatic changes
+    options = ("Concatenate Videos", "Change Playback Speed", "Frame Interpolation", "Dubbing")
+    
+    # Get the default option from session state. This will be set by the history action.
+    default_option = st.session_state.get('video_edit_option', "Concatenate Videos")
+    default_index = options.index(default_option) if default_option in options else 0
+    
     edit_option = st.radio(
         "Choose an editing tool:",
-        ("Concatenate Videos", "Change Playback Speed", "Frame Interpolation"),
+        options,
+        index=default_index,
         horizontal=True,
-        key="video_edit_option"
+        # key="video_edit_option" # Key is removed to allow programmatic changes from other tabs
     )
+    # Manually keep the session state in sync with the user's selection
+    st.session_state.video_edit_option = edit_option
 
     if edit_option == "Concatenate Videos":
         st.subheader("Concatenate Multiple Videos")
-        uploaded_videos = st.file_uploader(
-            "Upload videos to concatenate (MP4, MOV, AVI)",
+
+        newly_uploaded_videos = st.file_uploader(
+            "Upload videos to concatenate (or load from history)",
             type=["mp4", "mov", "avi"],
             accept_multiple_files=True,
-            key="concat_videos"
+            key="concat_video_uploader"
         )
+
+        if newly_uploaded_videos:
+            st.session_state.concat_video_files = newly_uploaded_videos
+
+        uploaded_videos = st.session_state.get('concat_video_files', [])
+
+        if uploaded_videos:
+            st.info(f"{len(uploaded_videos)} video(s) loaded for concatenation.")
+            if st.button("Clear Loaded Videos", key="clear_concat"):
+                st.session_state.concat_video_files = []
+                st.session_state.concat_video_uploader = []
+                st.rerun()
 
         if uploaded_videos and len(uploaded_videos) > 1:
             if st.button("🔗 Concatenate Videos", type="primary"):
@@ -1780,13 +1931,31 @@ def video_editing_tab():
 
     elif edit_option == "Change Playback Speed":
         st.subheader("Alter Video Playback Speed")
-        uploaded_video = st.file_uploader(
-            "Upload a video to alter its speed (MP4, MOV, AVI)",
+        
+        newly_uploaded_video = st.file_uploader(
+            "Upload a video to alter its speed (or load from history)",
             type=["mp4", "mov", "avi"],
-            key="speed_video"
+            key="speed_video_uploader"
         )
 
+        # If a new file is uploaded, it becomes the current video for speed change.
+        if newly_uploaded_video:
+            st.session_state.speed_change_video_file = newly_uploaded_video
+
+        # Get the video to be processed from session state.
+        # This will be either the one from history or the one just uploaded.
+        uploaded_video = st.session_state.get('speed_change_video_file', None)
+
         if uploaded_video:
+            st.info(f"Video '{uploaded_video.name}' loaded for speed change.")
+            st.video(uploaded_video.getvalue())
+
+            if st.button("Clear Loaded Video", key="clear_speed_video"):
+                st.session_state.speed_change_video_file = None
+                st.session_state.speed_video_uploader = None # Also clear uploader state
+                st.rerun()
+
+        
             speed_factor = st.number_input(
                 "Playback Speed Factor",
                 min_value=0.1,
@@ -1797,23 +1966,23 @@ def video_editing_tab():
             )
 
             if st.button("⏩ Apply Speed Change", type="primary"):
-                input_filename, output_filename = None, None
-                clip, final_clip = None, None
+               
                 with st.spinner("Applying speed change and uploading..."):
-                    try:
-                        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_in:
-                            tmp_in.write(uploaded_video.read())
-                            input_filename = tmp_in.name
+                    
+                    run_temp_dir = os.path.join("temp_processing_space", str(uuid.uuid4()))
+                    os.makedirs(run_temp_dir, exist_ok=True)
+                    
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4", dir=run_temp_dir) as tmp_in:
+                        tmp_in.write(uploaded_video.getvalue())
+                        input_path = tmp_in.name
 
-                        clip = VideoFileClip(input_filename)
-                        final_clip = clip.speedx(speed_factor)
+                    output_path = os.path.join(run_temp_dir, f"speed_adjusted_{os.path.basename(input_path)}")
+                    
+                    # Using the API helper function
+                    processed_path = Veo2API.alter_video_speed(input_path, output_path, speed_factor, run_temp_dir)
 
-                        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_out:
-                            final_clip.write_videofile(tmp_out.name, codec="libx264", audio_codec="aac", threads=4, preset="ultrafast")
-                            output_filename = tmp_out.name
-
-                        final_video_uri = video_upload_to_gcs(output_filename, BUCKET_NAME, f"speed-edited-{uploaded_video.name}")
-                        
+                    if processed_path and os.path.exists(processed_path):
+                        final_video_uri = video_upload_to_gcs(processed_path, BUCKET_NAME, f"speed-edited-{uploaded_video.name}")
                         if final_video_uri:
                             signed_url = client.generate_signed_url(final_video_uri)
                             st.subheader("Edited Video Preview")
@@ -1825,14 +1994,12 @@ def video_editing_tab():
                                     'prompt': f'Video speed changed by factor of {speed_factor}',
                                     'params': {'operation': 'change_speed', 'factor': speed_factor}
                                 })
-                    except Exception as e:
-                        st.error(f"An error occurred: {e}")
-                    finally:
-                        # Safely clean up all temporary files and moviepy clips
-                        if clip: clip.close()
-                        if final_clip: final_clip.close()
-                        if input_filename and os.path.exists(input_filename): os.remove(input_filename)
-                        if output_filename and os.path.exists(output_filename): os.remove(output_filename)
+                    else:
+                        st.error("Failed to process video speed.")
+
+                    # Cleanup
+                    if os.path.exists(run_temp_dir):
+                        shutil.rmtree(run_temp_dir)
 
                     # except Exception as e:
                     #     st.error(f"An error occurred while changing speed: {e}")
@@ -2020,6 +2187,65 @@ def video_editing_tab():
         elif uploaded_images:
             st.warning("Please upload at least two images for frame interpolation.")
 
+    elif edit_option == "Dubbing":
+        st.subheader("Dub Video")
+        uploaded_video = st.file_uploader(
+            "Upload a video to dub (MP4, MOV, AVI)",
+            type=["mp4", "mov", "avi"],
+            key="dub_video"
+        )
+
+        if uploaded_video:
+            languages = [
+                "Arabic (Egyptian)",
+                "English (US)",
+                "French (France)",
+                "Indonesian (Indonesia)",
+                "Japanese (Japan)",
+                "Portuguese (Brazil)",
+                "Dutch (Netherlands)",
+                "Thai (Thailand)",
+                "Vietnamese (Vietnam)",
+                "Ukrainian (Ukraine)",
+                "English (India)",
+                "Tamil (India)",
+                "German (Germany)",
+                "Spanish (US)",
+                "Hindi (India)",
+                "Italian (Italy)",
+                "Korean (Korea)",
+                "Russian (Russia)",
+                "Polish (Poland)",
+                "Turkish (Turkey)",
+                "Romanian (Romania)",
+                "Bengali (Bangladesh)",
+                "Marathi (India)",
+                "Telugu (India)"
+            ]
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                input_language = st.selectbox(
+                    "Original Language",
+                    options=languages,
+                    index=0,
+                    key="input_language",
+                    help="The language spoken in the original video."
+                )
+            with col2:
+                output_language = st.selectbox(
+                    "Target Language",
+                    options=languages,
+                    index=1,
+                    key="output_language",
+                    help="The language to dub the video into."
+                )
+
+            if st.button("🎙️ Dub Video", type="primary"):
+                if not BUCKET_NAME:
+                    st.error("A valid GCS Storage URI must be configured in settings to save and view the dubbed video.")
+                    return
+                dub_video(uploaded_video, input_language, output_language, BUCKET_NAME)
 
 def image_to_video_tab():
     """Image-to-Video generation tab."""
@@ -2304,7 +2530,7 @@ def image_to_video_tab():
         # Model selection
         model = st.selectbox(
             "Model",
-            options=["veo-2.0-generate-001", "veo-3.0-generate-preview"],  # Assuming these are the model IDs
+            options=["veo-2.0-generate-001", "veo-3.0-generate-preview", "veo-3.0-fast-generate-001"],  # Assuming these are the model IDs
             index=0,  # Default to Veo 2
             help="Choose the video generation model (Veo 2 or Veo 3)",
             key="image_model"
@@ -2314,14 +2540,15 @@ def image_to_video_tab():
         enable_audio = st.checkbox(
             "Add Audio", 
             value=False if model == "veo-2.0-generate-001" else True, 
-            disabled=model != "veo-3.0-generate-preview", 
+            disabled=model == "veo-2.0-generate-001", 
             key="image_enable_audio"
         )
         resolution = st.selectbox(
             "Resolution", 
             options=["720p"] if model == "veo-2.0-generate-001" else ["720p", "1080p"], 
             index=0, 
-            disabled=model != "veo-3.0-generate-preview", 
+            disabled=model == "veo-2.0-generate-001", 
+            help="Choose video resolution", 
             key="image_resolution"
         )
 
@@ -2394,10 +2621,9 @@ def image_to_video_tab():
         with settings_row[0]:
             aspect_ratio = st.selectbox(
                 "Aspect Ratio", 
-                options=["16:9"] if model == "veo-3.0-generate-preview" else ["16:9", "9:16"],
+                options=["16:9", "9:16"],
                 index=0,
-                disabled=(model == "veo-3.0-generate-preview"),
-                help="Choose orientation. Veo 3.0 is fixed to 16:9.",
+                help="Choose orientation.",
                 key="image_aspect_ratio"
             )
         with settings_row[1]:
@@ -2630,11 +2856,283 @@ def get_history_from_firestore(limit=200):
         st.error(f"Error getting history from Firestore: {str(e)}")
         return pd.DataFrame(columns=['timestamp', 'type', 'uri', 'prompt', 'params'])
 
+def display_recent_videos(history_data):
+    """Displays the 'Recent Videos' sub-tab content."""
+    video_history = history_data[history_data['type'] == 'video'].copy()
+        
+    if video_history.empty:
+        st.info("No videos in history yet. Generate some videos to see them here!")
+    else:
+        video_header_col, clear_col = st.columns([5, 1])
+        with video_header_col:
+            st.markdown(f"### Recent Generated Videos ({len(video_history)})")
+        with clear_col:
+            if st.button("🗑️ Clear All", key="clear_history_btn", type="secondary"):
+                if st.session_state.get("confirm_clear_history", False):
+                    if not FIRESTORE_AVAILABLE:
+                        st.error("Firestore is not available. Cannot clear history.")
+                        st.session_state.confirm_clear_history = False
+                        st.rerun()
+                        return
+                    try:
+                        clear_history()
+                        st.success("History cleared successfully!")
+                        st.session_state.history_loaded = False
+                        st.session_state.confirm_clear_history = False
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Error clearing history: {str(e)}")
+                else:
+                    st.session_state.confirm_clear_history = True
+                    st.warning("⚠️ This will permanently delete all history. Are you sure?")
+                    confirm_col1, confirm_col2 = st.columns(2)
+                    with confirm_col1:
+                        if st.button("✅ Yes, Delete All"):
+                            try:
+                                clear_history()
+                                st.success("History cleared successfully!")
+                                st.session_state.history_loaded = False
+                                st.session_state.confirm_clear_history = False
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Error clearing history: {str(e)}")
+                    with confirm_col2:
+                        if st.button("❌ Cancel"):
+                            st.session_state.confirm_clear_history = False
+                            st.rerun()
+    
+        video_history = video_history.sort_values('timestamp', ascending=False)
+        total_videos = len(video_history)
+        items_per_page = 10
+        max_pages = (total_videos + items_per_page - 1) // items_per_page
+        if "video_page" not in st.session_state:
+            st.session_state.video_page = 0
+            
+        col1, col2, col3 = st.columns([1, 3, 1])
+        with col1:
+            if st.button("◀ Previous", disabled=(st.session_state.video_page <= 0), key="prev_video"):
+                st.session_state.video_page = max(0, st.session_state.video_page - 1)
+                st.rerun()
+        with col2:
+            st.markdown(f"**Page {st.session_state.video_page + 1} of {max(1, max_pages)}** (showing {min(items_per_page, total_videos - st.session_state.video_page * items_per_page)} of {total_videos} videos)")
+        with col3:
+            if st.button("Next ▶", disabled=(st.session_state.video_page >= max_pages - 1), key="next_video"):
+                st.session_state.video_page = min(max_pages - 1, st.session_state.video_page + 1)
+                st.rerun()
+    
+        start_idx = st.session_state.video_page * items_per_page
+        end_idx = min(start_idx + items_per_page, total_videos)
+        page_videos = video_history.iloc[start_idx:end_idx]
+        
+        st.markdown('<div class="history-grid">', unsafe_allow_html=True)
+        rows = [page_videos.iloc[i:i+2] for i in range(0, len(page_videos), 2)]
+        for row_items in rows:
+            cols = st.columns(2)
+            for i, (_, row) in enumerate(row_items.iterrows()):
+                if i < len(cols):
+                    with cols[i]:
+                        display_history_video_card(row)
+        st.markdown('</div>', unsafe_allow_html=True)
+        
+        col1, col2, col3 = st.columns([1, 3, 1])
+        with col1:
+            if st.button("◀ Previous", disabled=(st.session_state.video_page <= 0), key="prev_video_bottom"):
+                st.session_state.video_page = max(0, st.session_state.video_page - 1)
+                st.rerun()
+        with col2:
+            st.markdown(f"**Page {st.session_state.video_page + 1} of {max(1, max_pages)}**")
+        with col3:
+            if st.button("Next ▶", disabled=(st.session_state.video_page >= max_pages - 1), key="next_video_bottom"):
+                st.session_state.video_page = min(max_pages - 1, st.session_state.video_page + 1)
+                st.rerun()
+
+def display_recent_audios(history_data):
+    """Displays the 'Recent Audios' sub-tab content."""
+    st.markdown("### Recent Generated Audios")
+    audio_history = history_data[history_data['type'] == 'audio'].copy()
+    
+    if audio_history.empty:
+        st.info("No audio generation history found.")
+    else:
+        st.markdown(f"Found {len(audio_history)} audio generations.")
+        audio_history = audio_history.sort_values('timestamp', ascending=False)
+        st.markdown('<div class="history-grid">', unsafe_allow_html=True)
+        rows = [audio_history.iloc[i:i+2] for i in range(0, len(audio_history), 2)]
+        for row_items in rows:
+            cols = st.columns(2)
+            for i, (_, row) in enumerate(row_items.iterrows()):
+                if i < len(cols):
+                    with cols[i]:
+                        with st.container(border=True, height=350):
+                            display_history_audio_card(row)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+def display_recent_voices(history_data):
+    """Displays the 'Recent Voices' sub-tab content."""
+    st.markdown("### Recent Generated Voiceovers")
+    voice_history = history_data[history_data['type'] == 'voice'].copy()
+    
+    if voice_history.empty:
+        st.info("No voiceover generation history found.")
+    else:
+        st.markdown(f"Found {len(voice_history)} voiceover generations.")
+        voice_history = voice_history.sort_values('timestamp', ascending=False)
+        st.markdown('<div class="history-grid">', unsafe_allow_html=True)
+        rows = [voice_history.iloc[i:i+2] for i in range(0, len(voice_history), 2)]
+        for row_items in rows:
+            cols = st.columns(2)
+            for i, (_, row) in enumerate(row_items.iterrows()):
+                if i < len(cols):
+                    with cols[i]:
+                        with st.container(border=True, height=350):
+                            display_history_voice_card(row)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+def display_all_images(history_data):
+    """Displays the 'All Images' sub-tab content."""
+    image_history = history_data[history_data['type'] == 'image'].copy()
+    
+    if image_history.empty:
+        st.info("No source images in history yet.")
+    else:
+        st.markdown("### Filter Source Images")
+        col1, col2 = st.columns([3, 2])
+        with col1:
+            search_term = st.text_input("Search by filename:", key="image_search", placeholder="Enter filename or leave empty to show all")
+        with col2:
+            sort_order = st.selectbox("Sort by:", ["Newest first", "Oldest first"], key="image_sort")
+        
+        if search_term:
+            image_history = image_history[image_history['params'].apply(
+                lambda x: search_term.lower() in json.loads(x).get('filename', '').lower() if pd.notna(x) and x else False
+            )]
+        
+        if sort_order == "Newest first":
+            image_history = image_history.sort_values('timestamp', ascending=False)
+        else:
+            image_history = image_history.sort_values('timestamp', ascending=True)
+        
+        total_images = len(image_history)
+        items_per_page = 10
+        max_pages = (total_images + items_per_page - 1) // items_per_page
+        if "image_page" not in st.session_state:
+            st.session_state.image_page = 0
+            
+        st.markdown(f"### Source Images ({total_images})")
+        
+        col1, col2, col3 = st.columns([1, 3, 1])
+        with col1:
+            if st.button("◀ Previous", disabled=(st.session_state.image_page <= 0), key="prev_image"):
+                st.session_state.image_page = max(0, st.session_state.image_page - 1)
+                st.rerun()
+        with col2:
+            st.markdown(f"**Page {st.session_state.image_page + 1} of {max(1, max_pages)}** (showing {min(items_per_page, total_images - st.session_state.image_page * items_per_page)} of {total_images} images)")
+        with col3:
+            if st.button("Next ▶", disabled=(st.session_state.image_page >= max_pages - 1), key="next_image"):
+                st.session_state.image_page = min(max_pages - 1, st.session_state.image_page + 1)
+                st.rerun()
+        start_idx = st.session_state.image_page * items_per_page
+        end_idx = min(start_idx + items_per_page, total_images)
+        page_images = image_history.iloc[start_idx:end_idx]
+        
+        st.markdown('<div class="history-grid">', unsafe_allow_html=True)
+        rows = [page_images.iloc[i:i+2] for i in range(0, len(page_images), 2)]
+        for row_items in rows:
+            cols = st.columns(2)
+            for i, (_, row) in enumerate(row_items.iterrows()):
+                if i < len(cols):
+                    with cols[i]:
+                        display_history_image_card(row)
+        st.markdown('</div>', unsafe_allow_html=True)
+        
+        col1, col2, col3 = st.columns([1, 3, 1])
+        with col1:
+            if st.button("◀ Previous", disabled=(st.session_state.image_page <= 0), key="prev_image_bottom"):
+                st.session_state.image_page = max(0, st.session_state.image_page - 1)
+                st.rerun()
+        with col2:
+            st.markdown(f"**Page {st.session_state.image_page + 1} of {max(1, max_pages)}**")
+        with col3:
+            if st.button("Next ▶", disabled=(st.session_state.image_page >= max_pages - 1), key="next_image_bottom"):
+                st.session_state.image_page = min(max_pages - 1, st.session_state.image_page + 1)
+                st.rerun()
+
+def display_all_history(history_data):
+    """Displays the 'All History' sub-tab content."""
+    st.markdown("### Complete History")
+    
+    col1, col2, col3, col4 = st.columns([1, 1, 1, 1])
+    with col1:
+        filter_type = st.selectbox("Filter by type:", ["All", "Video", "Image"], key="type_filter")
+    with col2:
+        sort_field = st.selectbox("Sort by:", ["Date", "Type"], key="sort_field")
+    with col3:
+        sort_order = st.selectbox("Order:", ["Newest first", "Oldest first"], key="sort_order")
+    with col4:
+        view_mode = st.selectbox("View as:", ["Table", "Grid"], key="view_mode")
+    
+    filtered_history = history_data.copy()
+    if filter_type == "Video":
+        filtered_history = filtered_history[filtered_history['type'] == 'video']
+    elif filter_type == "Image":
+        filtered_history = filtered_history[filtered_history['type'] == 'image']
+    
+    if sort_field == "Date":
+        if sort_order == "Newest first":
+            filtered_history = filtered_history.sort_values('timestamp', ascending=False)
+        else:
+            filtered_history = filtered_history.sort_values('timestamp', ascending=True)
+    else:
+        if sort_order == "Newest first":
+            filtered_history = filtered_history.sort_values(['type', 'timestamp'], ascending=[True, False])
+        else:
+            filtered_history = filtered_history.sort_values(['type', 'timestamp'], ascending=[True, True])
+    
+    if filtered_history.empty:
+        st.info("No history data found with these filters.")
+    else:
+        if view_mode == "Table":
+            display_df = filtered_history.copy()
+            display_df['timestamp'] = pd.to_datetime(display_df['timestamp']).dt.strftime("%Y-%m-%d %H:%M:%S")
+            display_df = display_df.rename(columns={'timestamp': 'Generated', 'type': 'Type', 'uri': 'URI', 'prompt': 'Prompt'})
+            if 'params' in display_df.columns:
+                display_df = display_df.drop(columns=['params'])
+            display_df['Prompt'] = display_df['Prompt'].apply(lambda x: x[:50] + "..." if isinstance(x, str) and len(x) > 50 else x)
+            st.dataframe(display_df, use_container_width=True, column_config={
+                "Generated": st.column_config.DatetimeColumn("Generated", help="When this item was created", format="MMM DD, YYYY, hh:mm a", width="medium"),
+                "Type": st.column_config.TextColumn("Type", help="Item type (video or image)", width="small"),
+                "URI": st.column_config.TextColumn("URI", help="Google Cloud Storage URI", width="large"),
+                "Prompt": st.column_config.TextColumn("Prompt", help="Prompt used for generation", width="large")
+            })
+        else:
+            st.markdown('<div class="history-grid">', unsafe_allow_html=True)
+            rows = [filtered_history.iloc[i:i+2] for i in range(0, len(filtered_history), 2)]
+            for row_items in rows:
+                cols = st.columns(2)
+                for i, (_, row) in enumerate(row_items.iterrows()):
+                    if i < len(cols):
+                        with cols[i]:
+                            if row['type'] == 'video':
+                                display_history_video_card(row)
+                            else:
+                                display_history_image_card(row)
+            st.markdown('</div>', unsafe_allow_html=True)
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("Download as CSV"):
+                csv = filtered_history.to_csv(index=False)
+                st.download_button(label="Download CSV", data=csv, file_name="veo2_history.csv", mime="text/csv")
+
 def history_tab():
     """History of generated videos and images."""
     logger.start_section("History Tab")
     logger.info("Rendering History tab")
     
+    # Display the action panel if items are selected
+    if st.session_state.get('selected_history_items'):
+        display_history_actions()
+
     # Use header and button in same line with columns
     header_col, button_col = st.columns([5, 1])
     with header_col:
@@ -2646,475 +3144,56 @@ def history_tab():
             st.success("Refreshing history...")
             st.rerun()
     
-    # Check if we can access Google Cloud Storage
-    if not GCS_SDK_AVAILABLE:
-        st.warning("Google Cloud Storage SDK not available. History tracking requires this library.")
-        st.markdown("Please install it with: `pip install google-cloud-storage`")
-        return
-    
-    # Check if storage URI is set
-    if not config.STORAGE_URI:
-        st.error("⚠️ Storage URI is not set. Please configure a GCS storage URI in the sidebar.")
-        return
-    
-    # Debug information
-    if st.session_state.get("debug_mode", False):
-        with st.expander("History Debug Info", expanded=False):
-            st.write("History Loaded:", st.session_state.get("history_loaded", False))
-            st.write("History Initialized:", st.session_state.get("history_initialized", False))
-            st.write("Storage URI:", config.STORAGE_URI)
-            st.write("History Folder:", config.HISTORY_FOLDER)
-            st.write("History File:", config.HISTORY_FILE)
-            st.write("GCS SDK Available:", GCS_SDK_AVAILABLE)
-            st.write("Session State Keys:", list(st.session_state.keys()))
-    
-    # Initialize history data variable
-    history_data = None
-    
-    # Load history data with spinner if not already loaded or force refresh
+    # Load history data
     try:
-        # Check if we need to load history data
         if not st.session_state.get("history_loaded", False) or "history_data" not in st.session_state:
             with st.spinner("Loading history data..."):
-                logger.info("Loading history data from Firestore...")
-                
-                # Get history data from Firestore
-                history_data = get_history_from_firestore(limit=200) # Fetch more to allow filtering
-                
-                # Store in session state
+                history_data = get_history_from_firestore(limit=200)
                 st.session_state.history_data = history_data
                 st.session_state.history_loaded = True
-                
-                if history_data.empty:
-                    logger.info("No history data found")
-                else:
-                    logger.success(f"Successfully loaded {len(history_data)} history entries")
         else:
-            # Use cached data
             history_data = st.session_state.history_data
-            logger.info(f"Using cached history data with {len(history_data)} entries")
     except Exception as e:
-        error_msg = f"Error loading history: {str(e)}"
-        st.error(error_msg)
-        logger.error(error_msg)
+        st.error(f"Error loading history: {str(e)}")
+        history_data = pd.DataFrame()
+
+    if not history_data.empty:
+        HISTORY_SUB_TABS = OrderedDict([
+            ("🎬 Recent Videos", display_recent_videos),
+            ("🎵 Recent Audios", display_recent_audios),
+            ("🎤 Recent Voices", display_recent_voices),
+            ("🖼️ All Images", display_all_images),
+            ("📋 All History", display_all_history)
+        ])
+
+        # Get the previously active tab to detect changes
+        previous_sub_tab = st.session_state.get('active_history_sub_tab', '🎬 Recent Videos')
+        default_index = list(HISTORY_SUB_TABS.keys()).index(previous_sub_tab)
+
+        active_sub_tab = st.radio(
+            "History Sub-Navigation",
+            options=list(HISTORY_SUB_TABS.keys()),
+            index=default_index,
+            horizontal=True,
+            label_visibility="collapsed",
+            key="history_sub_nav_radio"
+        )
+
+        # If the user clicks a new tab, clear selections to prevent errors
+        if active_sub_tab != previous_sub_tab:
+            st.session_state.selected_history_items.clear()
+            logger.info(f"History sub-tab changed to '{active_sub_tab}'. Clearing selection.")
         
-        # Display more information about the error for debugging
-        if st.session_state.get("debug_mode", False):
-            st.error(f"Error details: {type(e).__name__}")
-            import traceback
-            st.code(traceback.format_exc())
-        
-        # Create an empty DataFrame as a fallback
-        history_data = pd.DataFrame(columns=['timestamp', 'type', 'uri', 'prompt', 'params'])
-        st.session_state.history_data = history_data
-        st.session_state.history_loaded = True
-    
-    # If we somehow still don't have history data, use an empty DataFrame
-    if history_data is None:
-        logger.warning("History data is None, using empty DataFrame")
-        history_data = pd.DataFrame(columns=['timestamp', 'type', 'uri', 'prompt', 'params'])
-    
-    if history_data.empty:
+        # Always update the session state with the current tab
+        st.session_state.active_history_sub_tab = active_sub_tab
+
+        # Call the appropriate function to display the content of the active tab
+        HISTORY_SUB_TABS[active_sub_tab](history_data)
+    else:
         st.info("No generation history found. Generate some videos or images to see them here!")
-        logger.end_section()
-        return
-    
-    # Create tabs for different history views
-    history_tabs = st.tabs(["🎬 Recent Videos", "🎵 Recent Audios", "🎤 Recent Voices", "🖼️ All Images", "📋 All History"])
-    
-    # Recent Videos Tab
-    with history_tabs[0]:
-        # Filter videos only
-        video_history = history_data[history_data['type'] == 'video'].copy()
-        
-        if video_history.empty:
-            st.info("No videos in history yet. Generate some videos to see them here!")
-        else:
-            # Header and clear button in same row
-            video_header_col, clear_col = st.columns([5, 1])
-            with video_header_col:
-                st.markdown(f"### Recent Generated Videos ({len(video_history)})")
-            with clear_col:
-                if st.button("🗑️ Clear All", key="clear_history_btn", type="secondary"):
-                    if st.session_state.get("confirm_clear_history", False):
-                        if not FIRESTORE_AVAILABLE:
-                            st.error("Firestore is not available. Cannot clear history.")
-                            st.session_state.confirm_clear_history = False # Reset confirmation
-                            st.rerun()
-                            return
-
-                        # User has already confirmed, proceed with clearing
-                        try:
-                            clear_history()
-                            st.success("History cleared successfully!")
-                            st.session_state.history_loaded = False
-                            st.session_state.confirm_clear_history = False
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Error clearing history: {str(e)}")
-                    else:
-                        # Ask for confirmation
-                        st.session_state.confirm_clear_history = True
-                        st.warning("⚠️ This will permanently delete all history. Are you sure?")
-                        
-                        confirm_col1, confirm_col2 = st.columns(2)
-                        with confirm_col1:
-                            if st.button("✅ Yes, Delete All"):
-                                try:
-                                    clear_history()
-                                    st.success("History cleared successfully!")
-                                    st.session_state.history_loaded = False
-                                    st.session_state.confirm_clear_history = False
-                                    st.rerun()
-                                except Exception as e:
-                                    st.error(f"Error clearing history: {str(e)}")
-                        with confirm_col2:
-                            if st.button("❌ Cancel"):
-                                st.session_state.confirm_clear_history = False
-                                st.rerun()
-            
-            # Sort by timestamp descending
-            video_history = video_history.sort_values('timestamp', ascending=False)
-            
-            # Add pagination for videos
-            total_videos = len(video_history)
-            items_per_page = 10
-            
-            # Calculate max pages and add pagination controls
-            max_pages = (total_videos + items_per_page - 1) // items_per_page  # Ceiling division
-            
-            # Initialize or update page number in session state
-            if "video_page" not in st.session_state:
-                st.session_state.video_page = 0
-                
-            # Add pagination controls at the top
-            col1, col2, col3 = st.columns([1, 3, 1])
-            with col1:
-                if st.button("◀ Previous", disabled=(st.session_state.video_page <= 0), key="prev_video"):
-                    st.session_state.video_page = max(0, st.session_state.video_page - 1)
-                    st.rerun()
-            
-            with col2:
-                st.markdown(f"**Page {st.session_state.video_page + 1} of {max(1, max_pages)}** (showing {min(items_per_page, total_videos - st.session_state.video_page * items_per_page)} of {total_videos} videos)")
-                
-            with col3:
-                if st.button("Next ▶", disabled=(st.session_state.video_page >= max_pages - 1), key="next_video"):
-                    st.session_state.video_page = min(max_pages - 1, st.session_state.video_page + 1)
-                    st.rerun()
-            
-            # Get the videos for the current page
-            start_idx = st.session_state.video_page * items_per_page
-            end_idx = min(start_idx + items_per_page, total_videos)
-            page_videos = video_history.iloc[start_idx:end_idx]
-            
-            # Create a grid layout using custom CSS
-            st.markdown('<div class="history-grid">', unsafe_allow_html=True)
-            
-            # Create rows for every 2 videos to ensure proper grid layout
-            rows = [page_videos.iloc[i:i+2] for i in range(0, len(page_videos), 2)]
-            
-            for row_items in rows:
-                cols = st.columns(2)
-                
-                for i, (_, row) in enumerate(row_items.iterrows()):
-                    if i < len(cols):
-                        with cols[i]:
-                            # Remove the empty div and just display the card contents directly
-                            display_history_video_card(row)
-            
-            st.markdown('</div>', unsafe_allow_html=True)
-            
-            # Add pagination controls at the bottom too
-            col1, col2, col3 = st.columns([1, 3, 1])
-            with col1:
-                if st.button("◀ Previous", disabled=(st.session_state.video_page <= 0), key="prev_video_bottom"):
-                    st.session_state.video_page = max(0, st.session_state.video_page - 1)
-                    st.rerun()
-            
-            with col2:
-                st.markdown(f"**Page {st.session_state.video_page + 1} of {max(1, max_pages)}**")
-                
-            with col3:
-                if st.button("Next ▶", disabled=(st.session_state.video_page >= max_pages - 1), key="next_video_bottom"):
-                    st.session_state.video_page = min(max_pages - 1, st.session_state.video_page + 1)
-                    st.rerun()
-    
-    # Recent Audios Tab
-    with history_tabs[1]:
-        st.markdown("### Recent Generated Audios")
-        audio_history = history_data[history_data['type'] == 'audio'].copy()
-        
-        if audio_history.empty:
-            st.info("No audio generation history found.")
-        else:
-            st.markdown(f"Found {len(audio_history)} audio generations.")
-            audio_history = audio_history.sort_values('timestamp', ascending=False)
-            
-            # Display in a grid
-            st.markdown('<div class="history-grid">', unsafe_allow_html=True)
-            rows = [audio_history.iloc[i:i+2] for i in range(0, len(audio_history), 2)]
-            for row_items in rows:
-                cols = st.columns(2)
-                for i, (_, row) in enumerate(row_items.iterrows()):
-                    if i < len(cols):
-                        with cols[i]:
-                            with st.container(border=True, height=350):
-                                display_history_audio_card(row)
-            st.markdown('</div>', unsafe_allow_html=True)
-
-    # Recent Voices Tab
-    with history_tabs[2]:
-        st.markdown("### Recent Generated Voiceovers")
-        voice_history = history_data[history_data['type'] == 'voice'].copy()
-        
-        if voice_history.empty:
-            st.info("No voiceover generation history found.")
-        else:
-            st.markdown(f"Found {len(voice_history)} voiceover generations.")
-            voice_history = voice_history.sort_values('timestamp', ascending=False)
-
-            # Display in a grid
-            st.markdown('<div class="history-grid">', unsafe_allow_html=True)
-            rows = [voice_history.iloc[i:i+2] for i in range(0, len(voice_history), 2)]
-            for row_items in rows:
-                cols = st.columns(2)
-                for i, (_, row) in enumerate(row_items.iterrows()):
-                    if i < len(cols):
-                        with cols[i]:
-                            with st.container(border=True, height=350):
-                                display_history_voice_card(row)
-            st.markdown('</div>', unsafe_allow_html=True)
-
-    # All Images Tab
-    with history_tabs[3]:
-        # Filter images only
-        image_history = history_data[history_data['type'] == 'image'].copy()
-        
-        if image_history.empty:
-            st.info("No source images in history yet.")
-        else:
-            # Removed the direct image selection dropdown - it's no longer needed
-            
-            # Filtering options
-            st.markdown("### Filter Source Images")
-            col1, col2 = st.columns([3, 2])
-            with col1:
-                search_term = st.text_input("Search by filename:", key="image_search", 
-                                          placeholder="Enter filename or leave empty to show all")
-            with col2:
-                sort_order = st.selectbox("Sort by:", ["Newest first", "Oldest first"], 
-                                        key="image_sort")
-            
-            # Apply filters
-            if search_term:
-                # Search in parameters for filename
-                image_history = image_history[image_history['params'].apply(
-                    lambda x: search_term.lower() in json.loads(x).get('filename', '').lower() 
-                    if pd.notna(x) and x else False
-                )]
-            
-            # Sort images
-            if sort_order == "Newest first":
-                image_history = image_history.sort_values('timestamp', ascending=False)
-            else:
-                image_history = image_history.sort_values('timestamp', ascending=True)
-            
-            # Add pagination for images
-            total_images = len(image_history)
-            items_per_page = 10
-            
-            # Calculate max pages and add pagination controls
-            max_pages = (total_images + items_per_page - 1) // items_per_page  # Ceiling division
-            
-            # Initialize or update page number in session state
-            if "image_page" not in st.session_state:
-                st.session_state.image_page = 0
-                
-            st.markdown(f"### Source Images ({total_images})")
-            
-            # Add pagination controls
-            col1, col2, col3 = st.columns([1, 3, 1])
-            with col1:
-                if st.button("◀ Previous", disabled=(st.session_state.image_page <= 0), key="prev_image"):
-                    st.session_state.image_page = max(0, st.session_state.image_page - 1)
-                    st.rerun()
-            
-            with col2:
-                st.markdown(f"**Page {st.session_state.image_page + 1} of {max(1, max_pages)}** (showing {min(items_per_page, total_images - st.session_state.image_page * items_per_page)} of {total_images} images)")
-                
-            with col3:
-                if st.button("Next ▶", disabled=(st.session_state.image_page >= max_pages - 1), key="next_image"):
-                    st.session_state.image_page = min(max_pages - 1, st.session_state.image_page + 1)
-                    st.rerun()
-            
-            # Get the images for the current page
-            start_idx = st.session_state.image_page * items_per_page
-            end_idx = min(start_idx + items_per_page, total_images)
-            page_images = image_history.iloc[start_idx:end_idx]
-            
-            # Create a grid layout using custom CSS
-            st.markdown('<div class="history-grid">', unsafe_allow_html=True)
-            
-            # Create rows for every 2 images to ensure proper grid layout
-            rows = [page_images.iloc[i:i+2] for i in range(0, len(page_images), 2)]
-            
-            for row_items in rows:
-                cols = st.columns(2)
-                
-                for i, (_, row) in enumerate(row_items.iterrows()):
-                    if i < len(cols):
-                        with cols[i]:
-                            # Remove the empty div and just display the card contents directly
-                            display_history_image_card(row)
-            
-            st.markdown('</div>', unsafe_allow_html=True)
-            
-            # Add pagination controls at the bottom too
-            col1, col2, col3 = st.columns([1, 3, 1])
-            with col1:
-                if st.button("◀ Previous", disabled=(st.session_state.image_page <= 0), key="prev_image_bottom"):
-                    st.session_state.image_page = max(0, st.session_state.image_page - 1)
-                    st.rerun()
-            
-            with col2:
-                st.markdown(f"**Page {st.session_state.image_page + 1} of {max(1, max_pages)}**")
-                
-            with col3:
-                if st.button("Next ▶", disabled=(st.session_state.image_page >= max_pages - 1), key="next_image_bottom"):
-                    st.session_state.image_page = min(max_pages - 1, st.session_state.image_page + 1)
-                    st.rerun()
-    
-    # All History Tab
-    with history_tabs[4]:
-        st.markdown("### Complete History")
-        
-        # Add filter options
-        col1, col2, col3, col4 = st.columns([1, 1, 1, 1])
-        with col1:
-            filter_type = st.selectbox("Filter by type:", ["All", "Video", "Image"], key="type_filter")
-        with col2:
-            sort_field = st.selectbox("Sort by:", ["Date", "Type"], key="sort_field")
-        with col3:
-            sort_order = st.selectbox("Order:", ["Newest first", "Oldest first"], key="sort_order")
-        with col4:
-            view_mode = st.selectbox("View as:", ["Table", "Grid"], key="view_mode")
-        
-        # Apply filters
-        filtered_history = history_data.copy()
-        
-        if filter_type == "Video":
-            filtered_history = filtered_history[filtered_history['type'] == 'video']
-        elif filter_type == "Image":
-            filtered_history = filtered_history[filtered_history['type'] == 'image']
-        
-        # Apply sort
-        if sort_field == "Date":
-            if sort_order == "Newest first":
-                filtered_history = filtered_history.sort_values('timestamp', ascending=False)
-            else:
-                filtered_history = filtered_history.sort_values('timestamp', ascending=True)
-        else:  # Sort by type
-            if sort_order == "Newest first":
-                filtered_history = filtered_history.sort_values(['type', 'timestamp'], ascending=[True, False])
-            else:
-                filtered_history = filtered_history.sort_values(['type', 'timestamp'], ascending=[True, True])
-        
-        # Display data based on selected view mode
-        if filtered_history.empty:
-            st.info("No history data found with these filters.")
-        else:
-            if view_mode == "Table":
-                # Create a more readable dataframe for display
-                display_df = filtered_history.copy()
-                
-                # Convert timestamp
-                display_df['timestamp'] = pd.to_datetime(display_df['timestamp']).dt.strftime("%Y-%m-%d %H:%M:%S")
-                
-                # Rename columns
-                display_df = display_df.rename(columns={
-                    'timestamp': 'Generated',
-                    'type': 'Type',
-                    'uri': 'URI',
-                    'prompt': 'Prompt'
-                })
-                
-                # Drop params column as it's not very readable in a table
-                if 'params' in display_df.columns:
-                    display_df = display_df.drop(columns=['params'])
-                
-                # Truncate prompt for better display
-                display_df['Prompt'] = display_df['Prompt'].apply(lambda x: x[:50] + "..." if isinstance(x, str) and len(x) > 50 else x)
-                
-                # Display table with better formatting
-                st.dataframe(
-                    display_df,
-                    use_container_width=True,
-                    column_config={
-                        "Generated": st.column_config.DatetimeColumn(
-                            "Generated",
-                            help="When this item was created",
-                            format="MMM DD, YYYY, hh:mm a",
-                            width="medium"
-                        ),
-                        "Type": st.column_config.TextColumn(
-                            "Type",
-                            help="Item type (video or image)",
-                            width="small"
-                        ),
-                        "URI": st.column_config.TextColumn(
-                            "URI",
-                            help="Google Cloud Storage URI",
-                            width="large"
-                        ),
-                        "Prompt": st.column_config.TextColumn(
-                            "Prompt",
-                            help="Prompt used for generation",
-                            width="large"
-                        )
-                    }
-                )
-            else:  # Grid view
-                # Create a grid layout using custom CSS
-                st.markdown('<div class="history-grid">', unsafe_allow_html=True)
-                
-                # Create rows for every 2 items to ensure proper grid layout
-                rows = [filtered_history.iloc[i:i+2] for i in range(0, len(filtered_history), 2)]
-                
-                for row_items in rows:
-                    cols = st.columns(2)
-                    
-                    for i, (_, row) in enumerate(row_items.iterrows()):
-                        if i < len(cols):
-                            with cols[i]:
-                                # Remove the empty div and just display the card contents directly
-                                # Fix: Only call the appropriate display function based on type
-                                if row['type'] == 'video':
-                                    display_history_video_card(row)
-                                else:
-                                    display_history_image_card(row)
-                
-                st.markdown('</div>', unsafe_allow_html=True)
-            
-            # Add export options
-            col1, col2 = st.columns(2)
-            with col1:
-                if st.button("Download as CSV"):
-                    # Prepare data for download
-                    csv = filtered_history.to_csv(index=False)
-                    
-                    # Create download button
-                    st.download_button(
-                        label="Download CSV",
-                        data=csv,
-                        file_name="veo2_history.csv",
-                        mime="text/csv"
-                    )
-    
-    # Fullscreen view removed as the buttons that triggered it have been removed
-    # Direct links to open videos/images in new tabs are now provided directly in the cards
     
     logger.end_section()
-
+        
 def display_history_video_card(row):
     """Display a video history card with details and buttons."""
     uri = row['uri']
@@ -3122,6 +3201,16 @@ def display_history_video_card(row):
     prompt = row.get('prompt', 'No prompt available.')
     params = _parse_history_params(row.get('params', {}))
 
+    # --- Selection Checkbox ---
+    is_selected = uri in st.session_state.get('selected_history_items', {})
+
+    def toggle_selection():
+        if uri in st.session_state.selected_history_items:
+            del st.session_state.selected_history_items[uri]
+        else:
+            st.session_state.selected_history_items[uri] = 'video'
+
+    st.checkbox("Select this video", value=is_selected, key=f"select_{uri}", on_change=toggle_selection, label_visibility="collapsed")
     # Generate a signed URL for the video
     try:
         # Check if we already have a cached signed URL for this video
@@ -3187,6 +3276,16 @@ def display_history_video_card(row):
             display_params['sampleCount'] = display_params.pop('sample_count')
         if 'person_generation' in display_params and 'personGeneration' not in display_params:
             display_params['personGeneration'] = display_params.pop('person_generation')
+
+        # Format speed change factor for better display
+        if display_params.get('operation') == 'change_speed' and 'factor' in display_params:
+            try:
+                factor = float(display_params['factor'])
+                # Format to one decimal place and add 'x'
+                display_params['factor'] = f"{factor:.1f}x"
+            except (ValueError, TypeError):
+                # If it's not a number for some reason, leave it as is
+                pass
 
         # Display parameters in an expander with a clear title
         with st.expander("Video Details", expanded=False):
@@ -3493,6 +3592,7 @@ def generate_image(
     sample_count,
     aspect_ratio,
     seed,
+    resolution,
     person_generation,
     safety_filter_level,
     storage_uri,
@@ -3510,13 +3610,23 @@ def generate_image(
         try:
             client = Veo2API(project_id) # Reusing the client
 
+            # Prepare image if provided
+            # if input_image_path:
+            #     input_image = client.encode_image_file(input_image_path)
+            # if reference_image_path:
+            #     reference_image = client.encode_image_file(reference_image_path)
+
+            # Generate the image
+
             response = client.generate_image_imagen(
+                # input_image=input_image,
                 prompt=prompt,
                 model=model,
                 negative_prompt=negative_prompt,
                 sample_count=sample_count,
                 aspect_ratio=aspect_ratio,
                 seed=seed,
+                resolution=resolution,
                 person_generation= person_generation,
                 safety_filter_level=safety_filter_level,
                 storage_uri=storage_uri,
@@ -3577,7 +3687,107 @@ def generate_image(
             st.error(f"⚠️ Error: {str(e)}")
             st.exception(e)
 
+def edit_image(
+    project_id,
+    prompt,
+    model,
+    seed,
+    person_generation,
+    safety_filter_level,
+    storage_uri,
+    enhance_prompt,
+    input_image_paths: Optional[List[str]] = None, # Expect a list of paths
+):
+    """Edit an image using Gemini and display results."""
+    # ... (project_id and storage_uri checks remain the same) ...
 
+    with st.spinner("🎨 Generating your image with Gemini..."):
+        try:
+            client = Veo2API(project_id)
+
+            # Prepare a list of input images
+            input_images_data = []
+            if input_image_paths:
+                for image_path in input_image_paths:
+                    # 1. Get the base64 encoded data
+                    encoded_dict = client.encode_image_file(image_path)
+                    base64_data = encoded_dict['bytesBase64Encoded']
+
+                    # 2. Determine the mime type from the file extension
+                    mime_type, _ = mimetypes.guess_type(image_path)
+                    if mime_type is None:
+                        # Fallback for unknown types
+                        mime_type = "application/octet-stream"
+
+                    # 3. Construct the correct dictionary and append it
+                    input_images_data.append({
+                        "data": base64_data,
+                        "mime_type": mime_type
+                    })
+
+            # Call the new API function
+            response = client.generate_image_gemini_image_preview(
+                prompt=prompt,
+                input_images=input_images_data, # Pass the list of encoded images
+                model=model,
+                safety_threshold=safety_filter_level,
+                # Note: 'seed' and other unused parameters are ignored by the new function
+            )
+
+            if "error" in response:
+                error_msg = response.get("error", {}).get("message", "Unknown error")
+                st.error(f"⚠️ Image editing failed: {error_msg}")
+                st.json(response)
+                return
+
+            # Try to get URIs first, as this is the expected response when storage_uri is provided
+            image_uris = client.extract_image_uris(response)
+            image_data_list = []
+
+            # If no URIs are found, fall back to checking for base64 encoded data
+            if not image_uris:
+                image_data_list = client.extract_image_data(response)
+
+            if not image_uris and not image_data_list:
+                st.warning("Image editing succeeded, but no images were returned. This could be due to safety filters.")
+                st.json(response)
+                return
+
+            st.success(f"✅ Successfully edited {len(image_uris) or len(image_data_list)} image(s)!")
+
+            # If we received base64 data, we need to upload it to GCS to get a URI
+            if image_data_list:
+                st.info("Uploading edited images to your history bucket...")
+                uploaded_uris = []
+                for i, image_data in enumerate(image_data_list):
+                    image_to_upload = Image.open(io.BytesIO(image_data))
+                    # Use history manager to upload
+                    uri = history_manager.upload_image_to_history(image_to_upload, image_name=f"gemini_edit_{uuid.uuid4().hex}.png")
+                    uploaded_uris.append(uri)
+                # The final list of URIs is the one we just uploaded
+                image_uris = uploaded_uris
+
+            # Add to history
+            if image_uris and FIRESTORE_AVAILABLE:
+                params = {
+                    "prompt": prompt, "model": model, "safetyFilterThreshold": safety_filter_level,
+                    "input_images": [os.path.basename(p) for p in input_image_paths or []]
+                }
+                for uri in image_uris:
+                    db.collection('history').document().set({
+                        'timestamp': firestore.SERVER_TIMESTAMP, 'type': 'image', 'uri': uri,
+                        'prompt': f"Edited image with prompt: {prompt}", 'params': params
+                    })
+
+            # Display images
+            display_images(image_uris)
+
+        except Exception as e:
+            logger.error(f"Error during image editing: {str(e)}")
+            st.error(f"⚠️ Error: {str(e)}")
+            st.exception(e)
+
+            
 def display_videos(video_uris, client, enable_streaming=True):
     """Display a list of videos in Streamlit."""
     if not video_uris:
@@ -3825,6 +4035,97 @@ def display_history_voice_card(row):
     if signed_url:
         st.markdown(f'<div style="text-align: right;"><a href="{signed_url}" target="_blank" style="font-size: 0.8rem;">Open in new tab</a></div>', unsafe_allow_html=True)
 
+def dub_video(uploaded_video, input_language, output_language, bucket_name):
+    """
+    Dubs a video using the command-line interface.
+    """
+    # Dependency check for pydub and Python 3.13+
+    try:
+        import pydub
+        try:
+            import audioop
+        except ImportError:
+            # audioop is removed in Python 3.13, check for pyaudioop
+            import pyaudioop
+    except ImportError:
+        st.error("The 'pydub' and/or 'pyaudioop' packages are not installed. Please run 'pip install pydub pyaudioop' to use the dubbing feature, especially on Python 3.13+.")
+        return
+
+    # 1. Save uploaded video to a temporary file
+    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(uploaded_video.name)[1]) as tmp_in:
+        tmp_in.write(uploaded_video.getvalue())
+        input_video_path = tmp_in.name
+
+    try:
+        # 2. Define output path and filename
+        output_dir = os.path.join(os.getcwd(), "output", "dubbed_videos")
+        os.makedirs(output_dir, exist_ok=True)
+        
+        base_name = os.path.splitext(os.path.basename(uploaded_video.name))[0]
+        
+        # Parse language and sanitize for filename, matching CLI logic
+        output_lang_parsed = output_language.split(' (')[0]
+        safe_output_language = ''.join(c for c in output_lang_parsed if c.isalnum() or c in '-_').lower()
+        output_filename = f"{base_name}_dubbed_{safe_output_language}.mp4"
+        output_video_path = os.path.join(output_dir, output_filename)
+
+        # 3. Construct the command
+        cli_path = os.path.join(os.getcwd(), "apis", "cli", "cli.py")
+        
+        input_lang_parsed = input_language.split(' (')[0]
+
+        command = [
+            sys.executable,
+            cli_path,
+            "--input-video", input_video_path,
+            "--output-path", output_dir,
+            "--input-language", input_lang_parsed,
+            "--output-language", output_lang_parsed,
+            "--gemini-api-key", config.GEMINI_API_KEY
+        ]
+
+        st.info("Running dubbing command...")
+        st.code(f"python {' '.join(command[1:])}")
+
+        # 4. Execute the command and stream output
+        with st.spinner(f"Dubbing video from {input_language} to {output_language}... This may take a while."):
+            log_placeholder = st.empty()
+            log_output = ""
+            
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', bufsize=1)
+
+            for line in iter(process.stdout.readline, ''):
+                log_output += line
+                log_placeholder.code(log_output)
+            
+            process.stdout.close()
+            return_code = process.wait()
+
+            if return_code == 0:
+                st.success("✅ Dubbing process completed successfully!")
+                if os.path.exists(output_video_path):
+                    st.subheader("Dubbed Video Preview")
+                    st.video(output_video_path)
+                    
+                    if FIRESTORE_AVAILABLE:
+                        with st.spinner("Uploading to history..."):
+                            final_video_uri = video_upload_to_gcs(output_video_path, bucket_name, output_filename)
+                            if final_video_uri:
+                                db.collection('history').add({
+                                    'timestamp': firestore.SERVER_TIMESTAMP, 'type': 'video', 'uri': final_video_uri,
+                                    'prompt': f'Video dubbed from {input_language} to {output_language}.',
+                                    'params': {'operation': 'dub_video', 'input_language': input_language, 'output_language': output_language}
+                                })
+                                st.success(f"✅ Dubbed video saved to history: {final_video_uri}")
+            else:
+                st.error(f"⚠️ Dubbing process failed with return code {return_code}.")
+                st.subheader("Dubbing Logs:")
+                st.code(log_output)
+    finally:
+        # 5. Clean up the temporary file
+        if 'input_video_path' in locals() and os.path.exists(input_video_path):
+            os.unlink(input_video_path)
+
 def generate_audio(
     project_id,
     prompt,
@@ -4041,9 +4342,18 @@ def display_history_image_card(row):
     
     # Parse params to get filename and other info
     params = _parse_history_params(params_json)
-    is_generated = 'model' in params and 'imagen' in params.get('model', '')
+    is_generated = 'model' in params
     filename = params.get('filename', default_filename)
     
+    # --- Selection Checkbox ---
+    is_selected = uri in st.session_state.get('selected_history_items', {})
+
+    def toggle_selection():
+        if uri in st.session_state.selected_history_items:
+            del st.session_state.selected_history_items[uri]
+        else:
+            st.session_state.selected_history_items[uri] = 'image'
+    st.checkbox("Select this image", value=is_selected, key=f"select_{uri}", on_change=toggle_selection, label_visibility="collapsed")
     # Generate a signed URL for the image
     try:
 
@@ -4092,6 +4402,85 @@ def display_history_image_card(row):
     # Provide direct link to open in new tab
     if signed_url:
         st.markdown(f'<div style="text-align: right;"><a href="{signed_url}" target="_blank" style="font-size: 0.8rem;">Open in new tab</a></div>', unsafe_allow_html=True)
+
+def download_gcs_file_and_simulate_upload(uri: str) -> Optional[SimulatedUploadFile]:
+    """Downloads a file from GCS and wraps it in a file-like object for Streamlit."""
+    try:
+        logger.info(f"Downloading {uri} from GCS...")
+        # Use the global client to generate a signed URL
+        signed_url = get_cached_signed_url(uri)
+        response = requests.get(signed_url)
+        response.raise_for_status()
+
+        content = response.content
+        filename = uri.split('/')[-1]
+
+        logger.success(f"Successfully downloaded {filename}.")
+        return SimulatedUploadFile(name=filename, content=content)
+    except Exception as e:
+        logger.error(f"Failed to download and simulate upload for {uri}: {e}")
+        st.error(f"Failed to load {uri.split('/')[-1]} from history.")
+        return None
+
+def handle_history_action(operation: str, uris: List[str]):
+    """Processes the selected action from the history tab."""
+    with st.spinner(f"Preparing assets for '{operation}'..."):
+        simulated_files = [download_gcs_file_and_simulate_upload(uri) for uri in uris]
+        simulated_files = [f for f in simulated_files if f] # Filter out None on failure
+
+        if not simulated_files:
+            st.error("Failed to load any of the selected files from storage.")
+            return
+
+        if operation == "Edit Image(s)":
+            st.session_state.edit_image_files = simulated_files
+            st.session_state.active_main_tab = "✨ Image Editing"
+        elif operation == "Use for Image-to-Video":
+            st.session_state.current_uploaded_file = simulated_files[0]
+            st.session_state.current_image = Image.open(simulated_files[0])
+            st.session_state.active_main_tab = "🖼️ Image-to-Video"
+        elif operation == "Concatenate Videos":
+            st.session_state.concat_video_files = simulated_files
+            st.session_state.video_edit_option = "Concatenate Videos"
+            st.session_state.active_main_tab = "✂️ Video Editing"
+        elif operation == "Change Video Speed":
+            st.session_state.speed_change_video_file = simulated_files[0]
+            st.session_state.video_edit_option = "Change Playback Speed"
+            st.session_state.active_main_tab = "✂️ Video Editing"
+
+        # Clear selection and rerun to switch tab and apply state changes
+        st.session_state.selected_history_items.clear()
+        st.rerun()
+
+def display_history_actions():
+    """Displays the action panel for selected history items."""
+    with st.container(border=True):
+        items = st.session_state.selected_history_items
+        st.subheader(f"{len(items)} item(s) selected")
+
+        item_types = set(items.values())
+        operations = ["-- Select an action --"]
+
+        if item_types == {'image'}:
+            operations.append("Edit Image(s)")
+            if len(items) == 1:
+                operations.append("Use for Image-to-Video")
+        elif item_types == {'video'}:
+            if len(items) > 1:
+                operations.append("Concatenate Videos")
+            if len(items) == 1:
+                operations.append("Change Video Speed")
+
+        if len(operations) > 1:
+            selected_op = st.selectbox("Perform an action:", options=operations, key="history_action_selector", index=0)
+            if selected_op != "-- Select an action --":
+                handle_history_action(selected_op, list(items.keys()))
+        else:
+            st.warning("No actions available for the current selection (e.g., mixed types or unsupported count).")
+
+        if st.button("Clear Selection"):
+            st.session_state.selected_history_items.clear()
+            st.rerun()
 
 if __name__ == "__main__":
     # Initialize minimal session state variables
