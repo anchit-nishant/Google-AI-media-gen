@@ -10,10 +10,8 @@ moviepy==1.0.3
 firebase-admin
 google-cloud-firestore
 werkzeug>=2.1.0
-pydub
+pydub>=0.25.1
 demucs
 pyrubberband
 soundfile
 click
-
-
