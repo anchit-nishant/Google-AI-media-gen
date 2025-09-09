@@ -180,6 +180,11 @@ logger.info(f"Python version: {sys.version}")
 logger.info(f"Working directory: {os.getcwd()}")
 logger.end_section()
 
+# Initialize dark_mode state at the top level of the script.
+# This ensures it's set only once per session and persists across all reruns.
+if "dark_mode" not in st.session_state:
+    st.session_state.dark_mode = False
+
 # Configure the Streamlit page
 st.set_page_config(
     page_title="Google Media Gen Tool",
@@ -767,11 +772,6 @@ def init_state():
     """Initialize all session state variables."""
     logger.start_section("Initializing App State")
     
-    # Add dark mode state
-    if "dark_mode" not in st.session_state:
-        logger.info("Initializing 'dark_mode' in session state")
-        st.session_state.dark_mode = False
-        
     # Initialize session state variables if they don't exist
     if "generated_videos" not in st.session_state:
         logger.info("Initializing 'generated_videos' in session state")
@@ -862,46 +862,33 @@ def main():
     # Initialize session state
     init_state()
     
-    # Handle programmatic tab switching from other parts of the app
+    # Handle programmatic tab switching. This must be at the top.
     if st.session_state.get("next_active_main_tab"):
         st.session_state.active_main_tab = st.session_state.next_active_main_tab
         st.session_state.next_active_main_tab = None
-        
-    
-    # Define Dark Mode CSS
+        st.rerun()
+
+    # --- Dark Mode CSS ---
+    # This CSS is conditionally applied to style components that Streamlit's
+    # native dark mode doesn't cover fully, like expanders.
     DARK_MODE_CSS = """
     <style>
-        /* General Dark Mode Styles */
-        body, .main, .stApp, .st-emotion-cache-z5fcl4, [data-testid="stAppViewContainer"] {
-            background-color: #0e1117 !important;
-            color: #fafafa !important;
-        }
-        h1, h2, h3, h4, h5, h6 {
-            color: #fafafa !important;
-        }
-
-        /* Sidebar */
-        [data-testid="stSidebar"] > div:first-child {
-            background-color: #1a1c22 !important;
-            border-right: 1px solid #31333F;
-        }
-        .sidebar-section {
-            border-bottom: 1px solid #31333F;
-        }
-
-        /* Cards and Containers */
-        .card, .simplified-card, .history-card, .image-preview-container, .upload-container, div[data-testid="stExpander"], .image-preview {
+        /* Expander (Advanced Options) styling for dark mode */
+        div[data-testid="stExpander"] {
             background-color: #1c1c1c !important;
             border: 1px solid #31333F !important;
-            color: #fafafa;
-            box-shadow: none !important;
+            color: #fafafa !important;
+            border-radius: 8px;
         }
-        .history-card-toolbar {
-            background-color: #262730 !important;
-            border-top: 1px solid #31333F !important;
+        div[data-testid="stExpander"] > div[data-testid="stExpanderHeader"] > p {
+            color: #fafafa !important; /* Header text color */
         }
-
-        /* Widgets */
+        div[data-testid="stExpander"] [data-testid="stMarkdownContainer"] p,
+        div[data-testid="stExpander"] [data-testid="stMarkdownContainer"] li {
+            color: #fafafa !important; /* Content text color */
+        }
+        
+        /* Ensure input/select box text is visible in dark mode */
         .stTextInput > div > div > input, 
         .stNumberInput > div > div > input,
         .stTextArea > div > div > textarea,
@@ -911,40 +898,10 @@ def main():
             border-color: #4d4d4d !important;
         }
 
-        /* Tabs */
-        .stTabs [data-baseweb="tab-list"] {
-            border-bottom-color: #31333F !important;
+        /* Sidebar section styling */
+        .sidebar-section {
+            border-bottom: 1px solid #31333F;
         }
-        .stTabs [data-baseweb="tab"][aria-selected="true"] {
-            color: #fafafa;
-            background-color: #262730;
-        }
-
-        /* History and Media */
-        .history-card video, .history-card img {
-            background-color: #262730 !important;
-        }
-        .history-meta, .history-prompt { color: #a0a0a0; }
-        .history-card [data-testid="stMarkdownContainer"] strong { color: #cccccc; }
-        
-        /* Alerts */
-        .stAlert { background-color: #262730 !important; }
-         /* --- Start: Sidebar Collapse Arrow Fix for Dark Mode --- */
-         section[data-testid="stSidebar"][aria-collapsed="true"] button[data-testid="stSidebarCollapseButton"] {
-             background-color: #1a1c22; /* Dark mode background */
-         }
-
-         /* Hover effect for the button in dark mode */
-         section[data-testid="stSidebar"][aria-collapsed="true"] button[data-testid="stSidebarCollapseButton"]:hover {
-             background-color: #262730;
-         }
-
-         /* Ensure arrow icon is visible in dark mode */
-         section[data-testid="stSidebar"][aria-collapsed="true"] button[data-testid="stSidebarCollapseButton"] svg {
-             fill: #fafafa; /* White arrow */
-             opacity: 1;
-         }
-         /* --- End: Sidebar Collapse Arrow Fix for Dark Mode --- */
     </style>
     """
 
@@ -1101,8 +1058,12 @@ def main():
     with toggle_col:
         # Add some padding to vertically align the toggle with the title
         st.markdown('<div style="padding-top: 1.5rem;"></div>', unsafe_allow_html=True)
+        # Initialize dark_mode state right before the widget is created
+        # This is the most robust way to prevent it from being reset on reruns.
+        # if "dark_mode" not in st.session_state:
+        #     st.session_state.dark_mode = False
         st.toggle("🌙 Dark Mode", key="dark_mode", help="Toggle between light and dark themes.")
-
+    
     # Define the main tabs and their corresponding functions
     TABS = OrderedDict([
         ("🎬 Text-to-Video", text_to_video_tab),
@@ -1120,7 +1081,6 @@ def main():
     st.radio(
         "Main Navigation",
         options=list(TABS.keys()),
-        index=list(TABS.keys()).index(st.session_state.active_main_tab),
         horizontal=True,
         label_visibility="collapsed",
         key="active_main_tab"  # Directly link the widget to the session state key.

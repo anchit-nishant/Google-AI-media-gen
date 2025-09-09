@@ -9,10 +9,11 @@ This application provides a streamlined interface for generating different types
 - **AI-Powered Prompt Generation**: Get prompt suggestions from AI to kickstart your creativity
 - **Direct Video Streaming**: Preview and download generated videos directly in the app
 - **Text-to-Image Generation**: Create images from text prompts using Imagen 3 and Imagen 4
+- **Image-to-Image Generation**: Transform images using Nano Banana also known as Gemini 2.5 Flash Image Preview
 - **Text-to-Audio Generation**: Generate music from text prompts
-- **Text-to-Voice Generation**: Create speech from text prompts, with multiple voice options and script templates along with Gemini Flash and Pro model versions.
+- **Text-to-Voice Generation**: Create speech from text prompts, with multiple voice options and script templates along with Gemini Flash and Pro model versions
 - **Direct Audio Streaming**: Preview and download generated audio directly in the app
-- **Video Editing**: Concatenate videos, alter playback speed and perform frame interpolation
+- **Video Editing**: Concatenate videos, alter playback speed, perform frame interpolation and Dubbing in Indic and international languages.
 - **Complete History Tracking**: View and reuse previous generations with pagination support
 - **Full Prompt Access**: View and copy the complete parameters for any generation
 - **Customizable Settings**: Configure API keys, storage locations, and generation parameters
