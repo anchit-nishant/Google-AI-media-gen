@@ -9,6 +9,7 @@ import time
 import json
 import tempfile
 import io
+import queue
 import sys
 import pandas as pd
 import subprocess
@@ -29,6 +30,7 @@ from werkzeug.utils import secure_filename
 # Import project modules
 import config.config as config
 import apis.gemini_helper as gemini_helper
+import app as dubbing_lib
 import apis.history_manager as history_manager
 from apis.veo2_api import Veo2API
 
@@ -177,6 +179,11 @@ logger.info(f"Starting Veo2 Video Generator App (v0.2.0)")
 logger.info(f"Python version: {sys.version}")
 logger.info(f"Working directory: {os.getcwd()}")
 logger.end_section()
+
+# Initialize dark_mode state at the top level of the script.
+# This ensures it's set only once per session and persists across all reruns.
+if "dark_mode" not in st.session_state:
+    st.session_state.dark_mode = False
 
 # Configure the Streamlit page
 st.set_page_config(
@@ -495,8 +502,8 @@ st.markdown("""
     /* History styling improvements */
     .history-grid {
         display: grid;
-        grid-template-columns: repeat(2, 1fr) !important;
-        grid-gap: 20px;
+        grid-template-columns: repeat(3, 1fr) !important; /* Changed from 2 to 3 columns */
+        grid-gap: 15px; /* Reduced gap for tighter packing */
         margin-bottom: 20px;
         width: 100%;
     }
@@ -765,11 +772,6 @@ def init_state():
     """Initialize all session state variables."""
     logger.start_section("Initializing App State")
     
-    # Add dark mode state
-    if "dark_mode" not in st.session_state:
-        logger.info("Initializing 'dark_mode' in session state")
-        st.session_state.dark_mode = False
-        
     # Initialize session state variables if they don't exist
     if "generated_videos" not in st.session_state:
         logger.info("Initializing 'generated_videos' in session state")
@@ -848,6 +850,9 @@ def init_state():
         logger.debug("Initializing 'active_history_sub_tab' in session state")
         st.session_state.active_history_sub_tab = "🎬 Recent Videos"
 
+    if 'next_active_main_tab' not in st.session_state:
+        st.session_state.next_active_main_tab = None
+
     logger.end_section()
 
 def main():
@@ -857,40 +862,33 @@ def main():
     # Initialize session state
     init_state()
     
-    # Define Dark Mode CSS
+    # Handle programmatic tab switching. This must be at the top.
+    if st.session_state.get("next_active_main_tab"):
+        st.session_state.active_main_tab = st.session_state.next_active_main_tab
+        st.session_state.next_active_main_tab = None
+        st.rerun()
+
+    # --- Dark Mode CSS ---
+    # This CSS is conditionally applied to style components that Streamlit's
+    # native dark mode doesn't cover fully, like expanders.
     DARK_MODE_CSS = """
     <style>
-        /* General Dark Mode Styles */
-        body, .main, .stApp, .st-emotion-cache-z5fcl4, [data-testid="stAppViewContainer"] {
-            background-color: #0e1117 !important;
-            color: #fafafa !important;
-        }
-        h1, h2, h3, h4, h5, h6 {
-            color: #fafafa !important;
-        }
-
-        /* Sidebar */
-        [data-testid="stSidebar"] > div:first-child {
-            background-color: #1a1c22 !important;
-            border-right: 1px solid #31333F;
-        }
-        .sidebar-section {
-            border-bottom: 1px solid #31333F;
-        }
-
-        /* Cards and Containers */
-        .card, .simplified-card, .history-card, .image-preview-container, .upload-container, div[data-testid="stExpander"], .image-preview {
+        /* Expander (Advanced Options) styling for dark mode */
+        div[data-testid="stExpander"] {
             background-color: #1c1c1c !important;
             border: 1px solid #31333F !important;
-            color: #fafafa;
-            box-shadow: none !important;
+            color: #fafafa !important;
+            border-radius: 8px;
         }
-        .history-card-toolbar {
-            background-color: #262730 !important;
-            border-top: 1px solid #31333F !important;
+        div[data-testid="stExpander"] > div[data-testid="stExpanderHeader"] > p {
+            color: #fafafa !important; /* Header text color */
         }
-
-        /* Widgets */
+        div[data-testid="stExpander"] [data-testid="stMarkdownContainer"] p,
+        div[data-testid="stExpander"] [data-testid="stMarkdownContainer"] li {
+            color: #fafafa !important; /* Content text color */
+        }
+        
+        /* Ensure input/select box text is visible in dark mode */
         .stTextInput > div > div > input, 
         .stNumberInput > div > div > input,
         .stTextArea > div > div > textarea,
@@ -900,40 +898,10 @@ def main():
             border-color: #4d4d4d !important;
         }
 
-        /* Tabs */
-        .stTabs [data-baseweb="tab-list"] {
-            border-bottom-color: #31333F !important;
+        /* Sidebar section styling */
+        .sidebar-section {
+            border-bottom: 1px solid #31333F;
         }
-        .stTabs [data-baseweb="tab"][aria-selected="true"] {
-            color: #fafafa;
-            background-color: #262730;
-        }
-
-        /* History and Media */
-        .history-card video, .history-card img {
-            background-color: #262730 !important;
-        }
-        .history-meta, .history-prompt { color: #a0a0a0; }
-        .history-card [data-testid="stMarkdownContainer"] strong { color: #cccccc; }
-        
-        /* Alerts */
-        .stAlert { background-color: #262730 !important; }
-         /* --- Start: Sidebar Collapse Arrow Fix for Dark Mode --- */
-         section[data-testid="stSidebar"][aria-collapsed="true"] button[data-testid="stSidebarCollapseButton"] {
-             background-color: #1a1c22; /* Dark mode background */
-         }
-
-         /* Hover effect for the button in dark mode */
-         section[data-testid="stSidebar"][aria-collapsed="true"] button[data-testid="stSidebarCollapseButton"]:hover {
-             background-color: #262730;
-         }
-
-         /* Ensure arrow icon is visible in dark mode */
-         section[data-testid="stSidebar"][aria-collapsed="true"] button[data-testid="stSidebarCollapseButton"] svg {
-             fill: #fafafa; /* White arrow */
-             opacity: 1;
-         }
-         /* --- End: Sidebar Collapse Arrow Fix for Dark Mode --- */
     </style>
     """
 
@@ -1055,42 +1023,6 @@ def main():
             if "debug_mode" not in st.session_state or st.session_state.debug_mode != debug_mode:
                 st.session_state.debug_mode = debug_mode
                 logger.debug_mode = debug_mode
-        
-        # Add a reset button for clearing current session data (but not history)
-        st.markdown('</div>', unsafe_allow_html=True)
-        st.markdown('<div class="sidebar-section">', unsafe_allow_html=True)
-        st.markdown("### Reset Current Session")
-        
-        if st.button("🔄 Reset Current Image", help="Clear the current image data without affecting history"):
-            # Clear current image-related data from session state
-            keys_to_clear = [
-                'current_image', 
-                'current_uploaded_file', 
-                'current_image_url',
-                'generated_prompt',
-                'last_entered_prompt'
-            ]
-            
-            for key in keys_to_clear:
-                if key in st.session_state:
-                    del st.session_state[key]
-            
-            # Don't delete image_prompt directly as it's linked to a widget
-            # Instead set it back to the default
-            if 'image_prompt' in st.session_state:
-                st.session_state.image_prompt = config.DEFAULT_IMAGE_PROMPT
-                
-            # Reset active tab tracking
-            if 'active_upload_tab' in st.session_state:
-                st.session_state.active_upload_tab = 0
-            
-            st.success("✅ Current image data has been cleared. You can now upload a new image.")
-            # Add small delay to ensure the success message is seen
-            time.sleep(0.5)
-            # Rerun to refresh the UI
-            st.rerun()
-        
-        st.info("Use this to clear the current image without affecting your history.")
         st.markdown('</div>', unsafe_allow_html=True)
         
         # Display configuration summary if in debug mode
@@ -1126,35 +1058,36 @@ def main():
     with toggle_col:
         # Add some padding to vertically align the toggle with the title
         st.markdown('<div style="padding-top: 1.5rem;"></div>', unsafe_allow_html=True)
+        # Initialize dark_mode state right before the widget is created
+        # This is the most robust way to prevent it from being reset on reruns.
+        # if "dark_mode" not in st.session_state:
+        #     st.session_state.dark_mode = False
         st.toggle("🌙 Dark Mode", key="dark_mode", help="Toggle between light and dark themes.")
-
+    
     # Define the main tabs and their corresponding functions
     TABS = OrderedDict([
         ("🎬 Text-to-Video", text_to_video_tab),
         ("🖼️ Image-to-Video", image_to_video_tab),
         ("🎨 Text-to-Image", text_to_image_tab),
-        ("✨ Image Editing", image_editing_tab),
+        ("✨ Nano Banana", image_editing_tab),
         ("🎵 Text-to-Audio", text_to_audio_tab),
         ("🎤 Text-to-Voiceover", text_to_voiceover_tab),
         ("✂️ Video Editing", video_editing_tab),
         ("📋 History", history_tab),
     ])
 
-    # Use a radio button for main navigation to allow programmatic switching from history
-    active_tab = st.radio(
+    # Use a radio button for main navigation that is directly tied to the session state.
+    # This is the standard way to create a "controlled" widget in Streamlit.
+    st.radio(
         "Main Navigation",
         options=list(TABS.keys()),
-        index=list(TABS.keys()).index(st.session_state.active_main_tab),
         horizontal=True,
         label_visibility="collapsed",
-        key="main_nav_radio"
+        key="active_main_tab"  # Directly link the widget to the session state key.
     )
 
-    # Update the active tab in session state if the user clicks a new one
-    st.session_state.active_main_tab = active_tab
-
     # Call the function for the currently active tab
-    TABS[active_tab]()
+    TABS[st.session_state.active_main_tab]()
 
     # Remove the footer which might be causing spacing issues
     # st.markdown('<div class="footer">', unsafe_allow_html=True)
@@ -1268,31 +1201,25 @@ def text_to_image_tab():
 def image_editing_tab():
     """Image editing tab."""
     st.header("Image Editing with Gemini")
-
-    # The file uploader is always present to allow adding/changing images.
-    newly_uploaded_files = st.file_uploader(
+    
+    # This callback is triggered when the file_uploader's value changes.
+    # It syncs the widget's state to our application's state variable.
+    def _sync_edit_image_files():
+        st.session_state.edit_image_files = st.session_state.get("edit_image_uploader", [])
+    
+    st.file_uploader(
         "Upload images to edit (or load from history)",
         type=["jpg", "jpeg", "png", "webp"],
         key="edit_image_uploader",
-        accept_multiple_files=True
+        accept_multiple_files=True,
+        on_change=_sync_edit_image_files,
     )
-
-    # If new files are uploaded, they replace the current set.
-    if newly_uploaded_files:
-        st.session_state.edit_image_files = newly_uploaded_files
-        st.info(f"Loaded {len(newly_uploaded_files)} new image(s) for editing.")
 
     # The primary source of truth for images to be edited.
     input_image_files = st.session_state.get('edit_image_files', [])
 
     # Display uploaded images
     if input_image_files:
-        if st.button("Clear Loaded Images"):
-            st.session_state.edit_image_files = []
-            # Clear the uploader widget's state as well
-            st.session_state.edit_image_uploader = []
-            st.rerun()
-
         # Convert all file-like objects to PIL Images for display
         # This handles both Streamlit's UploadedFile and our SimulatedUploadFile
         try:
@@ -1300,6 +1227,11 @@ def image_editing_tab():
             # Create a list of captions from the filenames
             captions = [f.name for f in input_image_files]
             st.image(images_to_display, caption=captions, width=128)
+            
+            def _clear_edit_images_callback():
+                st.session_state.edit_image_files = []
+            st.button("🗑️ Clear Loaded Images", key="clear_edit_images", on_click=_clear_edit_images_callback)
+
         except Exception as e:
             st.error(f"Could not display one of the loaded images: {e}")
 
@@ -1822,21 +1754,24 @@ def video_editing_tab():
         return
     
     # Manage radio button state to allow programmatic changes
-    options = ("Concatenate Videos", "Change Playback Speed", "Frame Interpolation", "Dubbing")
+    options = ("Concatenate Videos", "Change Playback Speed", "Frame Interpolation", "Dubbing")    
+    # Initialize the session state for the video editing tab if it doesn't exist.
+    if 'video_edit_option' not in st.session_state:
+        st.session_state.video_edit_option = "Concatenate Videos"
     
-    # Get the default option from session state. This will be set by the history action.
-    default_option = st.session_state.get('video_edit_option', "Concatenate Videos")
-    default_index = options.index(default_option) if default_option in options else 0
-    
-    edit_option = st.radio(
+    # Use a key to make this a "controlled" widget. Its state is now directly
+    # read from and written to st.session_state.video_edit_option.
+    # This resolves the "double-click" issue.
+    st.radio(
         "Choose an editing tool:",
         options,
-        index=default_index,
+        key="video_edit_option",
         horizontal=True,
-        # key="video_edit_option" # Key is removed to allow programmatic changes from other tabs
+        label_visibility="collapsed"
     )
-    # Manually keep the session state in sync with the user's selection
-    st.session_state.video_edit_option = edit_option
+    
+    # The active option is now always read directly from the session state.
+    edit_option = st.session_state.video_edit_option
 
     if edit_option == "Concatenate Videos":
         st.subheader("Concatenate Multiple Videos")
@@ -1947,7 +1882,6 @@ def video_editing_tab():
         uploaded_video = st.session_state.get('speed_change_video_file', None)
 
         if uploaded_video:
-            st.info(f"Video '{uploaded_video.name}' loaded for speed change.")
             st.video(uploaded_video.getvalue())
 
             if st.button("Clear Loaded Video", key="clear_speed_video"):
@@ -2189,54 +2123,41 @@ def video_editing_tab():
 
     elif edit_option == "Dubbing":
         st.subheader("Dub Video")
-        uploaded_video = st.file_uploader(
+        
+        # If a new file is uploaded, it becomes the current video for dubbing.
+        newly_uploaded_video = st.file_uploader(
             "Upload a video to dub (MP4, MOV, AVI)",
             type=["mp4", "mov", "avi"],
-            key="dub_video"
+            key="dub_video_uploader"
         )
+        if newly_uploaded_video:
+            st.session_state.dub_video_file = newly_uploaded_video
+
+        # Get the video to be processed from session state.
+        uploaded_video = st.session_state.get('dub_video_file', None)
 
         if uploaded_video:
-            languages = [
-                "Arabic (Egyptian)",
-                "English (US)",
-                "French (France)",
-                "Indonesian (Indonesia)",
-                "Japanese (Japan)",
-                "Portuguese (Brazil)",
-                "Dutch (Netherlands)",
-                "Thai (Thailand)",
-                "Vietnamese (Vietnam)",
-                "Ukrainian (Ukraine)",
-                "English (India)",
-                "Tamil (India)",
-                "German (Germany)",
-                "Spanish (US)",
-                "Hindi (India)",
-                "Italian (Italy)",
-                "Korean (Korea)",
-                "Russian (Russia)",
-                "Polish (Poland)",
-                "Turkish (Turkey)",
-                "Romanian (Romania)",
-                "Bengali (Bangladesh)",
-                "Marathi (India)",
-                "Telugu (India)"
-            ]
-            
+            # Display the video preview
+            st.video(uploaded_video.getvalue())
+
+            if st.button("Clear Loaded Video", key="clear_dub_video"):
+                st.session_state.dub_video_file = None
+                st.session_state.dub_video_uploader = [] # Clear the widget's state
+                st.rerun()
             col1, col2 = st.columns(2)
             with col1:
                 input_language = st.selectbox(
                     "Original Language",
-                    options=languages,
-                    index=0,
+                    options=dubbing_lib.LANGUAGES,
+                    index=4, # Default to English
                     key="input_language",
                     help="The language spoken in the original video."
                 )
             with col2:
                 output_language = st.selectbox(
                     "Target Language",
-                    options=languages,
-                    index=1,
+                    options=dubbing_lib.LANGUAGES,
+                    index=7, # Default to Hindi
                     key="output_language",
                     help="The language to dub the video into."
                 )
@@ -2247,78 +2168,43 @@ def video_editing_tab():
                     return
                 dub_video(uploaded_video, input_language, output_language, BUCKET_NAME)
 
+
 def image_to_video_tab():
     """Image-to-Video generation tab."""
     logger.start_section("Image-to-Video Tab")
     logger.info("Rendering Image-to-Video tab")
     st.header("Image-to-Video Generation")
-    
-    # Function to clear current image data
-    def clear_current_image_data():
-        if 'current_image' in st.session_state:
-            del st.session_state.current_image
-        if 'current_uploaded_file' in st.session_state:
-            del st.session_state.current_uploaded_file
-        logger.info("Cleared current image data from session state")
-    
+
     # Create tabs for different input methods
     upload_tabs = st.tabs(["Upload Image", "Enter Image URL"])
     
-    # Track which tab is active
-    if "active_upload_tab" not in st.session_state:
-        st.session_state.active_upload_tab = 0  # Default to first tab
-    
-    # Check if we have image data in session state from previous interactions
-    if 'current_image' in st.session_state:
-        image = st.session_state.current_image
-        logger.info("Retrieved image from session state")
-    else:
-        image = None
-    
-    if 'current_uploaded_file' in st.session_state:
-        uploaded_file = st.session_state.current_uploaded_file
-        logger.info("Retrieved uploaded file from session state")
-    else:
-        uploaded_file = None
-    
     # Upload Image Tab
-    with upload_tabs[0]:
-        # Check if we switched tabs
-        if st.session_state.active_upload_tab != 0:
-            # We switched to the file upload tab, clear URL-based image
-            if 'current_image_url' in st.session_state:
-                # Only clear if we previously had a URL
-                if st.session_state.current_image_url:
-                    clear_current_image_data()
-                st.session_state.current_image_url = ""
-            st.session_state.active_upload_tab = 0
-            
-        new_upload = st.file_uploader(
+    with upload_tabs[0]:        
+        def _on_image_upload_change():
+            """Callback to update the canonical active_image_data state."""
+            uploaded_file = st.session_state.get("image_upload")
+            if uploaded_file:
+                st.session_state.active_image_data = uploaded_file
+                st.session_state.current_image_url = "" # Clear URL if a file is uploaded
+
+        st.file_uploader(
             "Upload an image to transform into a video (JPG, JPEG, PNG, WEBP)",
             type=["jpg", "jpeg", "png", "webp"],
             key="image_upload",
-            help="Upload an image to transform into a video. Maximum size: 20MB."
+            help="Upload an image to transform into a video. Maximum size: 20MB.",
+            on_change=_on_image_upload_change,
         )
-        
-        # If a new file was uploaded, update our variable and session state
-        if new_upload is not None:
-            if uploaded_file is None or new_upload.name != uploaded_file.name:
-                logger.info(f"New file uploaded: {new_upload.name}")
-                # We have a new upload, clear previous data
-                clear_current_image_data()
-                
-            uploaded_file = new_upload
-            st.session_state.current_uploaded_file = uploaded_file
+
+    # --- SIMPLIFIED STATE LOGIC ---
+    # Use the file uploader's state directly.
+    active_image_file = st.session_state.get("active_image_data")
+    image = None
+    if active_image_file:
+            image = Image.open(active_image_file)
+            st.session_state.current_image = image
     
     # URL Input Tab
     with upload_tabs[1]:
-        # Check if we switched tabs
-        if st.session_state.active_upload_tab != 1:
-            # We switched to the URL tab from file upload, clear file-based image
-            if uploaded_file is not None and uploaded_file.name != "image_from_url.jpg":
-                clear_current_image_data()
-            st.session_state.active_upload_tab = 1
-            
         st.markdown("### Enter Image URL")
         
         # Check if we have a URL in session state
@@ -2335,9 +2221,6 @@ def image_to_video_tab():
         
         # Update URL in session state if changed
         if image_url != st.session_state.current_image_url:
-            # URL changed, clear any previous image data
-            if st.session_state.current_image_url:
-                clear_current_image_data()
             st.session_state.current_image_url = image_url
         
         # Create containers for the preview and message
@@ -2384,18 +2267,12 @@ def image_to_video_tab():
                         # Store image in session state
                         st.session_state.current_image = image
                         
-                        # Create a simulated upload file
-                        with open(tmp_file.name, "rb") as f:
-                            image_data = f.read()
-                        
-                        filename = image_url.split("/")[-1]
-                        uploaded_file = SimulatedUploadFile(
-                            name=filename,
-                            content=image_data
+                        # Create a simulated upload file and set it as the uploader's value
+                        # This ensures consistency with the file upload tab.
+                        st.session_state.image_upload = SimulatedUploadFile(
+                            name=image_url.split("/")[-1],
+                            content=response.content
                         )
-                        
-                        # Store uploaded file in session state
-                        st.session_state.current_uploaded_file = uploaded_file
                         
                         # Display a success message - don't display image here
                         url_message_container.success(f"Successfully loaded image: {filename}")
@@ -2409,53 +2286,46 @@ def image_to_video_tab():
                     if "Access Denied" in str(e):
                         url_message_container.info("If using a GCS URI, make sure the bucket is publicly accessible or you have proper permissions.")
     
-    # If an image is uploaded through the file uploader or already in session state, process and display it
-    if uploaded_file is not None:
+    # If an image is loaded (either from uploader or URL), process and display it
+    if active_image_file is not None:
         try:
-            # If we don't already have the image loaded, read it from the uploaded file
-            if image is None:
-                # Read the image
-                image = Image.open(uploaded_file)
-                # Store in session state
-                st.session_state.current_image = image
-                
-            logger.info(f"Image available: {uploaded_file.name}, size: {uploaded_file.size} bytes")
+            logger.info(f"Image available: {active_image_file.name}, size: {active_image_file.size} bytes")
             logger.info(f"Image properties: format={image.format}, size={image.size}, mode={image.mode}")
-            
-            # Convert WebP to PNG if needed
-            convert_needed = uploaded_file.name.lower().endswith('.webp')
-            if convert_needed:
-                logger.info("WebP image detected, will convert to PNG")
-                st.info("WebP image detected. It will be automatically converted to PNG for compatibility.")
             
             # Display the image preview and details in a cleaner layout
             st.subheader("Image Preview")
             
             # Create two columns for the image and details
-            preview_col, details_col = st.columns([3, 2])
+            preview_col, details_col = st.columns(2)
             
             with preview_col:
                 # Display the image in the left column
                 st.image(
                     image, 
-                    caption=f"{uploaded_file.name}",
+                    caption=f"{active_image_file.name}",
                     use_container_width=True
                 )
             
             with details_col:
                 # Show image details in the right column
-                st.markdown(f"**Filename:** {uploaded_file.name}")
+                st.markdown(f"**Filename:** {active_image_file.name}")
                 st.markdown(f"**Size:** {image.size[0]} × {image.size[1]} pixels")
                 st.markdown(f"**Format:** {image.format}")
                 st.markdown(f"**Mode:** {image.mode}")
                 
                 # Add file size
-                file_size_kb = uploaded_file.size / 1024
+                file_size_kb = active_image_file.size / 1024
                 if file_size_kb > 1024:
                     file_size_display = f"{file_size_kb/1024:.2f} MB"
                 else:
                     file_size_display = f"{file_size_kb:.2f} KB"
                 st.markdown(f"**File Size:** {file_size_display}")
+
+                # Add a button to clear the current image
+                def _clear_i2v_image_callback():
+                    st.session_state.active_image_data = None
+                    st.session_state.current_image_url = ""
+                st.button("🗑️ Clear Image", key="clear_i2v_image", on_click=_clear_i2v_image_callback)
         
         except Exception as e:
             st.error(f"Error loading image: {str(e)}")
@@ -2464,35 +2334,13 @@ def image_to_video_tab():
             if 'current_image' in st.session_state:
                 del st.session_state.current_image
     
-    # If no image is loaded, show a helpful message
-    if uploaded_file is None and image is None:
-        # Only show this if neither upload method provided an image
+    # If no image is loaded, show a helpful message.
+    if not active_image_file:
         st.info("👆 Please upload an image or provide an image URL to get started.")
         logger.end_section()
         return
     
-    # Rest of the tab content only if we have an image
-    if image or uploaded_file:
-        # Store image in session state to persist across interactions
-        if 'current_image' not in st.session_state and image is not None:
-            st.session_state.current_image = image
-        elif image is not None:
-            st.session_state.current_image = image
-        
-        # Use image from session state if available
-        if 'current_image' in st.session_state and image is None:
-            image = st.session_state.current_image
-        
-        # Ensure the file handle is also persisted
-        if 'current_uploaded_file' not in st.session_state and uploaded_file is not None:
-            st.session_state.current_uploaded_file = uploaded_file
-        elif uploaded_file is not None:
-            st.session_state.current_uploaded_file = uploaded_file
-        
-        # Use file from session state if available
-        if 'current_uploaded_file' in st.session_state and uploaded_file is None:
-            uploaded_file = st.session_state.current_uploaded_file
-        
+    if active_image_file:
         # Prompt section
         st.markdown("### Video Prompt")
         
@@ -2689,7 +2537,7 @@ def image_to_video_tab():
         # Generate button - more prominent with better placement
         st.markdown("<div style='margin-top: 20px; margin-bottom: 20px;'></div>", unsafe_allow_html=True)
         if st.button("🚀 Generate Video", key="image_generate", type="primary", use_container_width=True):
-            if uploaded_file is None and image is None:
+            if active_image_file is None and image is None:
                 st.error("No image is available. Please upload an image or provide a URL first.")
                 return
                 
@@ -2701,7 +2549,7 @@ def image_to_video_tab():
                 # Create a temporary file for the image
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp_file:
                     # If we're working with a PIL image object directly (from URL)
-                    if uploaded_file is None and image is not None:
+                    if active_image_file is None and image is not None:
                         # Save the PIL image to the temporary file
                         if image.mode == 'RGBA':
                             # Convert RGBA to RGB for JPEG compatibility
@@ -2712,7 +2560,7 @@ def image_to_video_tab():
                             image.save(tmp_file.name, format='JPEG')
                         
                         # Create a simulated upload file if needed
-                        if uploaded_file is None:
+                        if active_image_file is None:
                             with open(tmp_file.name, "rb") as f:
                                 image_data = f.read()
                             
@@ -2723,16 +2571,16 @@ def image_to_video_tab():
                                 if url_filename and '.' in url_filename:
                                     filename = url_filename
                             
-                            uploaded_file = SimulatedUploadFile(
+                            active_image_file = SimulatedUploadFile(
                                 name=filename,
                                 content=image_data
                             )
                             
                             # Save to session state
-                            st.session_state.current_uploaded_file = uploaded_file
+                            st.session_state.active_image_data = active_image_file
                     else:
                         # We have a regular uploaded_file
-                        tmp_file.write(uploaded_file.getvalue())
+                        tmp_file.write(active_image_file.getvalue())
                 
                 tmp_image_path = tmp_file.name
                 image_path = tmp_image_path
@@ -2751,13 +2599,13 @@ def image_to_video_tab():
                     # Make sure image is in session state
                     if image is None and 'current_image' in st.session_state:
                         image = st.session_state.current_image
-                    
+
                     if image is not None:
                         uploaded_image_uri = history_manager.upload_image_to_history(image)
                         if uploaded_image_uri:
                             # Add to history - store proper JSON for parameters
                             image_params = {
-                                "filename": uploaded_file.name,
+                                "filename": active_image_file.name,
                                 "size": f"{image.size[0]}x{image.size[1]}",
                                 "format": image.format if hasattr(image, 'format') else "Unknown",
                                 "mode": image.mode if hasattr(image, 'mode') else "Unknown"
@@ -2901,9 +2749,9 @@ def display_recent_videos(history_data):
                             st.session_state.confirm_clear_history = False
                             st.rerun()
     
-        video_history = video_history.sort_values('timestamp', ascending=False)
+        video_history = video_history.sort_values('timestamp', ascending=False).reset_index(drop=True)
         total_videos = len(video_history)
-        items_per_page = 10
+        items_per_page = 9 # Adjusted for 3 columns
         max_pages = (total_videos + items_per_page - 1) // items_per_page
         if "video_page" not in st.session_state:
             st.session_state.video_page = 0
@@ -2925,9 +2773,9 @@ def display_recent_videos(history_data):
         page_videos = video_history.iloc[start_idx:end_idx]
         
         st.markdown('<div class="history-grid">', unsafe_allow_html=True)
-        rows = [page_videos.iloc[i:i+2] for i in range(0, len(page_videos), 2)]
+        rows = [page_videos.iloc[i:i+3] for i in range(0, len(page_videos), 3)]
         for row_items in rows:
-            cols = st.columns(2)
+            cols = st.columns(3)
             for i, (_, row) in enumerate(row_items.iterrows()):
                 if i < len(cols):
                     with cols[i]:
@@ -2957,9 +2805,9 @@ def display_recent_audios(history_data):
         st.markdown(f"Found {len(audio_history)} audio generations.")
         audio_history = audio_history.sort_values('timestamp', ascending=False)
         st.markdown('<div class="history-grid">', unsafe_allow_html=True)
-        rows = [audio_history.iloc[i:i+2] for i in range(0, len(audio_history), 2)]
+        rows = [audio_history.iloc[i:i+3] for i in range(0, len(audio_history), 3)]
         for row_items in rows:
-            cols = st.columns(2)
+            cols = st.columns(3)
             for i, (_, row) in enumerate(row_items.iterrows()):
                 if i < len(cols):
                     with cols[i]:
@@ -2978,9 +2826,9 @@ def display_recent_voices(history_data):
         st.markdown(f"Found {len(voice_history)} voiceover generations.")
         voice_history = voice_history.sort_values('timestamp', ascending=False)
         st.markdown('<div class="history-grid">', unsafe_allow_html=True)
-        rows = [voice_history.iloc[i:i+2] for i in range(0, len(voice_history), 2)]
+        rows = [voice_history.iloc[i:i+3] for i in range(0, len(voice_history), 3)]
         for row_items in rows:
-            cols = st.columns(2)
+            cols = st.columns(3)
             for i, (_, row) in enumerate(row_items.iterrows()):
                 if i < len(cols):
                     with cols[i]:
@@ -2990,7 +2838,11 @@ def display_recent_voices(history_data):
 
 def display_all_images(history_data):
     """Displays the 'All Images' sub-tab content."""
+    # Filter for images and remove any duplicates based on the URI.
+    # This prevents the StreamlitDuplicateElementKey error if the same image
+    # appears multiple times in the history. We keep the most recent entry.
     image_history = history_data[history_data['type'] == 'image'].copy()
+    image_history = image_history.drop_duplicates(subset=['uri'], keep='first')
     
     if image_history.empty:
         st.info("No source images in history yet.")
@@ -3013,8 +2865,8 @@ def display_all_images(history_data):
             image_history = image_history.sort_values('timestamp', ascending=True)
         
         total_images = len(image_history)
-        items_per_page = 10
-        max_pages = (total_images + items_per_page - 1) // items_per_page
+        items_per_page = 9 # Adjusted for 3 columns
+        max_pages = max(1, (total_images + items_per_page - 1) // items_per_page)
         if "image_page" not in st.session_state:
             st.session_state.image_page = 0
             
@@ -3036,9 +2888,9 @@ def display_all_images(history_data):
         page_images = image_history.iloc[start_idx:end_idx]
         
         st.markdown('<div class="history-grid">', unsafe_allow_html=True)
-        rows = [page_images.iloc[i:i+2] for i in range(0, len(page_images), 2)]
+        rows = [page_images.iloc[i:i+3] for i in range(0, len(page_images), 3)]
         for row_items in rows:
-            cols = st.columns(2)
+            cols = st.columns(3)
             for i, (_, row) in enumerate(row_items.iterrows()):
                 if i < len(cols):
                     with cols[i]:
@@ -3106,9 +2958,9 @@ def display_all_history(history_data):
             })
         else:
             st.markdown('<div class="history-grid">', unsafe_allow_html=True)
-            rows = [filtered_history.iloc[i:i+2] for i in range(0, len(filtered_history), 2)]
+            rows = [filtered_history.iloc[i:i+3] for i in range(0, len(filtered_history), 3)]
             for row_items in rows:
-                cols = st.columns(2)
+                cols = st.columns(3)
                 for i, (_, row) in enumerate(row_items.iterrows()):
                     if i < len(cols):
                         with cols[i]:
@@ -3166,29 +3018,26 @@ def history_tab():
             ("📋 All History", display_all_history)
         ])
 
-        # Get the previously active tab to detect changes
-        previous_sub_tab = st.session_state.get('active_history_sub_tab', '🎬 Recent Videos')
-        default_index = list(HISTORY_SUB_TABS.keys()).index(previous_sub_tab)
-
-        active_sub_tab = st.radio(
+        # Use a key to make this a "controlled" widget. Its state is now directly
+        # read from and written to st.session_state.active_history_sub_tab.
+        # This resolves the "double-click" issue.
+        st.radio(
             "History Sub-Navigation",
             options=list(HISTORY_SUB_TABS.keys()),
-            index=default_index,
+            key="active_history_sub_tab", # This is the fix
             horizontal=True,
             label_visibility="collapsed",
-            key="history_sub_nav_radio"
         )
 
         # If the user clicks a new tab, clear selections to prevent errors
-        if active_sub_tab != previous_sub_tab:
+        if 'previous_history_sub_tab' not in st.session_state:
+            st.session_state.previous_history_sub_tab = st.session_state.active_history_sub_tab
+        if st.session_state.active_history_sub_tab != st.session_state.previous_history_sub_tab:
             st.session_state.selected_history_items.clear()
-            logger.info(f"History sub-tab changed to '{active_sub_tab}'. Clearing selection.")
-        
-        # Always update the session state with the current tab
-        st.session_state.active_history_sub_tab = active_sub_tab
-
+            logger.info(f"History sub-tab changed to '{st.session_state.active_history_sub_tab}'. Clearing selection.")
+            st.session_state.previous_history_sub_tab = st.session_state.active_history_sub_tab
         # Call the appropriate function to display the content of the active tab
-        HISTORY_SUB_TABS[active_sub_tab](history_data)
+        HISTORY_SUB_TABS[st.session_state.active_history_sub_tab](history_data)
     else:
         st.info("No generation history found. Generate some videos or images to see them here!")
     
@@ -4037,93 +3886,74 @@ def display_history_voice_card(row):
 
 def dub_video(uploaded_video, input_language, output_language, bucket_name):
     """
-    Dubs a video using the command-line interface.
+    Dubs a video using the app.py library functions.
     """
-    # Dependency check for pydub and Python 3.13+
-    try:
-        import pydub
-        try:
-            import audioop
-        except ImportError:
-            # audioop is removed in Python 3.13, check for pyaudioop
-            import pyaudioop
-    except ImportError:
-        st.error("The 'pydub' and/or 'pyaudioop' packages are not installed. Please run 'pip install pydub pyaudioop' to use the dubbing feature, especially on Python 3.13+.")
-        return
-
     # 1. Save uploaded video to a temporary file
     with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(uploaded_video.name)[1]) as tmp_in:
         tmp_in.write(uploaded_video.getvalue())
         input_video_path = tmp_in.name
 
     try:
-        # 2. Define output path and filename
-        output_dir = os.path.join(os.getcwd(), "output", "dubbed_videos")
-        os.makedirs(output_dir, exist_ok=True)
+        # Create UI elements for logging
+        st.subheader("⚙️ Processing Status")
+        log_container = st.empty()
+        synthesis_log_area = st.container()
         
-        base_name = os.path.splitext(os.path.basename(uploaded_video.name))[0]
-        
-        # Parse language and sanitize for filename, matching CLI logic
-        output_lang_parsed = output_language.split(' (')[0]
-        safe_output_language = ''.join(c for c in output_lang_parsed if c.isalnum() or c in '-_').lower()
-        output_filename = f"{base_name}_dubbed_{safe_output_language}.mp4"
-        output_video_path = os.path.join(output_dir, output_filename)
+        # Set up logger and session state for live logging
+        log_queue = queue.Queue()
+        st.session_state.log_messages = []
+        logger = dubbing_lib.StatusLogger(log_queue)
 
-        # 3. Construct the command
-        cli_path = os.path.join(os.getcwd(), "apis", "cli", "cli.py")
-        
-        input_lang_parsed = input_language.split(' (')[0]
+        # Prepare config dictionary
+        # These models can be exposed in the UI later if needed
+        config_dict = {
+            "USE_VERTEX_AI": False,
+            "PROJECT_ID": st.session_state.get("project_id", config.PROJECT_ID),
+            "LOCATION": "us-central1",
+            "GOOGLE_API_KEY": config.GEMINI_API_KEY,
+            "VIDEO_ANALYSIS_PROMPT": dubbing_lib.DEFAULT_VIDEO_ANALYSIS_PROMPT,
+            "INPUT_LANGUAGE": input_language.split(' (')[0],
+            "OUTPUT_LANGUAGE": output_language.split(' (')[0],
+            "MODEL_NAME": "gemini-2.5-pro",
+            "TTS_MODEL": "gemini-2.5-pro-preview-tts",
+            "BUCKET_NAME": bucket_name
+        }
 
-        command = [
-            sys.executable,
-            cli_path,
-            "--input-video", input_video_path,
-            "--output-path", output_dir,
-            "--input-language", input_lang_parsed,
-            "--output-language", output_lang_parsed,
-            "--gemini-api-key", config.GEMINI_API_KEY
-        ]
+        # Call the main dubbing function from app.py
+        final_video_gcs_path = dubbing_lib.process_video_dubbing(
+            video_path=input_video_path,
+            config=config_dict,
+            logger=logger,
+            log_container=log_container,
+            synthesis_log_area=synthesis_log_area
+        )
 
-        st.info("Running dubbing command...")
-        st.code(f"python {' '.join(command[1:])}")
-
-        # 4. Execute the command and stream output
-        with st.spinner(f"Dubbing video from {input_language} to {output_language}... This may take a while."):
-            log_placeholder = st.empty()
-            log_output = ""
+        if final_video_gcs_path:
+            full_gcs_uri = f"gs://{bucket_name}/{final_video_gcs_path}"
+            st.success("✅ Dubbing process completed successfully!")
+            signed_url = client.generate_signed_url(full_gcs_uri)
+            st.subheader("Dubbed Video Preview")
+            st.video(signed_url)
             
-            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', bufsize=1)
+            if FIRESTORE_AVAILABLE:
+                db.collection('history').add({
+                    'timestamp': firestore.SERVER_TIMESTAMP,
+                    'type': 'video',
+                    'uri': full_gcs_uri,
+                    'prompt': f'Video dubbed from {input_language} to {output_language}.',
+                    'params': {'operation': 'dub_video', 'input_language': input_language, 'output_language': output_language}
+                })
+                st.success(f"✅ Dubbed video saved to history: {full_gcs_uri}")
+        else:
+            st.error("⚠️ Dubbing process failed. Check the logs above for details.")
 
-            for line in iter(process.stdout.readline, ''):
-                log_output += line
-                log_placeholder.code(log_output)
-            
-            process.stdout.close()
-            return_code = process.wait()
-
-            if return_code == 0:
-                st.success("✅ Dubbing process completed successfully!")
-                if os.path.exists(output_video_path):
-                    st.subheader("Dubbed Video Preview")
-                    st.video(output_video_path)
-                    
-                    if FIRESTORE_AVAILABLE:
-                        with st.spinner("Uploading to history..."):
-                            final_video_uri = video_upload_to_gcs(output_video_path, bucket_name, output_filename)
-                            if final_video_uri:
-                                db.collection('history').add({
-                                    'timestamp': firestore.SERVER_TIMESTAMP, 'type': 'video', 'uri': final_video_uri,
-                                    'prompt': f'Video dubbed from {input_language} to {output_language}.',
-                                    'params': {'operation': 'dub_video', 'input_language': input_language, 'output_language': output_language}
-                                })
-                                st.success(f"✅ Dubbed video saved to history: {final_video_uri}")
-            else:
-                st.error(f"⚠️ Dubbing process failed with return code {return_code}.")
-                st.subheader("Dubbing Logs:")
-                st.code(log_output)
+    except Exception as e:
+        st.error(f"An unexpected error occurred during the dubbing process: {e}")
+        import traceback
+        st.code(traceback.format_exc())
     finally:
-        # 5. Clean up the temporary file
-        if 'input_video_path' in locals() and os.path.exists(input_video_path):
+        # Clean up the temporary file
+        if os.path.exists(input_video_path):
             os.unlink(input_video_path)
 
 def generate_audio(
@@ -4434,19 +4264,26 @@ def handle_history_action(operation: str, uris: List[str]):
 
         if operation == "Edit Image(s)":
             st.session_state.edit_image_files = simulated_files
-            st.session_state.active_main_tab = "✨ Image Editing"
+            st.session_state.next_active_main_tab = "✨ Nano Banana"
         elif operation == "Use for Image-to-Video":
-            st.session_state.current_uploaded_file = simulated_files[0]
-            st.session_state.current_image = Image.open(simulated_files[0])
-            st.session_state.active_main_tab = "🖼️ Image-to-Video"
+            # Set the canonical active image data. The Image-to-Video tab will
+            # pick this up on the next run. This is the safe way.
+            st.session_state.active_image_data = simulated_files[0]
+            # Clear any URL that might have been there to avoid conflicts
+            st.session_state.current_image_url = ""
+            st.session_state.next_active_main_tab = "🖼️ Image-to-Video"
         elif operation == "Concatenate Videos":
             st.session_state.concat_video_files = simulated_files
             st.session_state.video_edit_option = "Concatenate Videos"
-            st.session_state.active_main_tab = "✂️ Video Editing"
+            st.session_state.next_active_main_tab = "✂️ Video Editing"
         elif operation == "Change Video Speed":
             st.session_state.speed_change_video_file = simulated_files[0]
             st.session_state.video_edit_option = "Change Playback Speed"
-            st.session_state.active_main_tab = "✂️ Video Editing"
+            st.session_state.next_active_main_tab = "✂️ Video Editing"
+        elif operation == "Dubbing":
+            st.session_state.dub_video_file = simulated_files[0]
+            st.session_state.video_edit_option = "Dubbing"
+            st.session_state.next_active_main_tab = "✂️ Video Editing"
 
         # Clear selection and rerun to switch tab and apply state changes
         st.session_state.selected_history_items.clear()
@@ -4470,6 +4307,8 @@ def display_history_actions():
                 operations.append("Concatenate Videos")
             if len(items) == 1:
                 operations.append("Change Video Speed")
+                operations.append("Dubbing") # Add Dubbing option for single video
+
 
         if len(operations) > 1:
             selected_op = st.selectbox("Perform an action:", options=operations, key="history_action_selector", index=0)
