@@ -89,68 +89,25 @@ def generate_prompt_from_image(image, custom_instructions=None):
         # Initialize Gemini client
         client = init_gemini_client()
         
-        # Encode the image
-        encoded_image = encode_image_as_base64(image)
-        
-        # Create image part from encoded image
-        print("Creating image part for Gemini request...")
-        image_part = types.Part.from_bytes(
-            data=base64.b64decode(encoded_image),
-            mime_type="image/jpeg",
-        )
-        
         # Get the instructions text
         instructions_text = custom_instructions or config.DEFAULT_GEMINI_INSTRUCTIONS
         print(f"Using instructions: {instructions_text[:50]}...")
         
-        # Create content for the model
+        # The google-generativeai library can handle PIL Images directly.
+        # We pass the instructions and the image as a simple list.
         contents = [
-            types.Content(
-                role="user",
-                parts=[
-                    image_part,
-                    types.Part.from_text(text=instructions_text)
-                ]
-            )
+            instructions_text,
+            image,
         ]
-        
-        # Set generation configuration
-        print(f"Configuring Gemini with model: {config.GEMINI_MODEL_NAME}")
-        generate_content_config = types.GenerateContentConfig(
-            temperature=0.2,
-            top_p=0.8,
-            seed=0,
-            max_output_tokens=2048,
-            response_modalities=["TEXT"],
-            safety_settings=[
-                types.SafetySetting(
-                    category="HARM_CATEGORY_HATE_SPEECH",
-                    threshold="OFF"
-                ),
-                types.SafetySetting(
-                    category="HARM_CATEGORY_DANGEROUS_CONTENT",
-                    threshold="OFF"
-                ),
-                types.SafetySetting(
-                    category="HARM_CATEGORY_SEXUALLY_EXPLICIT",
-                    threshold="OFF"
-                ),
-                types.SafetySetting(
-                    category="HARM_CATEGORY_HARASSMENT",
-                    threshold="OFF"
-                )
-            ],
-        )
-        
+
         # Generate content
         print("Sending request to Gemini API...")
         response = client.models.generate_content(
             model=config.GEMINI_MODEL_NAME,
             contents=contents,
-            config=generate_content_config,
         )
         print(response)
-        
+
         # Extract and return the generated prompt
         if response.text:
             prompt = response.text.strip()
@@ -174,3 +131,86 @@ def generate_prompt_from_image(image, custom_instructions=None):
         error_msg = f"Failed to generate prompt from image: {str(e)}"
         print(f"❌ {error_msg}", file=sys.stderr)
         raise Exception(error_msg) 
+
+def generate_gemini_chat_response(model_name, prompt, uploaded_file=None, system_instructions=None, temperature=1.0, enable_grounding=False):
+    """
+    Generates a chat response from Gemini, handling multimodal inputs.
+
+    Args:
+        model_name (str): The name of the Gemini model to use.
+        prompt (str): The user's text prompt.
+        uploaded_file (UploadedFile, optional): A file uploaded by the user.
+        system_instructions (str, optional): System-level instructions for the model.
+        temperature (float): The temperature for the generation.
+        enable_grounding (bool): Whether to enable Google Search grounding.
+
+    Returns:
+        str: The generated text response from the model.
+    """
+    try:
+        print(f"Starting chat generation with model: {model_name}")
+        # Initialize Gemini client using the older method for compatibility
+        client = init_gemini_client()
+
+        # The modern library usage prefers a simple list of content parts.
+        # The client library handles the conversion to the correct Part types.
+        contents = []
+        if system_instructions:
+            contents.append(system_instructions)
+        contents.append(prompt)
+
+        if uploaded_file:
+            print(f"Processing uploaded file: {uploaded_file.name}")
+            # The library expects a Part object for files. We create one from the
+            # uploaded file's bytes and its MIME type.
+            contents.append(
+                types.Part.from_bytes(data=uploaded_file.getvalue(), mime_type=uploaded_file.type)
+            )
+
+        # Configure tools for grounding if enabled
+        
+        if enable_grounding: 
+            tools = [
+                types.Tool(google_search=types.GoogleSearch())
+            ]
+        else: 
+            tools =  []
+        
+
+
+        # Configure safety settings
+        safety_settings = [
+            types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="OFF"),
+            types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="OFF"),
+            types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="OFF"),
+            types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="OFF"),
+        ]
+
+        # For this client, generation_config, tools, and safety_settings are passed
+        # within a single generation_config dictionary.
+        generation_config = {
+            "temperature": temperature,
+            "top_p": 1,
+            "max_output_tokens": 8192, # Using a more reasonable max for chat
+            "safety_settings": safety_settings,
+            "tools": tools,
+        }
+
+        # Generate content
+        print("Sending request to Gemini API...")
+        # Use the streaming version to get results incrementally
+        response_stream = client.models.generate_content_stream(
+            model=model_name,
+            contents=contents,
+            config=generation_config,
+        )
+
+        # Combine the chunks from the stream into a single response
+        full_response = "".join(chunk.text for chunk in response_stream)
+        print(f"✅ Received full response from Gemini: \"{full_response[:100]}...\"")
+        return full_response.strip()
+
+    except Exception as e:
+        error_msg = f"Failed to generate chat response: {str(e)}"
+        print(f"❌ {error_msg}", file=sys.stderr)
+        raise Exception(error_msg)

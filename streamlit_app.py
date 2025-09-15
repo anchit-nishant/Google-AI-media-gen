@@ -180,19 +180,6 @@ logger.info(f"Python version: {sys.version}")
 logger.info(f"Working directory: {os.getcwd()}")
 logger.end_section()
 
-# Initialize dark_mode state at the top level of the script.
-# This ensures it's set only once per session and persists across all reruns.
-if "dark_mode" not in st.session_state:
-    st.session_state.dark_mode = False
-
-# Configure the Streamlit page
-st.set_page_config(
-    page_title="Google Media Gen Tool",
-    page_icon="🎬",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
-
 # Custom CSS to improve app appearance
 st.markdown("""
 <style>
@@ -248,6 +235,11 @@ st.markdown("""
         padding-top: 0 !important;
     }
     
+    /* Target the main app container to remove top padding */
+    .appview-container .main .block-container {
+        padding-top: 0rem !important;
+    }
+
     /* Remove empty input bars */
     .stTextInput, .stNumberInput {
         margin-bottom: 0 !important;
@@ -836,11 +828,17 @@ def init_state():
     # Initialize state for the main navigation tabs
     if "active_main_tab" not in st.session_state:
         logger.debug("Initializing 'active_main_tab' in session state")
-        st.session_state.active_main_tab = "🎬 Text-to-Video"
+        st.session_state.active_main_tab = "🎬 Video"
 
     # State for files passed from history to editing tabs
     if 'edit_image_files' not in st.session_state:
         st.session_state.edit_image_files = []
+    if 'active_video_sub_tab' not in st.session_state:
+        st.session_state.active_video_sub_tab = "Text-to-Video"
+    if 'active_image_sub_tab' not in st.session_state:
+        st.session_state.active_image_sub_tab = "Text-to-Image"
+    if 'active_audio_sub_tab' not in st.session_state:
+        st.session_state.active_audio_sub_tab = "Text-to-Audio"
     if 'speed_change_video_file' not in st.session_state:
         st.session_state.speed_change_video_file = None
     if 'concat_video_files' not in st.session_state:
@@ -853,22 +851,33 @@ def init_state():
     if 'next_active_main_tab' not in st.session_state:
         st.session_state.next_active_main_tab = None
 
+    # State for the new Gemini Chat tab
+    if "gemini_messages" not in st.session_state:
+        logger.debug("Initializing 'gemini_messages' for chat history")
+        st.session_state.gemini_messages = []
+
     logger.end_section()
 
-def main():
-    """Main function to run the Streamlit app."""
-    logger.start_section("App Initialization")
-    
-    # Initialize session state
-    init_state()
-    
-    # Handle programmatic tab switching. This must be at the top.
-    if st.session_state.get("next_active_main_tab"):
-        st.session_state.active_main_tab = st.session_state.next_active_main_tab
-        st.session_state.next_active_main_tab = None
-        st.rerun()
+def _setup_page():
+    """
+    Configures the Streamlit page, applies the theme, and handles programmatic tab switching.
+    This function should be called at the very beginning of the main app script execution.
+    """
+    # Initialize dark_mode state if it doesn't exist. This ensures it's set only
+    # once per session and persists across all reruns.
+    if "dark_mode" not in st.session_state:
+        st.session_state.dark_mode = False
 
-    # --- Dark Mode CSS ---
+    # Configure the Streamlit page. This must be the first Streamlit command.
+    # The 'theme' argument is removed for compatibility with older Streamlit versions.
+    st.set_page_config(
+        page_title="Google Media Gen Tool",
+        page_icon="🎬",
+        layout="wide",
+        initial_sidebar_state="expanded"
+    )
+
+    # --- Dark Mode CSS Injection ---
     # This CSS is conditionally applied to style components that Streamlit's
     # native dark mode doesn't cover fully, like expanders.
     DARK_MODE_CSS = """
@@ -905,10 +914,27 @@ def main():
     </style>
     """
 
-    # Apply dark mode if toggled
+    # Apply dark mode CSS if the toggle is active.
     if st.session_state.get("dark_mode", False):
         st.markdown(DARK_MODE_CSS, unsafe_allow_html=True)
-        
+
+    # Handle programmatic tab switching. This must be done after applying CSS.
+    # By updating the state and allowing the script to continue without a second
+    # rerun, we prevent the "flicker" of the light theme.
+    if st.session_state.get("next_active_main_tab"):
+        st.session_state.active_main_tab = st.session_state.next_active_main_tab
+        st.session_state.next_active_main_tab = None
+
+def main():
+    """Main function to run the Streamlit app."""
+    logger.start_section("App Initialization")
+    
+    # Initialize session state
+    init_state()
+    
+    # Run the setup function to configure the page, theme, and handle tab switches.
+    _setup_page()
+
     # Sidebar for configuration
     with st.sidebar:
         # App title
@@ -1056,26 +1082,15 @@ def main():
     with title_col:
         st.title("AI Media Generator")
     with toggle_col:
-        # Add some padding to vertically align the toggle with the title
-        st.markdown('<div style="padding-top: 1.5rem;"></div>', unsafe_allow_html=True)
-        # Initialize dark_mode state right before the widget is created
-        # This is the most robust way to prevent it from being reset on reruns.
-        # if "dark_mode" not in st.session_state:
-        #     st.session_state.dark_mode = False
         st.toggle("🌙 Dark Mode", key="dark_mode", help="Toggle between light and dark themes.")
-    
     # Define the main tabs and their corresponding functions
     TABS = OrderedDict([
-        ("🎬 Text-to-Video", text_to_video_tab),
-        ("🖼️ Image-to-Video", image_to_video_tab),
-        ("🎨 Text-to-Image", text_to_image_tab),
-        ("✨ Nano Banana", image_editing_tab),
-        ("🎵 Text-to-Audio", text_to_audio_tab),
-        ("🎤 Text-to-Voiceover", text_to_voiceover_tab),
-        ("✂️ Video Editing", video_editing_tab),
+        ("🎬 Video", video_tab),
+        ("🎨 Image", image_tab),
+        ("🎵 Audio", audio_tab),
+        ("♊ Gemini", gemini_chat_tab),
         ("📋 History", history_tab),
     ])
-
     # Use a radio button for main navigation that is directly tied to the session state.
     # This is the standard way to create a "controlled" widget in Streamlit.
     st.radio(
@@ -1095,6 +1110,173 @@ def main():
     # st.markdown('</div>', unsafe_allow_html=True)
     
     logger.end_section()
+
+def video_tab():
+    """Main tab for all video-related operations."""
+    # Define the video sub-tabs and their corresponding functions
+    sub_tabs = OrderedDict([
+        ("Text-to-Video", text_to_video_tab),
+        ("Image-to-Video", image_to_video_tab),
+        ("Video Editing", video_editing_tab),
+    ])
+
+    # Use a radio button styled as tabs for sub-navigation.
+    # This is a "controlled" component, allowing programmatic switching.
+    st.radio(
+        "Video Sub-Navigation",
+        options=list(sub_tabs.keys()),
+        horizontal=True,
+        label_visibility="collapsed",
+        key="active_video_sub_tab"  # Directly link to session state
+    )
+
+    # Call the function for the currently active sub-tab
+    active_sub_tab_func = sub_tabs.get(st.session_state.active_video_sub_tab)
+    if active_sub_tab_func:
+        active_sub_tab_func()
+    else:
+        # Fallback to the first tab if the state is somehow invalid
+        text_to_video_tab()
+
+def image_tab():
+    """Main tab for all image-related operations."""
+    # Define the image sub-tabs and their corresponding functions
+    sub_tabs = OrderedDict([
+        ("Text-to-Image", text_to_image_tab),
+        ("Image Editing (Nano Banana)", image_editing_tab),
+    ])
+
+    # Use a radio button for controlled sub-navigation
+    st.radio(
+        "Image Sub-Navigation",
+        options=list(sub_tabs.keys()),
+        horizontal=True,
+        label_visibility="collapsed",
+        key="active_image_sub_tab" # Directly link to session state
+    )
+
+    # Call the function for the active sub-tab
+    active_sub_tab_func = sub_tabs.get(st.session_state.active_image_sub_tab)
+    if active_sub_tab_func:
+        active_sub_tab_func()
+    else:
+        # Fallback to the first tab
+        text_to_image_tab()
+
+def audio_tab():
+    """Main tab for all audio-related operations."""
+    # Define the audio sub-tabs and their corresponding functions
+    sub_tabs = OrderedDict([
+        ("Text-to-Audio", text_to_audio_tab),
+        ("Text-to-Voiceover", text_to_voiceover_tab),
+    ])
+
+    # Use a radio button for controlled sub-navigation
+    st.radio(
+        "Audio Sub-Navigation",
+        options=list(sub_tabs.keys()),
+        horizontal=True,
+        label_visibility="collapsed",
+        key="active_audio_sub_tab" # Directly link to session state
+    )
+
+    # Call the function for the active sub-tab
+    active_sub_tab_func = sub_tabs.get(st.session_state.active_audio_sub_tab)
+    if active_sub_tab_func:
+        active_sub_tab_func()
+    else:
+        # Fallback to the first tab
+        text_to_audio_tab()
+
+def gemini_chat_tab():
+    """A tab for multimodal chat with Gemini."""
+    st.header("Chat with Gemini")
+
+    # Model selection
+    model_name = st.selectbox(
+        "Select Gemini Model",
+        options=["gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash-001", "gemini-2.0-flash-lite-001", "gemini-1.5-pro-002"],
+        key="gemini_chat_model",
+        help="Choose the Gemini model to chat with. 'Flash' is faster, 'Pro' is more capable."
+    )
+
+    # System instructions input
+    system_instructions = st.text_area(
+        "System Instructions (Optional)",
+        placeholder="e.g., You are a helpful assistant that speaks like a pirate.",
+        help="Provide instructions to guide the model's behavior and personality.",
+        key="gemini_system_instructions"
+    )
+
+    # Advanced settings for temperature and grounding
+    with st.expander("Advanced Settings"):
+        temperature = st.slider(
+            "Temperature",
+            min_value=0.0,
+            max_value=2.0,
+            value=1.0,
+            step=0.1,
+            help="Controls the randomness of the output. Lower values are more deterministic, higher values are more creative."
+        )
+        enable_grounding = st.toggle(
+            "Enable Google Search Grounding",
+            value=False,
+            help="Allows the model to use Google Search to ground its responses with real-time information."
+        )
+
+    # File uploader for multimodal input
+    uploaded_file = st.file_uploader(
+        "Upload an image, audio, or video file (optional)",
+        type=["jpg", "jpeg", "png", "webp", "mp3", "wav", "mp4", "mov", "avi", "mkv", "txt", "pdf"],
+        key="gemini_chat_uploader"
+    )
+
+    if uploaded_file:
+        file_type = uploaded_file.type.split('/')[0]
+        st.info(f"File '{uploaded_file.name}' is ready to be sent with your next message.")
+        if file_type == "image":
+            st.image(uploaded_file, width=200)
+        elif file_type == "audio":
+            st.audio(uploaded_file)
+        elif file_type == "video":
+            st.video(uploaded_file)
+
+    # Display chat messages from history
+    for message in st.session_state.gemini_messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    # React to user input
+    if prompt := st.chat_input("What would you like to ask Gemini?"):
+        # Add user message to chat history
+        st.session_state.gemini_messages.append({"role": "user", "content": prompt})
+        # Display user message in chat message container
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        # Display assistant response in chat message container
+        with st.chat_message("assistant"):
+            message_placeholder = st.empty()
+            full_response = ""
+            with st.spinner("Gemini is thinking..."):
+                try:
+                    # Use the existing gemini_helper for the API call
+                    response_text = gemini_helper.generate_gemini_chat_response(
+                        model_name=model_name,
+                        prompt=prompt,
+                        uploaded_file=uploaded_file,
+                        system_instructions=system_instructions,
+                        temperature=temperature,
+                        enable_grounding=enable_grounding
+                    )
+                    full_response = response_text
+                except Exception as e:
+                    full_response = f"An error occurred: {e}"
+                    st.error(full_response)
+
+            message_placeholder.markdown(full_response)
+        # Add assistant response to chat history
+        st.session_state.gemini_messages.append({"role": "assistant", "content": full_response})
 
 def text_to_image_tab():
     """Text-to-Image generation tab."""
@@ -4264,26 +4446,31 @@ def handle_history_action(operation: str, uris: List[str]):
 
         if operation == "Edit Image(s)":
             st.session_state.edit_image_files = simulated_files
-            st.session_state.next_active_main_tab = "✨ Nano Banana"
+            st.session_state.active_image_sub_tab = "Image Editing (Nano Banana)"
+            st.session_state.next_active_main_tab = "🎨 Image"
         elif operation == "Use for Image-to-Video":
             # Set the canonical active image data. The Image-to-Video tab will
             # pick this up on the next run. This is the safe way.
             st.session_state.active_image_data = simulated_files[0]
             # Clear any URL that might have been there to avoid conflicts
             st.session_state.current_image_url = ""
-            st.session_state.next_active_main_tab = "🖼️ Image-to-Video"
+            st.session_state.active_video_sub_tab = "Image-to-Video"
+            st.session_state.next_active_main_tab = "🎬 Video"
         elif operation == "Concatenate Videos":
             st.session_state.concat_video_files = simulated_files
             st.session_state.video_edit_option = "Concatenate Videos"
-            st.session_state.next_active_main_tab = "✂️ Video Editing"
+            st.session_state.active_video_sub_tab = "Video Editing"
+            st.session_state.next_active_main_tab = "🎬 Video"
         elif operation == "Change Video Speed":
             st.session_state.speed_change_video_file = simulated_files[0]
             st.session_state.video_edit_option = "Change Playback Speed"
-            st.session_state.next_active_main_tab = "✂️ Video Editing"
+            st.session_state.active_video_sub_tab = "Video Editing"
+            st.session_state.next_active_main_tab = "🎬 Video"
         elif operation == "Dubbing":
             st.session_state.dub_video_file = simulated_files[0]
             st.session_state.video_edit_option = "Dubbing"
-            st.session_state.next_active_main_tab = "✂️ Video Editing"
+            st.session_state.active_video_sub_tab = "Video Editing"
+            st.session_state.next_active_main_tab = "🎬 Video"
 
         # Clear selection and rerun to switch tab and apply state changes
         st.session_state.selected_history_items.clear()
