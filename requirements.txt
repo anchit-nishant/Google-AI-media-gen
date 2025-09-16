@@ -16,3 +16,5 @@ pyrubberband
 soundfile
 click
 streamlit-mic-recorder
+streamlit-oauth
+

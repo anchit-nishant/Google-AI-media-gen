@@ -41,6 +41,17 @@ except ValueError as e:
     raise SystemExit(1)
 
 # ----------------------------------------------------------------------
+# Google OAuth Configuration
+# ----------------------------------------------------------------------
+try:
+    GOOGLE_CLIENT_ID = get_required_env("GOOGLE_CLIENT_ID", "Google OAuth Client ID must be set in .env file")
+    GOOGLE_CLIENT_SECRET = get_required_env("GOOGLE_CLIENT_SECRET", "Google OAuth Client Secret must be set in .env file")
+    REDIRECT_URI = get_required_env("REDIRECT_URI", "Google OAuth Redirect URI must be set in .env file")
+except ValueError as e:
+    print(f"OAuth configuration error: {str(e)}", file=sys.stderr)
+    raise SystemExit(1)
+
+# ----------------------------------------------------------------------
 # Gemini Configuration
 # ----------------------------------------------------------------------
 try:

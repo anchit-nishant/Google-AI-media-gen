@@ -25,6 +25,7 @@ from firebase_admin import credentials, firestore
 from collections import OrderedDict
 from typing import Dict, List, Optional, Union, Any
 import shutil
+from streamlit_oauth import OAuth2Component
 from werkzeug.utils import secure_filename
 from streamlit_mic_recorder import mic_recorder
 
@@ -927,6 +928,29 @@ def _setup_page():
         st.session_state.active_main_tab = st.session_state.next_active_main_tab
         st.session_state.next_active_main_tab = None
 
+def get_google_user_info(token_dict: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Fetches user information from Google's userinfo endpoint.
+
+    Args:
+        token_dict: The token dictionary received from the OAuth flow.
+
+    Returns:
+        A dictionary containing user info (email, name, etc.) or None on failure.
+    """
+    if not token_dict or 'access_token' not in token_dict:
+        return None
+
+    access_token = token_dict['access_token']
+    userinfo_endpoint = "https://www.googleapis.com/oauth2/v3/userinfo"
+    headers = {'Authorization': f'Bearer {access_token}'}
+
+    response = requests.get(userinfo_endpoint, headers=headers)
+    if response.status_code == 200:
+        return response.json()
+    return None
+
+
 def main():
     """Main function to run the Streamlit app."""
     logger.start_section("App Initialization")
@@ -934,6 +958,15 @@ def main():
     # Initialize session state
     init_state()
 
+    # --- OAuth2 Configuration ---
+    oauth2 = OAuth2Component(
+        client_id=config.GOOGLE_CLIENT_ID,
+        client_secret=config.GOOGLE_CLIENT_SECRET,
+        authorize_endpoint="https://accounts.google.com/o/oauth2/v2/auth",
+        token_endpoint="https://oauth2.googleapis.com/token",
+        refresh_token_endpoint=None, # Google uses the same endpoint for refresh
+        revoke_token_endpoint="https://oauth2.googleapis.com/revoke",
+    )
     # --- Password Hashing and Verification Helpers ---
     def hash_password(password):
         """Returns the SHA-256 hash of the password."""
@@ -944,59 +977,40 @@ def main():
         return stored_hash == hash_password(provided_password)
 
     # --- Persistent Login Check ---
-    # Check if a user is logged in via query params on a page refresh.
-    if 'user_id' not in st.session_state and 'user' in st.query_params:
-        # This is a weak form of "remember me". A full solution would use secure cookies.
-        st.session_state.user_id = st.query_params['user']
+    # Check if a token exists in the session state
+    if 'token' not in st.session_state:
+        st.session_state.token = None
+
+    # If we have a token, but no user_id, the user is returning to the session
+    # We need to fetch their info
+    if st.session_state.token and 'user_id' not in st.session_state:
+        user_info = get_google_user_info(st.session_state.token)
+        if user_info:
+            st.session_state.user_id = user_info.get("email")
+            st.session_state.user_name = user_info.get("name")
+        else:
+            # If token is invalid, clear it
+            st.session_state.token = None
 
     # --- Authentication Gate ---
     if 'user_id' not in st.session_state:
         st.set_page_config(page_title="Login - Media Gen Tool")
         st.title("🎬 Welcome to the AI Media Generator")
+        st.subheader("Please sign in to continue")
 
-        auth_choice = st.radio("Choose an action:", ["Login", "Sign Up"], horizontal=True, label_visibility="collapsed")
+        result = oauth2.authorize_button(
+            name="Sign in with Google",
+            icon="https://www.google.com.tw/favicon.ico",
+            redirect_uri=config.REDIRECT_URI,
+            scope="openid email profile",
+            key="google_login",
+            use_container_width=True,
+        )
 
-        if auth_choice == "Login":
-            st.subheader("Login to your account")
-            with st.form("login_form"):
-                email = st.text_input("Email Address")
-                password = st.text_input("Password", type="password")
-                submitted = st.form_submit_button("Login")
-                if submitted:
-                    if not email or not password:
-                        st.error("Please enter both email and password.")
-                    else:
-                        user_ref = db.collection('users').document(email)
-                        user_doc = user_ref.get()
-                        if user_doc.exists and verify_password(user_doc.to_dict().get('password_hash'), password):
-                            st.session_state.user_id = email
-                            st.query_params['user'] = email # Add user to query params to persist login
-                            st.success(f"Logged in as {email}")
-                            time.sleep(1)
-                            st.rerun()
-                        else:
-                            st.error("Invalid email or password.")
-        
-        elif auth_choice == "Sign Up":
-            st.subheader("Create a new account")
-            with st.form("signup_form"):
-                email = st.text_input("Email Address")
-                password = st.text_input("Password", type="password")
-                confirm_password = st.text_input("Confirm Password", type="password")
-                submitted = st.form_submit_button("Sign Up")
-                if submitted:
-                    if not email or not password or not confirm_password:
-                        st.error("Please fill out all fields.")
-                    elif password != confirm_password:
-                        st.error("Passwords do not match.")
-                    elif db.collection('users').document(email).get().exists:
-                        st.error("An account with this email already exists.")
-                    else:
-                        password_hash = hash_password(password)
-                        db.collection('users').document(email).set({'password_hash': password_hash})
-                        st.success("Account created successfully! Please log in.")
-                        time.sleep(2)
-                        st.rerun() # Reruns to switch back to login view
+        if result and "token" in result:
+            st.session_state.token = result.get('token')
+            st.rerun()
+
         return  # Stop execution until the user is logged in
     
     # Run the setup function to configure the page, theme, and handle tab switches.
@@ -1157,6 +1171,9 @@ def main():
         st.markdown(f"👤 **Logged in as:** {st.session_state.user_id}")
     with logout_col:
         if st.button("🚪 Logout", key="logout_button"):
+            if st.session_state.token:
+                # This part is optional but good practice; it revokes the token on Google's side.
+                oauth2.revoke_token(st.session_state.token)
             st.session_state.clear()
             st.query_params.clear() # Remove user from query params on logout
             st.rerun()
