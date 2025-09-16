@@ -1,122 +1,141 @@
 # End-to-End Deployment Guide
+
 Follow these steps carefully to configure your Google Cloud environment and deploy the application.
 
 ## Part 1: Google Cloud Project Setup
+
 Before deploying, you must prepare your Google Cloud project by enabling the necessary APIs and creating a service account with the correct permissions.
 
 ### 1.1 Enable Required APIs
+
 Navigate to the APIs & Services > Library page in the Google Cloud Console and enable the following APIs for your project:
 
-- Vertex AI API
+  - Vertex AI API
 
-- Gemini API
+  - Gemini API
 
-- Cloud Run Admin API
+  - Cloud Run Admin API
 
-- Cloud Build API
+  - Cloud Build API
 
-- Artifact Registry API
+  - Artifact Registry API
 
-- Cloud Datastore API (Firestore)
+  - Cloud Datastore API (Firestore)
 
 ### 1.2 Create and Configure a Service Account
+
 The application runs using a service account's identity. You need to create one and grant it the appropriate permissions.
 
-Go to IAM & Admin > Service Accounts.
+1. Go to IAM & Admin > Service Accounts.
 
-Click Create Service Account. Give it a name (e.g., cloud-run-media-gen-sa) and an ID.
+2. Click Create Service Account. Give it a name (e.g., cloud-run-media-gen-sa) and an ID.
 
-Grant the following IAM roles to the service account:
+3. Grant the following IAM roles to the service account:
 
-- Cloud Run Admin
+    - Cloud Run Admin
 
-- Artifact Registry Writer
+    - Artifact Registry Writer
 
-- Cloud Build Editor
+    - Cloud Build Editor
 
-- Cloud Datastore User
+    - Cloud Datastore User
 
-- Service Account User
+    - Service Account User
 
-- Logs Writer
+    - Logs Writer
 
-- Logs Viewer
+    - Logs Viewer
 
-- Vertex AI User
+    - Vertex AI User
 
-- Storage Object Creator
+    - Storage Object Creator
 
 Take note of the service account's email address.
 
 ## Part 2: Infrastructure Configuration
+
 Next, create the necessary database and storage resources.
 
-### 2.1 Create a Firestore Database
-In the Cloud Console search bar, look for Firestore.
+#### 2.1 Create a Firestore Database
 
-Click Create Database.
+- In the Cloud Console search bar, look for Firestore.
 
-Select Native Mode and choose a location (e.g., us-central1).
+- Click Create Database.
 
-Provide a Database ID or use (default).
+- Select Native Mode and choose a location (e.g., us-central1).
 
-Click Create. Remember this Database ID for the .env file.
+- Provide a Database ID or use (default).
 
-### 2.2 Create a Cloud Storage Bucket
-Navigate to Cloud Storage > Buckets and click Create.
+- Click Create. Remember this Database ID for the .env file.
 
-Give the bucket a globally unique name.
+#### 2.2 Create a Cloud Storage Bucket
 
-Set the Location type to Region and select us-central-1.
+- Navigate to Cloud Storage > Buckets and click Create.
 
-Crucially, ensure "Enforce public access prevention" is checked.
+- Give the bucket a globally unique name.
 
-Click Create. Remember this bucket name for the .env file.
+- Set the Location type to Region and select us-central-1.
 
-### 2.3 Get a Gemini API Key
-Navigate to Google AI Studio.
+- Crucially, ensure "Enforce public access prevention" is checked.
 
-Ensure you have selected the correct Google Cloud project.
+- Click Create. Remember this bucket name for the .env file.
 
-Click "Get API key" from the left menu, then "Create API key".
+#### 2.3 Get a Gemini API Key
 
-Copy the generated key and save it securely.
+- Navigate to Google AI Studio.
+
+- Ensure you have selected the correct Google Cloud project.
+
+- Click "Get API key" from the left menu, then "Create API key".
+
+- Copy the generated key and save it securely.
 
 ## Part 3: Code and Deployment
+
 Now you will configure the source code and deploy it using a single gcloud command.
 
-### 3.1 Clone and Configure the Repository
-Open the Google Cloud Shell or your local terminal.
+#### 3.1 Clone and Configure the Repository
 
-Clone the repository:
+1. Open the Google Cloud Shell or your local terminal.
 
-git clone [https://github.com/anchit-nishant/Google-AI-media-gen](https://github.com/anchit-nishant/Google-AI-media-gen)
+2. Clone the repository:
+
+3. git clone [https://github.com/anchit-nishant/Google-AI-media-gen](https://github.com/anchit-nishant/Google-AI-media-gen)
 cd Google-AI-media-gen
 
-Create an environment file from the example:
+4. Create an environment file from the example:
+
+    ```
+    cp env.example .env
+    ```
+
+5. Edit the .env file and populate it with your specific values:
+
+#### Google Cloud Configuration
 
 ```
-cp env.example .env
-```
-
-Edit the .env file and populate it with your specific values:
-
-### Google Cloud Configuration
 PROJECT_ID=your-gcp-project-id
 STORAGE_URI=gs://your-bucket-name/
+```
 
-### Gemini Configuration
+#### Gemini Configuration
+
+```
 GEMINI_PROJECT_ID=your-gcp-project-id
 GEMINI_LOCATION=us-central1
 GEMINI_MODEL_NAME=gemini-2.5-pro
 GEMINI_API_KEY=your-gemini-api-key-from-ai-studio
+```
 
-### History Tracking
+#### History Tracking
+
+```
 DB_ID="your-firestore-db-id"
+```
 
 Cloud Build needs access to the .env file. Open the .gitignore file and comment out the line .env by adding a # in front of it: #.env.
 
-3.2 Deploy to Cloud Run
+#### 3.2 Deploy to Cloud Run
 From the root of the project directory, run the following command. Remember to replace the placeholder values.
 
 ```
@@ -134,19 +153,20 @@ gcloud beta run deploy <service-name> \
 When prompted Allow unauthenticated invocations...?, enter n to keep the service private and secure.
 
 ## Part 4: Finalizing Access Control
+
 Once deployed, you must grant specific users permission to access the application through the Identity-Aware Proxy (IAP).
 
-In the Cloud Console, go to Cloud Run and click on your new service.
+- In the Cloud Console, go to Cloud Run and click on your new service.
 
-Navigate to the Security tab.
+- Navigate to the Security tab.
 
-You should see that Identity-Aware Proxy is enabled. Click "Edit Policy".
+- You should see that Identity-Aware Proxy is enabled. Click "Edit Policy".
 
-Click "Add Principal" and enter the email addresses of users or Google Groups you want to grant access.
+- Click "Add Principal" and enter the email addresses of users or Google Groups you want to grant access.
 
-Assign them the IAP-secured Web App User role.
+- Assign them the IAP-secured Web App User role.
 
-Click Save.
+- Click Save.
 
 Users can now access the application URL provided on the Cloud Run service details page.
 

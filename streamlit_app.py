@@ -11,6 +11,7 @@ import tempfile
 import io
 import queue
 import sys
+import hashlib
 import pandas as pd
 import subprocess
 from datetime import datetime
@@ -932,6 +933,64 @@ def main():
     
     # Initialize session state
     init_state()
+
+    # --- Password Hashing and Verification Helpers ---
+    def hash_password(password):
+        """Returns the SHA-256 hash of the password."""
+        return hashlib.sha256(str.encode(password)).hexdigest()
+
+    def verify_password(stored_hash, provided_password):
+        """Verifies a provided password against a stored hash."""
+        return stored_hash == hash_password(provided_password)
+
+    # --- Authentication Gate ---
+    if 'user_id' not in st.session_state:
+        st.set_page_config(page_title="Login - Media Gen Tool")
+        st.title("🎬 Welcome to the AI Media Generator")
+
+        auth_choice = st.radio("Choose an action:", ["Login", "Sign Up"], horizontal=True, label_visibility="collapsed")
+
+        if auth_choice == "Login":
+            st.subheader("Login to your account")
+            with st.form("login_form"):
+                email = st.text_input("Email Address")
+                password = st.text_input("Password", type="password")
+                submitted = st.form_submit_button("Login")
+                if submitted:
+                    if not email or not password:
+                        st.error("Please enter both email and password.")
+                    else:
+                        user_ref = db.collection('users').document(email)
+                        user_doc = user_ref.get()
+                        if user_doc.exists and verify_password(user_doc.to_dict().get('password_hash'), password):
+                            st.session_state.user_id = email
+                            st.success(f"Logged in as {email}")
+                            time.sleep(1)
+                            st.rerun()
+                        else:
+                            st.error("Invalid email or password.")
+        
+        elif auth_choice == "Sign Up":
+            st.subheader("Create a new account")
+            with st.form("signup_form"):
+                email = st.text_input("Email Address")
+                password = st.text_input("Password", type="password")
+                confirm_password = st.text_input("Confirm Password", type="password")
+                submitted = st.form_submit_button("Sign Up")
+                if submitted:
+                    if not email or not password or not confirm_password:
+                        st.error("Please fill out all fields.")
+                    elif password != confirm_password:
+                        st.error("Passwords do not match.")
+                    elif db.collection('users').document(email).get().exists:
+                        st.error("An account with this email already exists.")
+                    else:
+                        password_hash = hash_password(password)
+                        db.collection('users').document(email).set({'password_hash': password_hash})
+                        st.success("Account created successfully! Please log in.")
+                        time.sleep(2)
+                        st.rerun() # Reruns to switch back to login view
+        return  # Stop execution until the user is logged in
     
     # Run the setup function to configure the page, theme, and handle tab switches.
     _setup_page()
@@ -1084,6 +1143,16 @@ def main():
         st.title("AI Media Generator")
     with toggle_col:
         st.toggle("🌙 Dark Mode", key="dark_mode", help="Toggle between light and dark themes.")
+    
+    # --- User Info and Logout Button ---
+    user_col, _, logout_col = st.columns([4, 1, 1])
+    with user_col:
+        st.markdown(f"👤 **Logged in as:** {st.session_state.user_id}")
+    with logout_col:
+        if st.button("🚪 Logout", key="logout_button"):
+            st.session_state.clear()
+            st.rerun()
+
     # Define the main tabs and their corresponding functions
     TABS = OrderedDict([
         ("🎬 Video", video_tab),
@@ -1382,16 +1451,16 @@ def text_to_image_tab():
         with col1_adv:
             person_generation = st.selectbox(
                 "Person Generation",
-                options=["Allow (All ages)", "Allow (Adults only)", "Don't Allow"],
+                options=["Allow", "Don't Allow"],
                 index=0,
-                help="Allow or disallow the generation of human faces.",
+                help="Allow or disallow the generation of people.",
                 key="t2i_person_generation"
             )
 
         with col2_adv:
             safety_filter_threshold = st.selectbox(
                 "Safety Filter Strength",
-                options=["block_most", "block_few", "block_some",],
+                options=["BLOCK_MOST", "BLOCK_SOME", "BLOCK_FEW", "BLOCK_NONE"],
                 index=2,
                 help="Set the threshold for safety filters.",
                 key="t2i_safety_threshold"
@@ -1922,6 +1991,7 @@ def text_to_voiceover_tab():
                                 try:
                                     doc_ref = db.collection('history').document()
                                     doc_ref.set({
+                                        'user_id': st.session_state.user_id,
                                         'timestamp': firestore.SERVER_TIMESTAMP,
                                         'type': 'voice',
                                         'uri': uri,
@@ -2037,6 +2107,7 @@ def video_editing_tab():
                             st.video(signed_url)
                             if FIRESTORE_AVAILABLE:
                                 db.collection('history').add({
+                                    'user_id': st.session_state.user_id,
                                     'timestamp': firestore.SERVER_TIMESTAMP,
                                     'type': 'video',
                                     'uri': final_video_uri,
@@ -2138,6 +2209,7 @@ def video_editing_tab():
                             st.video(signed_url)
                             if FIRESTORE_AVAILABLE:
                                 db.collection('history').add({
+                                    'user_id': st.session_state.user_id,
                                     'timestamp': firestore.SERVER_TIMESTAMP,
                                     'type': 'video', 'uri': final_video_uri,
                                     'prompt': f'Video speed changed by factor of {speed_factor}',
@@ -2317,6 +2389,7 @@ def video_editing_tab():
                                 st.video(signed_url)
                                 if FIRESTORE_AVAILABLE:
                                     db.collection('history').add({
+                                        'user_id': st.session_state.user_id,
                                         'timestamp': firestore.SERVER_TIMESTAMP,
                                         'type': 'video', 'uri': final_gcs_uri,
                                         'prompt': f'Video interpolated and changed by factor of {playback_speed_factor}',
@@ -2829,6 +2902,7 @@ def image_to_video_tab():
                             if FIRESTORE_AVAILABLE:
                                 doc_ref = db.collection('history').document()
                                 doc_ref.set({
+                                    'user_id': st.session_state.user_id,
                                     'timestamp': firestore.SERVER_TIMESTAMP,
                                     'type': 'image',
                                     'uri': uploaded_image_uri,
@@ -2883,12 +2957,13 @@ def image_to_video_tab():
     logger.end_section()
 
 
-def get_history_from_firestore(limit=200):
+def get_history_from_firestore(user_id, limit=200):
     """
     Get the history of generated content from Firestore.
     
     Args:
-        limit (int): Maximum number of entries to return
+        user_id (str): The ID of the user to fetch history for.
+        limit (int): Maximum number of entries to return.
         
     Returns:
         pandas.DataFrame: DataFrame containing the history entries
@@ -2898,9 +2973,9 @@ def get_history_from_firestore(limit=200):
         return pd.DataFrame(columns=['timestamp', 'type', 'uri', 'prompt', 'params'])
 
     try:
-        history_ref = db.collection('history').order_by(
-            'timestamp', direction=firestore.Query.DESCENDING
-        ).limit(limit)
+        # Fetch all documents for the user first, then sort and limit in pandas.
+        # This avoids the need for a composite index in Firestore.
+        history_ref = db.collection('history').where('user_id', '==', user_id)
         
         docs = history_ref.stream()
         
@@ -2911,8 +2986,11 @@ def get_history_from_firestore(limit=200):
             
         df = pd.DataFrame(history_list)
         # Ensure timestamp column is of datetime type for proper sorting
-        df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
-        return df.sort_values('timestamp', ascending=False)
+        if 'timestamp' in df.columns:
+            df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
+            # Sort by timestamp descending and then take the top 'limit' results
+            return df.sort_values('timestamp', ascending=False).head(limit)
+        return df
 
     except Exception as e:
         logger.error(f"Error getting history from Firestore: {str(e)}")
@@ -3215,7 +3293,7 @@ def history_tab():
     try:
         if not st.session_state.get("history_loaded", False) or "history_data" not in st.session_state:
             with st.spinner("Loading history data..."):
-                history_data = get_history_from_firestore(limit=200)
+                history_data = get_history_from_firestore(user_id=st.session_state.user_id, limit=200)
                 st.session_state.history_data = history_data
                 st.session_state.history_loaded = True
         else:
@@ -3625,6 +3703,7 @@ def generate_video(
                                     doc_ref = db.collection('history').document()
                                     doc_ref.set({
                                         'timestamp': firestore.SERVER_TIMESTAMP,
+                                        'user_id': st.session_state.user_id,
                                         'type': "video", 'uri': uri, 'prompt': prompt, 'params': params
                                     })
                                     logger.info(f"Added video {uri} to Firestore history.")
@@ -3740,6 +3819,7 @@ def generate_image(
                 for uri in image_uris:
                     db.collection('history').document().set({
                         'timestamp': firestore.SERVER_TIMESTAMP, 'type': 'image', 'uri': uri,
+                        'user_id': st.session_state.user_id,
                         'prompt': prompt, 'params': params
                     })
 
@@ -3840,6 +3920,7 @@ def edit_image(
                 for uri in image_uris:
                     db.collection('history').document().set({
                         'timestamp': firestore.SERVER_TIMESTAMP, 'type': 'image', 'uri': uri,
+                        'user_id': st.session_state.user_id,
                         'prompt': f"Edited image with prompt: {prompt}", 'params': params
                     })
 
@@ -4152,6 +4233,7 @@ def dub_video(uploaded_video, input_language, output_language, bucket_name):
             
             if FIRESTORE_AVAILABLE:
                 db.collection('history').add({
+                    'user_id': st.session_state.user_id,
                     'timestamp': firestore.SERVER_TIMESTAMP,
                     'type': 'video',
                     'uri': full_gcs_uri,
@@ -4224,6 +4306,7 @@ def generate_audio(
                         doc_ref = db.collection('history').document()
                         doc_ref.set({
                             'timestamp': firestore.SERVER_TIMESTAMP,
+                            'user_id': st.session_state.user_id,
                             'type': "audio",
                             'uri': uri,
                             'prompt': prompt,

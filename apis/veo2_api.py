@@ -832,7 +832,6 @@ class Veo2API:
         parameters = {
             "sampleCount": sample_count,
             "aspectRatio": aspect_ratio,
-            "personGeneration": person_generation,
             "enhancePrompt": enhance_prompt,
             "storageUri": storage_uri,
 
@@ -844,6 +843,13 @@ class Veo2API:
             parameters["seed"] = seed
         if resolution:
             parameters["sampleImageSize"] = resolution
+        
+        # Correctly handle the person_generation parameter.
+        # The API expects 'disablePersonFace' as a boolean.
+        # if person_generation == "Don't Allow":
+        #     parameters["disablePersonFace"] = True
+        # else: # "Allow" or "Allow (Adults only)"
+        #     parameters["disablePersonFace"] = False
 
 
         harm_categories = [
@@ -852,12 +858,13 @@ class Veo2API:
             "HARM_CATEGORY_SEXUALLY_EXPLICIT",
             "HARM_CATEGORY_HARASSMENT"
         ]
+        
         safety_settings = [{"category": cat, "threshold": safety_filter_level} for cat in harm_categories]
         parameters["safetySettings"] = safety_settings
 
         request_body = {
             "instances": [instance],
-            "parameters": parameters
+            "parameters": parameters,
         }
 
         headers = {
@@ -867,37 +874,38 @@ class Veo2API:
 
         response = requests.post(url, headers=headers, json=request_body)
         response.raise_for_status() # Raise an exception for bad status codes
+        return response.json()
         
         # The response from streamGenerateContent is a list of JSON objects (chunks).
         # We need to aggregate them to extract the image data.
-        full_response_text = response.text
+        # full_response_text = response.text
         
-        # The response is a stream of JSON objects, not a single one.
-        # We need to parse it line by line or as a list of objects.
-        try:
-            # It's often returned as a JSON array of objects
-            full_response_json = json.loads(full_response_text)
-        except json.JSONDecodeError:
-            # Or sometimes as newline-delimited JSON
-            try:
-                full_response_json = [json.loads(line) for line in full_response_text.strip().split('\n')]
-            except json.JSONDecodeError:
-                raise ValueError(f"Could not parse streaming response from Gemini API: {full_response_text}")
+        # # The response is a stream of JSON objects, not a single one.
+        # # We need to parse it line by line or as a list of objects.
+        # try:
+        #     # It's often returned as a JSON array of objects
+        #     full_response_json = json.loads(full_response_text)
+        # except json.JSONDecodeError:
+        #     # Or sometimes as newline-delimited JSON
+        #     try:
+        #         full_response_json = [json.loads(line) for line in full_response_text.strip().split('\n')]
+        #     except json.JSONDecodeError:
+        #         raise ValueError(f"Could not parse streaming response from Gemini API: {full_response_text}")
 
-        # For image generation, the content is usually in one of the first chunks.
-        # Let's find the image data and format it like the other Imagen responses.
-        predictions = []
-        for chunk in full_response_json:
-            if "candidates" in chunk:
-                for candidate in chunk["candidates"]:
-                    if "content" in candidate and "parts" in candidate["content"]:
-                        for part in candidate["content"]["parts"]:
-                            if "inlineData" in part and "data" in part["inlineData"]:
-                                predictions.append({
-                                    "bytesBase64Encoded": part["inlineData"]["data"]
-                                })
+        # # For image generation, the content is usually in one of the first chunks.
+        # # Let's find the image data and format it like the other Imagen responses.
+        # predictions = []
+        # for chunk in full_response_json:
+        #     if "candidates" in chunk:
+        #         for candidate in chunk["candidates"]:
+        #             if "content" in candidate and "parts" in candidate["content"]:
+        #                 for part in candidate["content"]["parts"]:
+        #                     if "inlineData" in part and "data" in part["inlineData"]:
+        #                         predictions.append({
+        #                             "bytesBase64Encoded": part["inlineData"]["data"]
+        #                         })
         
-        return {"predictions": predictions}
+        # return {"predictions": predictions}
 
     def extract_image_data(self, result: Dict) -> List[bytes]:
         """Extracts base64 encoded image data from an Imagen API result."""
