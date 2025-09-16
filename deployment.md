@@ -90,6 +90,41 @@ Next, create the necessary database and storage resources.
 
 - Copy the generated key and save it securely.
 
+#### 2.4 Create OAuth Credentials for User Login
+
+To allow users to sign in with their Google accounts, you must create OAuth 2.0 credentials.
+
+##### 2.4.1 Configure the OAuth Consent Screen
+
+First, configure what users will see when they grant permission to your app.
+
+1.  In the Google Cloud Console, navigate to **APIs & Services > OAuth consent screen**.
+2.  Choose **External** for the User Type and click **Create**.
+3.  Fill in the required fields:
+    -   **App name**: e.g., `AI Media Generator`
+    -   **User support email**: Your email address.
+    -   **Developer contact information**: Your email address.
+4.  Click **Save and Continue**.
+5.  On the **Scopes** page, click **Add or Remove Scopes**. Find and add the following three scopes:
+    -   `.../auth/userinfo.email`
+    -   `.../auth/userinfo.profile`
+    -   `openid`
+6.  Click **Update**, then **Save and Continue**.
+7.  On the **Test users** page, click **Add Users** and enter the Google email addresses you will use for testing while the app is in "Testing" mode.
+8.  Click **Save and Continue**, then go back to the dashboard.
+
+##### 2.4.2 Create the OAuth Client ID
+
+1.  In the left menu, go to **APIs & Services > Credentials**.
+2.  Click **+ Create Credentials** and select **OAuth client ID**.
+3.  Configure the client ID:
+    -   **Application type**: Select **Web application**.
+    -   **Name**: Give it a name, like `Media Gen Web App`.
+    -   **Authorized redirect URIs**: This is a critical step. You must add the URLs where Google can send users after they log in.
+        -   For local development, add: `http://localhost:8501`
+        -   After deploying to Cloud Run, you must **return to this page** and add the service URL (e.g., `https://your-service-name-....run.app`).
+4.  Click **Create**. A pop-up will appear with your **Client ID** and **Client Secret**. Copy both of these values for the next step.
+
 ## Part 3: Code and Deployment
 
 Now you will configure the source code and deploy it using a single gcloud command.
@@ -125,6 +160,14 @@ GEMINI_PROJECT_ID=your-gcp-project-id
 GEMINI_LOCATION=us-central1
 GEMINI_MODEL_NAME=gemini-2.5-pro
 GEMINI_API_KEY=your-gemini-api-key-from-ai-studio
+```
+
+#### Google OAuth Credentials
+
+```
+GOOGLE_CLIENT_ID="your-client-id-from-oauth-credentials"
+GOOGLE_CLIENT_SECRET="your-client-secret-from-oauth-credentials"
+REDIRECT_URI="your-cloud-run-url"
 ```
 
 #### History Tracking

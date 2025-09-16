@@ -958,6 +958,15 @@ def main():
     # Initialize session state
     init_state()
 
+    # --- Bypass Authentication for Local Development ---
+    # Check for a command-line flag to bypass authentication.
+    if '--no-auth' in sys.argv:
+        if 'user_id' not in st.session_state:
+            # If the flag is present and no user is logged in, set a default user.
+            st.session_state.user_id = "local_dev_user@example.com"
+            st.session_state.user_name = "Local Dev User"
+            logger.warning("Authentication bypassed with --no-auth flag. Logged in as default local user.")
+
     # --- OAuth2 Configuration ---
     oauth2 = OAuth2Component(
         client_id=config.GOOGLE_CLIENT_ID,
