@@ -943,6 +943,12 @@ def main():
         """Verifies a provided password against a stored hash."""
         return stored_hash == hash_password(provided_password)
 
+    # --- Persistent Login Check ---
+    # Check if a user is logged in via query params on a page refresh.
+    if 'user_id' not in st.session_state and 'user' in st.query_params:
+        # This is a weak form of "remember me". A full solution would use secure cookies.
+        st.session_state.user_id = st.query_params['user']
+
     # --- Authentication Gate ---
     if 'user_id' not in st.session_state:
         st.set_page_config(page_title="Login - Media Gen Tool")
@@ -964,6 +970,7 @@ def main():
                         user_doc = user_ref.get()
                         if user_doc.exists and verify_password(user_doc.to_dict().get('password_hash'), password):
                             st.session_state.user_id = email
+                            st.query_params['user'] = email # Add user to query params to persist login
                             st.success(f"Logged in as {email}")
                             time.sleep(1)
                             st.rerun()
@@ -1151,6 +1158,7 @@ def main():
     with logout_col:
         if st.button("🚪 Logout", key="logout_button"):
             st.session_state.clear()
+            st.query_params.clear() # Remove user from query params on logout
             st.rerun()
 
     # Define the main tabs and their corresponding functions
