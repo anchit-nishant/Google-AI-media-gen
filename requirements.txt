@@ -15,3 +15,4 @@ demucs
 pyrubberband
 soundfile
 click
+streamlit-mic-recorder

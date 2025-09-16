@@ -25,6 +25,7 @@ from collections import OrderedDict
 from typing import Dict, List, Optional, Union, Any
 import shutil
 from werkzeug.utils import secure_filename
+from streamlit_mic_recorder import mic_recorder
 
 
 # Import project modules
@@ -1224,6 +1225,13 @@ def gemini_chat_tab():
             help="Allows the model to use Google Search to ground its responses with real-time information."
         )
 
+    # --- Microphone Input ---
+    # Place the mic recorder next to the file uploader.
+    st.write("OR")
+    # The mic_recorder returns audio data when the user stops recording
+    audio_data = mic_recorder(start_prompt="🎤 Start Recording", stop_prompt="⏹️ Stop Recording", key='gemini_mic')
+
+
     # File uploader for multimodal input
     uploaded_file = st.file_uploader(
         "Upload an image, audio, or video file (optional)",
@@ -1231,7 +1239,25 @@ def gemini_chat_tab():
         key="gemini_chat_uploader"
     )
 
-    if uploaded_file:
+    # --- Handle Inputs ---
+    # We prioritize the last provided input: microphone audio takes precedence over file upload.
+    input_file_for_gemini = None
+    # A flag to indicate if we should trigger the API call automatically for audio.
+    trigger_from_audio = False
+    prompt_for_api = ""
+
+    if audio_data and audio_data['bytes']:
+        st.info("🎤 Voice recording is ready to be sent with your next message.")
+        st.audio(audio_data['bytes'])
+        # Wrap the recorded audio bytes in our file-like object for the API helper
+        input_file_for_gemini = SimulatedUploadFile(name="voice_recording.wav", content=audio_data['bytes'])
+        input_file_for_gemini.type = "audio/wav" # Set the mime type
+
+        # Set the flag to trigger the API call and provide a default prompt for the model.
+        trigger_from_audio = True
+        prompt_for_api = "Analyze the provided audio and respond to the query within it."
+
+    elif uploaded_file:
         file_type = uploaded_file.type.split('/')[0]
         st.info(f"File '{uploaded_file.name}' is ready to be sent with your next message.")
         if file_type == "image":
@@ -1240,6 +1266,7 @@ def gemini_chat_tab():
             st.audio(uploaded_file)
         elif file_type == "video":
             st.video(uploaded_file)
+        input_file_for_gemini = uploaded_file
 
     # Display chat messages from history
     for message in st.session_state.gemini_messages:
@@ -1247,24 +1274,30 @@ def gemini_chat_tab():
             st.markdown(message["content"])
 
     # React to user input
-    if prompt := st.chat_input("What would you like to ask Gemini?"):
+    if text_prompt := st.chat_input("What would you like to ask Gemini?"):
+        # If the user types a message, it takes precedence.
+        trigger_from_audio = False
+        prompt_for_api = text_prompt
+
+    # Trigger the API call if either a text prompt was entered or an audio recording was made.
+    if prompt_for_api:
         # Add user message to chat history
-        st.session_state.gemini_messages.append({"role": "user", "content": prompt})
+        st.session_state.gemini_messages.append({"role": "user", "content": prompt_for_api})
         # Display user message in chat message container
         with st.chat_message("user"):
-            st.markdown(prompt)
+            st.markdown(prompt_for_api)
 
         # Display assistant response in chat message container
         with st.chat_message("assistant"):
             message_placeholder = st.empty()
             full_response = ""
-            with st.spinner("Gemini is thinking..."):
+            with st.spinner("Gemini is thinking..." if not trigger_from_audio else "Processing audio..."):
                 try:
                     # Use the existing gemini_helper for the API call
                     response_text = gemini_helper.generate_gemini_chat_response(
                         model_name=model_name,
-                        prompt=prompt,
-                        uploaded_file=uploaded_file,
+                        prompt=prompt_for_api,
+                        uploaded_file=input_file_for_gemini, # Pass the selected input
                         system_instructions=system_instructions,
                         temperature=temperature,
                         enable_grounding=enable_grounding
