@@ -133,7 +133,7 @@ GEMINI_API_KEY=your-gemini-api-key-from-ai-studio
 DB_ID="your-firestore-db-id"
 ```
 
-Cloud Build needs access to the .env file. Open the .gitignore file and comment out the line .env by adding a # in front of it: #.env.
+Cloud Build needs access to the .env file. Open the `.gitignore` file and comment out the line `.env` by adding a `#` in front of it: `#.env`.
 
 #### 3.2 Deploy to Cloud Run
 From the root of the project directory, run the following command. Remember to replace the placeholder values.
@@ -150,7 +150,7 @@ gcloud beta run deploy <service-name> \
   --project <your-gcp-project-id>
 ```
 
-When prompted Allow unauthenticated invocations...?, enter n to keep the service private and secure.
+When prompted `Allow unauthenticated invocations...?` , enter `N` to keep the service private and secure.
 
 ## Part 4: Finalizing Access Control
 
