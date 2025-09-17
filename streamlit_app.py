@@ -1201,17 +1201,7 @@ def audio_tab():
 
 def gemini_chat_tab():
     """A tab for multimodal chat with Gemini."""
-    header_col, button_col = st.columns([4, 1])
-    with header_col:
-        st.header("Chat with Gemini")
-    with button_col:
-        if st.button("🗑️ Clear Chat", key="clear_gemini_chat", help="Clear chat history and remove uploaded files."):
-            # Clear the chat message history
-            st.session_state.gemini_messages = []
-            # Increment the counter to force a re-render of the file_uploader with a new key
-            st.session_state.gemini_uploader_key_counter += 1
-            # Rerun the app to reflect the changes immediately
-            st.rerun()
+    st.header("Chat with Gemini")
 
     # Model selection
     model_name = st.selectbox(
@@ -1292,6 +1282,19 @@ def gemini_chat_tab():
     for message in st.session_state.gemini_messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
+
+    # --- Clear Chat Button ---
+    # Place the button at the bottom, just above the chat input.
+    # Use columns to align the button to the right for a cleaner look.
+    _, button_col = st.columns([4, 1])
+    with button_col:
+        if st.button("🗑️ Clear Chat", key="clear_gemini_chat_bottom", help="Clear chat history and remove uploaded files."):
+            # Clear the chat message history
+            st.session_state.gemini_messages = []
+            # Increment the counter to force a re-render of the file_uploader with a new key
+            st.session_state.gemini_uploader_key_counter += 1
+            # Rerun the app to reflect the changes immediately
+            st.rerun()
 
     # React to user input
     if text_prompt := st.chat_input("What would you like to ask Gemini?"):
