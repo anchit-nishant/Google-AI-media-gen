@@ -895,18 +895,13 @@ def main():
         """Verifies a provided password against a stored hash."""
         return stored_hash == hash_password(provided_password)
 
-    # --- Persistent Login Check ---
-    # Check if a token exists in the session state
-    if 'token' not in st.session_state:
-        st.session_state.token = None
-
     # If we have a token, but no user_id, the user is returning to the session
     # We need to fetch their info
-    if st.session_state.token and 'user_id' not in st.session_state:
-        user_info = get_google_user_info(st.session_state.token)
+    if 'token' in st.session_state and st.session_state.token and 'user_id' not in st.session_state:
+        user_info = get_google_user_info(st.session_state['token'])
         if user_info:
-            st.session_state.user_id = user_info.get("email")
-            st.session_state.user_name = user_info.get("name")
+            st.session_state['user_id'] = user_info.get("email")
+            st.session_state['user_name'] = user_info.get("name")
         else:
             # If token is invalid, clear it
             st.session_state.token = None
@@ -1090,9 +1085,6 @@ def main():
         st.markdown(f"👤 **Logged in as:** {st.session_state.user_id}")
     with logout_col:
         if st.button("🚪 Logout", key="logout_button"):
-            if st.session_state.token:
-                # This part is optional but good practice; it revokes the token on Google's side.
-                oauth2.revoke_token(st.session_state.token)
             st.session_state.clear()
             st.query_params.clear() # Remove user from query params on logout
             st.rerun()
@@ -1209,7 +1201,7 @@ def gemini_chat_tab():
     # Model selection
     model_name = st.selectbox(
         "Select Gemini Model",
-        options=["gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash-001", "gemini-2.0-flash-lite-001", "gemini-1.5-pro-002"],
+        options=["gemini-2.5-pro", "gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-2.0-flash-001", "gemini-2.0-flash-lite-001", "gemini-1.5-pro-002"],
         key="gemini_chat_model",
         help="Choose the Gemini model to chat with. 'Flash' is faster, 'Pro' is more capable."
     )
@@ -1297,8 +1289,8 @@ def gemini_chat_tab():
         # Add user message to chat history
         st.session_state.gemini_messages.append({"role": "user", "content": prompt_for_api})
         # Display user message in chat message container
-        with st.chat_message("user"):
-            st.markdown(prompt_for_api)
+        # with st.chat_message("user"):
+            # st.markdown(prompt_for_api)
 
         # Display assistant response in chat message container
         with st.chat_message("assistant"):
@@ -1341,7 +1333,7 @@ def text_to_image_tab():
         model = st.selectbox(
             "Model",
             # Using placeholder names as requested. User can change if needed.
-            options=["imagen-3.0-generate-002","imagen-3.0-fast-generate-001","imagen-4.0-generate-001", "imagen-4.0-ultra-generate-001", "imagen-4.0-fast-generate-001" ],
+            options=["imagen-4.0-generate-001", "imagen-4.0-ultra-generate-001", "imagen-4.0-fast-generate-001", "imagen-3.0-generate-002","imagen-3.0-fast-generate-001"],
             index=0,
             help="Choose the Imagen model for generation.",
             key="t2i_model"
@@ -1532,7 +1524,7 @@ def text_to_video_tab():
 
     model = st.selectbox(
         "Model",
-        options=["veo-2.0-generate-001", "veo-3.0-generate-preview", "veo-3.0-fast-generate-preview", "veo-3.0-fast-generate-001", "veo-3.0-generate-001"],  # Assuming these are the model IDs
+        options=["veo-3.0-generate-preview", "veo-3.0-fast-generate-preview", "veo-3.0-fast-generate-001", "veo-3.0-generate-001", "veo-2.0-generate-001"],  # Assuming these are the model IDs
         index=0,  # Default to Veo 2
         help="Choose the video generation model (Veo 2 or Veo 3)",
         key="text_model"
@@ -2610,7 +2602,7 @@ def image_to_video_tab():
         # Model selection
         model = st.selectbox(
             "Model",
-            options=["veo-2.0-generate-001", "veo-3.0-generate-preview", "veo-3.0-fast-generate-001"],  # Assuming these are the model IDs
+            options=["veo-3.0-generate-preview", "veo-3.0-fast-generate-001", "veo-2.0-generate-001"],  # Assuming these are the model IDs
             index=0,  # Default to Veo 2
             help="Choose the video generation model (Veo 2 or Veo 3)",
             key="image_model"
