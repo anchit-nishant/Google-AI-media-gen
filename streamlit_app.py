@@ -773,6 +773,11 @@ def init_state():
         logger.debug("Initializing 'gemini_messages' for chat history")
         st.session_state.gemini_messages = []
 
+    # State for resetting the Gemini chat file uploader
+    if "gemini_uploader_key_counter" not in st.session_state:
+        logger.debug("Initializing 'gemini_uploader_key_counter' in session state")
+        st.session_state.gemini_uploader_key_counter = 0
+
     logger.end_section()
 
 def _setup_page():
@@ -1196,7 +1201,17 @@ def audio_tab():
 
 def gemini_chat_tab():
     """A tab for multimodal chat with Gemini."""
-    st.header("Chat with Gemini")
+    header_col, button_col = st.columns([4, 1])
+    with header_col:
+        st.header("Chat with Gemini")
+    with button_col:
+        if st.button("🗑️ Clear Chat", key="clear_gemini_chat", help="Clear chat history and remove uploaded files."):
+            # Clear the chat message history
+            st.session_state.gemini_messages = []
+            # Increment the counter to force a re-render of the file_uploader with a new key
+            st.session_state.gemini_uploader_key_counter += 1
+            # Rerun the app to reflect the changes immediately
+            st.rerun()
 
     # Model selection
     model_name = st.selectbox(
@@ -1241,7 +1256,7 @@ def gemini_chat_tab():
     uploaded_file = st.file_uploader(
         "Upload an image, audio, or video file (optional)",
         type=["jpg", "jpeg", "png", "webp", "mp3", "wav", "mp4", "mov", "avi", "mkv", "txt", "pdf"],
-        key="gemini_chat_uploader"
+        key=f"gemini_chat_uploader_{st.session_state.gemini_uploader_key_counter}"
     )
 
     # --- Handle Inputs ---
