@@ -1281,7 +1281,11 @@ def gemini_chat_tab():
     # Display chat messages from history
     for message in st.session_state.gemini_messages:
         with st.chat_message(message["role"]):
-            st.markdown(message["content"])
+            st.markdown(message["content"]["text"])
+            if message["content"].get("citations"):
+                with st.expander("View Citations"):
+                    for i, citation in enumerate(message["content"]["citations"], 1):
+                        st.markdown(f"**[{i}] [{citation['title']}]({citation['uri']})**")
 
     # --- Clear Chat Button ---
     # Place the button at the bottom, just above the chat input.
@@ -1305,7 +1309,10 @@ def gemini_chat_tab():
     # Trigger the API call if either a text prompt was entered or an audio recording was made.
     if prompt_for_api:
         # Add user message to chat history
-        st.session_state.gemini_messages.append({"role": "user", "content": prompt_for_api})
+        st.session_state.gemini_messages.append({
+            "role": "user",
+            "content": {"text": prompt_for_api, "citations": []}
+        })
         # Display user message in chat message container
         # with st.chat_message("user"):
             # st.markdown(prompt_for_api)
@@ -1313,11 +1320,14 @@ def gemini_chat_tab():
         # Display assistant response in chat message container
         with st.chat_message("assistant"):
             message_placeholder = st.empty()
-            full_response = ""
+            citations_placeholder = st.empty()
+            response_content = {"text": "", "citations": []}
+
             with st.spinner("Gemini is thinking..." if not trigger_from_audio else "Processing audio..."):
                 try:
                     # Use the existing gemini_helper for the API call
-                    response_text = gemini_helper.generate_gemini_chat_response(
+                    # This function is assumed to return a dict: {'text': str, 'citations': list}
+                    response_dict = gemini_helper.generate_gemini_chat_response(
                         model_name=model_name,
                         prompt=prompt_for_api,
                         uploaded_file=input_file_for_gemini, # Pass the selected input
@@ -1325,14 +1335,30 @@ def gemini_chat_tab():
                         temperature=temperature,
                         enable_grounding=enable_grounding
                     )
-                    full_response = response_text
-                except Exception as e:
-                    full_response = f"An error occurred: {e}"
-                    st.error(full_response)
+                    # Handle both dict (with citations) and str (without) responses
+                    if isinstance(response_dict, dict):
+                        response_content["text"] = response_dict.get("text", "No response text found.")
+                        response_content["citations"] = response_dict.get("citations", [])
+                    else:
+                        # Handle the case where a simple string is returned
+                        response_content["text"] = response_dict
+                        response_content["citations"] = []
 
-            message_placeholder.markdown(full_response)
+                except Exception as e:
+                    response_content["text"] = f"An error occurred: {e}"
+                    st.error(response_content["text"])
+
+            # Display the main response text
+            message_placeholder.markdown(response_content["text"])
+
+            # Display citations if they exist
+            if response_content["citations"]:
+                with citations_placeholder.expander("View Citations"):
+                    for i, citation in enumerate(response_content["citations"], 1):
+                        st.markdown(f"**[{i}] [{citation['title']}]({citation['uri']})**")
+
         # Add assistant response to chat history
-        st.session_state.gemini_messages.append({"role": "assistant", "content": full_response})
+        st.session_state.gemini_messages.append({"role": "assistant", "content": response_content})
 
 def text_to_image_tab():
     """Text-to-Image generation tab."""

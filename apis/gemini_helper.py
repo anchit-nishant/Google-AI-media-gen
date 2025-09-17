@@ -176,6 +176,7 @@ def generate_gemini_chat_response(model_name, prompt, uploaded_file=None, system
         else: 
             tools =  []
         
+        print(f"DEBUG: Tools being passed to Gemini API: {tools}")
 
 
         # Configure safety settings
@@ -199,16 +200,31 @@ def generate_gemini_chat_response(model_name, prompt, uploaded_file=None, system
         # Generate content
         print("Sending request to Gemini API...")
         # Use the streaming version to get results incrementally
-        response_stream = client.models.generate_content_stream(
+        response = client.models.generate_content(
             model=model_name,
             contents=contents,
             config=generation_config,
         )
 
-        # Combine the chunks from the stream into a single response
-        full_response = "".join(chunk.text for chunk in response_stream)
-        print(f"✅ Received full response from Gemini: \"{full_response[:100]}...\"")
-        return full_response.strip()
+        # Print the full API response to the terminal for inspection
+        print("--- Full Gemini API Response ---")
+        print(response)
+        print("--------------------------------")
+
+        # Process the response to extract text and citations
+        response_text = response.text
+        citations = []
+        # The grounding metadata is located within the first candidate of the response.
+        if response.candidates and hasattr(response.candidates[0], 'grounding_metadata') and response.candidates[0].grounding_metadata:
+            citations = [
+                {"title": chunk.web.title, "uri": chunk.web.uri}
+                for chunk in response.candidates[0].grounding_metadata.grounding_chunks
+                if hasattr(chunk, 'web') and hasattr(chunk.web, 'title') and hasattr(chunk.web, 'uri')
+            ]
+
+        print(f"✅ Extracted text: \"{response_text[:100]}...\"")
+        print(f"✅ Extracted {len(citations)} citations.")
+        return {"text": response_text.strip(), "citations": citations}
 
     except Exception as e:
         error_msg = f"Failed to generate chat response: {str(e)}"
