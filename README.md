@@ -68,7 +68,7 @@ This application provides a streamlined interface for generating different types
    ```
    This will automatically log you in as a default development user and take you directly to the main application interface.
    > **Note:** The double-dash (`--`) is required to separate Streamlit's arguments from your script's arguments.
-
+   
 2. The app will open in your browser (typically at http://localhost:8501)
 
 3. Navigate between tabs for different features:

@@ -193,56 +193,6 @@ st.markdown("""
         max-width: 100%;
     }
     
-    /* Hide default Streamlit elements */
-    header {
-        visibility: hidden !important;
-        height: 0 !important;
-        padding: 0 !important;
-        margin: 0 !important;
-        display: none !important;
-    }
-    
-    /* Remove default margins */
-    .st-emotion-cache-1wmy9hl e1f1d6gn0,
-    .st-emotion-cache-7ym5gk,
-    .st-emotion-cache-16txtl3,
-    .st-emotion-cache-uf99v8 {
-        margin-top: 0 !important;
-        padding-top: 0 !important;
-        display: none !important;
-    }
-    
-    /* Hide top decoration bar */
-    div[data-testid="stDecoration"],
-    div[data-testid="stToolbar"] {
-        display: none !important;
-        height: 0 !important;
-        padding: 0 !important;
-        margin: 0 !important; 
-        visibility: hidden !important;
-    }
-    
-    /* Override any internal padding */
-    .st-emotion-cache-z5fcl4 {
-        padding-top: 0 !important;
-    }
-    
-    /* Fix top whitespace */
-    div.appview-container {
-        margin-top: 0 !important;
-        padding-top: 0 !important;
-    }
-    
-    .main .element-container:first-of-type {
-        margin-top: 0 !important;
-        padding-top: 0 !important;
-    }
-    
-    /* Target the main app container to remove top padding */
-    .appview-container .main .block-container {
-        padding-top: 0rem !important;
-    }
-
     /* Remove empty input bars */
     .stTextInput, .stNumberInput {
         margin-bottom: 0 !important;
@@ -355,47 +305,10 @@ st.markdown("""
         border-radius: 5px;
     }
     
-    /* Sidebar styling */
-    .css-1d391kg {
-        padding-top: 2rem;
-    }
-    
     .sidebar .sidebar-content {
         background-color: #f8f9fa;
     }
     
-     /* --- Start: Sidebar Collapse Arrow Fix --- */
-     /* Make collapsed sidebar wider to accommodate the arrow */
-     section[data-testid="stSidebar"][aria-collapsed="true"] {
-         width: 50px !important;
-         min-width: 50px !important;
-     }
-
-     /* Adjust button position and styling */
-     section[data-testid="stSidebar"][aria-collapsed="true"] button[data-testid="stSidebarCollapseButton"] {
-         transform: rotate(180deg); /* Flip the arrow */
-         position: absolute;
-         top: 50%; /* Center vertically */
-         left: 0;
-         margin-top: -1.5rem; /* Adjust for button height */
-         width: 100%;
-         height: 3rem;
-         border-radius: 0;
-         border: none;
-         background-color: #f0f2f6; /* Light mode background */
-     }
-
-     /* Hover effect for the button */
-     section[data-testid="stSidebar"][aria-collapsed="true"] button[data-testid="stSidebarCollapseButton"]:hover {
-         background-color: #e6e6e6;
-     }
-
-     /* Hide content in collapsed sidebar for clarity */
-     section[data-testid="stSidebar"][aria-collapsed="true"] [data-testid="stSidebarUserContent"] {
-         display: none;
-     }
-     /* --- End: Sidebar Collapse Arrow Fix --- */
-
     .upload-container {
         border: 2px dashed #aaaaaa;
         border-radius: 8px;
@@ -762,6 +675,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+
 # App state initialization
 def init_state():
     """Initialize all session state variables."""
@@ -950,22 +864,18 @@ def get_google_user_info(token_dict: Dict[str, Any]) -> Optional[Dict[str, Any]]
         return response.json()
     return None
 
-
 def main():
     """Main function to run the Streamlit app."""
     logger.start_section("App Initialization")
     
-    # Initialize session state
-    init_state()
-
+    init_state() # Initialize session state
     # --- Bypass Authentication for Local Development ---
     # Check for a command-line flag to bypass authentication.
     if '--no-auth' in sys.argv:
-        if 'user_id' not in st.session_state:
+        if "user_id" not in st.session_state:
             # If the flag is present and no user is logged in, set a default user.
             st.session_state.user_id = "local_dev_user@example.com"
             st.session_state.user_name = "Local Dev User"
-            logger.warning("Authentication bypassed with --no-auth flag. Logged in as default local user.")
 
     # --- OAuth2 Configuration ---
     oauth2 = OAuth2Component(
@@ -1004,7 +914,7 @@ def main():
     # --- Authentication Gate ---
     if 'user_id' not in st.session_state:
         st.set_page_config(page_title="Login - Media Gen Tool")
-        st.title("🎬 Welcome to the AI Media Generator")
+        st.title("🎬 Welcome to the Google AI Media Generator")
         st.subheader("Please sign in to continue")
 
         result = oauth2.authorize_button(
@@ -1170,7 +1080,7 @@ def main():
     # Main content area with tabs - simple approach without extra complexity
     title_col, toggle_col = st.columns([5, 1])
     with title_col:
-        st.title("AI Media Generator")
+        st.title("📽️ Google AI Media Generator")
     with toggle_col:
         st.toggle("🌙 Dark Mode", key="dark_mode", help="Toggle between light and dark themes.")
     
@@ -4677,5 +4587,4 @@ if __name__ == "__main__":
     logger = Logger(debug=config.DEBUG_MODE)
     logger.info("Starting Veo2 Video Generator app")
     
-    # Run the app
-    main() 
+    main()
