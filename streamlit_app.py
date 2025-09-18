@@ -778,6 +778,11 @@ def init_state():
         logger.debug("Initializing 'gemini_uploader_key_counter' in session state")
         st.session_state.gemini_uploader_key_counter = 0
 
+    # Flag to ensure pending operations are checked only once per session
+    if 'pending_ops_checked' not in st.session_state:
+        logger.debug("Initializing 'pending_ops_checked' flag in session state")
+        st.session_state.pending_ops_checked = False
+
     logger.end_section()
 
 def _setup_page():
@@ -869,6 +874,125 @@ def get_google_user_info(token_dict: Dict[str, Any]) -> Optional[Dict[str, Any]]
         return response.json()
     return None
 
+def add_pending_operation_to_firestore(operation_id, operation_type, params, model_id, direct_response=None):
+    """Saves a new pending operation to Firestore."""
+    if not FIRESTORE_AVAILABLE:
+        logger.warning("Firestore not available. Cannot save pending operation.")
+        return
+
+    try:
+        doc_ref = db.collection('pending_operations').document()
+        operation_data = {
+            'user_id': st.session_state.user_id,
+            'operation_id': operation_id,
+            'operation_type': operation_type,
+            'model_id': model_id,
+            'params': params,
+            'timestamp': firestore.SERVER_TIMESTAMP
+        }
+        # For synchronous operations like Imagen, store the response directly
+        if direct_response:
+            operation_data['direct_response'] = direct_response
+
+        doc_ref.set(operation_data)
+        logger.info(f"Saved pending {operation_type} operation to Firestore (ID: {doc_ref.id}).")
+    except Exception as e:
+        logger.error(f"Failed to save pending operation to Firestore: {e}")
+
+def check_and_process_pending_operations(user_id):
+    """Checks Firestore for pending operations and processes them."""
+    if not FIRESTORE_AVAILABLE:
+        return
+
+    try:
+        pending_ref = db.collection('pending_operations').where('user_id', '==', user_id).stream()
+        pending_ops = list(pending_ref)
+
+        if not pending_ops:
+            return
+
+        st.info(f"Found {len(pending_ops)} pending generation(s) from a previous session. Checking status...")
+
+        for op_doc in pending_ops:
+            op_data = op_doc.to_dict()
+            op_id = op_data.get('operation_id')
+            op_type = op_data.get('operation_type')
+            model_id = op_data.get('model_id')
+            params = op_data.get('params', {})
+            prompt = params.get('prompt', 'N/A')
+            doc_id = op_doc.id
+
+            with st.spinner(f"Processing pending {op_type} operation..."):
+                # Handle synchronous operations (like Imagen) that have a direct response
+                if 'direct_response' in op_data:
+                    result = op_data['direct_response']
+                    is_done = True
+                # Handle asynchronous long-running operations
+                elif op_id and model_id:
+                    client.model_id = model_id # Ensure client is using the correct model for polling
+                    result = client.poll_operation(op_id)
+                    is_done = result.get("done", False)
+                else:
+                    logger.warning(f"Skipping invalid pending operation document: {doc_id}")
+                    continue
+
+                if is_done:
+                    logger.success(f"Pending operation {op_id or doc_id} is complete.")
+                    # Extract URI(s) based on operation type
+                    if op_type == 'video':
+                        uris = client.extract_video_uris(result)
+                    elif op_type in ['image', 'image_edit']:
+                        uris = client.extract_image_uris(result)
+                        if not uris: # Fallback for base64 encoded images
+                            image_data_list = client.extract_image_data(result)
+                            uris = []
+                            for image_data in image_data_list:
+                                img = Image.open(io.BytesIO(image_data))
+                                uri = history_manager.upload_image_to_history(img, f"recovered_{uuid.uuid4().hex}.png")
+                                uris.append(uri)
+                    elif op_type == 'audio':
+                        # For synchronous audio, the 'direct_response' will be set upon completion.
+                        # If we are here, it means the process was interrupted before the direct_response
+                        # could be saved. For now, we assume it failed and will remove the pending op.
+                        # A more advanced implementation could check GCS for the expected output file.
+                        uris = result.get('uris', [])
+                    elif op_type == 'audio':
+                        uris = result.get('uris', [])
+                    elif op_type == 'voice':
+                        # For voice, we get file paths and need to re-upload them
+                        file_paths = result.get('file_paths', [])
+                        uris = gemini_TTS_api.upload_audio_to_gcs(file_paths, f"{config.STORAGE_URI.rstrip('/')}/voiceovers/")
+                    else:
+                        uris = []
+
+                    # Add to history and delete pending doc
+                    if uris:
+                        for uri in uris:
+                            db.collection('history').add({
+                                'user_id': user_id,
+                                'timestamp': firestore.SERVER_TIMESTAMP,
+                                'type': op_type, # Use the dynamic operation type
+                                'uri': uri,
+                                'prompt': prompt,
+                                'params': params
+                            })
+                        st.success(f"✅ Recovered {len(uris)} generated asset(s) and added to your history.")
+                    db.collection('pending_operations').document(doc_id).delete()
+                    logger.info(f"Processed and removed pending operation: {doc_id}")
+                elif 'direct_response' not in op_data:
+                    # If the operation is not done and has no direct response, it's a genuinely pending LRO
+                    # or a synchronous one that was interrupted. We can leave it for the next check.
+                    logger.info(f"Pending operation {op_id or doc_id} is still in progress.")
+                else:
+                    # This case handles a synchronous operation that was logged but never completed.
+                    # We can safely remove it.
+                    logger.warning(f"Removing stale synchronous pending operation: {doc_id}")
+                    db.collection('pending_operations').document(doc_id).delete()
+
+    except Exception as e:
+        logger.error(f"Error processing pending operations: {e}")
+        st.error("An error occurred while checking for pending generations.")
+
 def main():
     """Main function to run the Streamlit app."""
     logger.start_section("App Initialization")
@@ -899,6 +1023,12 @@ def main():
     def verify_password(stored_hash, provided_password):
         """Verifies a provided password against a stored hash."""
         return stored_hash == hash_password(provided_password)
+
+    # --- Check for and process any pending operations from previous sessions ---
+    # This runs only once per session after the user is logged in.
+    if 'user_id' in st.session_state and not st.session_state.get('pending_ops_checked', False):
+        check_and_process_pending_operations(st.session_state.user_id)
+        st.session_state.pending_ops_checked = True # Set flag to prevent re-checking
 
     # If we have a token, but no user_id, the user is returning to the session
     # We need to fetch their info
@@ -3611,6 +3741,7 @@ def generate_video(
             operation_id = operation_name.split("/")[-1]
             st.info(f"✅ Operation started: {operation_id}")
             
+            add_pending_operation_to_firestore(operation_id, "video", params, model)
             # Wait for completion if requested
             if wait_for_completion:
                 progress_bar = st.progress(0)
@@ -3756,6 +3887,7 @@ def generate_image(
                 enhance_prompt=enhance_prompt
             )
 
+            add_pending_operation_to_firestore(None, "image", {"prompt": prompt, "model": model}, model, response)
             if "error" in response:
                 error_msg = response.get("error", {}).get("message", "Unknown error")
                 st.error(f"⚠️ Image generation failed: {error_msg}")
@@ -3858,12 +3990,21 @@ def edit_image(
                 # Note: 'seed' and other unused parameters are ignored by the new function
             )
 
+            # Create a unique ID for this synchronous operation to track it
+            operation_id = f"image_edit-{uuid.uuid4().hex}"
+            # Add to pending operations BEFORE the API call
+            add_pending_operation_to_firestore(
+                operation_id=operation_id,
+                operation_type='image_edit',
+                params={"prompt": prompt, "model": model},
+                model_id=model
+            )
+
             if "error" in response:
                 error_msg = response.get("error", {}).get("message", "Unknown error")
                 st.error(f"⚠️ Image editing failed: {error_msg}")
-                st.json(response)
-                return
-
+            else:
+                update_pending_operation_with_result(operation_id, response)
             # Try to get URIs first, as this is the expected response when storage_uri is provided
             image_uris = client.extract_image_uris(response)
             image_data_list = []
@@ -4265,6 +4406,17 @@ def generate_audio(
                 "negativePrompt": negative_prompt if negative_prompt else "",
                 "seed": seed if seed else "random",
             }
+
+            # Create a unique ID for this synchronous operation to track it
+            operation_id = f"audio-{uuid.uuid4().hex}"
+
+            # Add to pending operations BEFORE the API call
+            add_pending_operation_to_firestore(
+                operation_id=operation_id,
+                operation_type='audio',
+                params=params,
+                model_id='lyria-002', # Hardcoded model for Lyria
+            )
 
             # Make the API call
             response = client.generate_audio(

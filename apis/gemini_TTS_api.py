@@ -191,17 +191,21 @@ def upload_audio_to_gcs(file_paths, storage_uri):
     bucket = client.bucket(bucket_name)
     uploaded_uris = []
 
-    
-    if not os.path.exists(file_paths):
-        print(f"Error: File not found: {file_paths}")
-        
-    blob = bucket.blob(f"{folder_path}{os.path.basename(file_paths)}")
-    blob.upload_from_filename(file_paths)
-    uploaded_uris.append(f"gs://{bucket_name}/{blob.name}")
-    print(f"Uploaded {file_paths} to {uploaded_uris[-1]}")
+    # Ensure file_paths is a list
+    if isinstance(file_paths, str):
+        file_paths = [file_paths]
+
+    for file_path in file_paths:
+        if not os.path.exists(file_path):
+            print(f"Error: File not found: {file_path}")
+            continue
+            
+        blob = bucket.blob(f"{folder_path}{os.path.basename(file_path)}")
+        blob.upload_from_filename(file_path)
+        uploaded_uris.append(f"gs://{bucket_name}/{blob.name}")
+        print(f"Uploaded {file_path} to {uploaded_uris[-1]}")
 
     return uploaded_uris
-
     
 if __name__ == "__main__":
     #Example usage of the modified function
