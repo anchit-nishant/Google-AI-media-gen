@@ -11,6 +11,7 @@ import tempfile
 import io
 import queue
 import sys
+import hashlib
 import pandas as pd
 import subprocess
 from datetime import datetime
@@ -24,7 +25,9 @@ from firebase_admin import credentials, firestore
 from collections import OrderedDict
 from typing import Dict, List, Optional, Union, Any
 import shutil
+from streamlit_oauth import OAuth2Component
 from werkzeug.utils import secure_filename
+from streamlit_mic_recorder import mic_recorder
 
 
 # Import project modules
@@ -180,19 +183,6 @@ logger.info(f"Python version: {sys.version}")
 logger.info(f"Working directory: {os.getcwd()}")
 logger.end_section()
 
-# Initialize dark_mode state at the top level of the script.
-# This ensures it's set only once per session and persists across all reruns.
-if "dark_mode" not in st.session_state:
-    st.session_state.dark_mode = False
-
-# Configure the Streamlit page
-st.set_page_config(
-    page_title="Google Media Gen Tool",
-    page_icon="🎬",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
-
 # Custom CSS to improve app appearance
 st.markdown("""
 <style>
@@ -201,51 +191,6 @@ st.markdown("""
         padding-top: 0 !important;
         padding-bottom: 2rem;
         max-width: 100%;
-    }
-    
-    /* Hide default Streamlit elements */
-    header {
-        visibility: hidden !important;
-        height: 0 !important;
-        padding: 0 !important;
-        margin: 0 !important;
-        display: none !important;
-    }
-    
-    /* Remove default margins */
-    .st-emotion-cache-1wmy9hl e1f1d6gn0,
-    .st-emotion-cache-7ym5gk,
-    .st-emotion-cache-16txtl3,
-    .st-emotion-cache-uf99v8 {
-        margin-top: 0 !important;
-        padding-top: 0 !important;
-        display: none !important;
-    }
-    
-    /* Hide top decoration bar */
-    div[data-testid="stDecoration"],
-    div[data-testid="stToolbar"] {
-        display: none !important;
-        height: 0 !important;
-        padding: 0 !important;
-        margin: 0 !important; 
-        visibility: hidden !important;
-    }
-    
-    /* Override any internal padding */
-    .st-emotion-cache-z5fcl4 {
-        padding-top: 0 !important;
-    }
-    
-    /* Fix top whitespace */
-    div.appview-container {
-        margin-top: 0 !important;
-        padding-top: 0 !important;
-    }
-    
-    .main .element-container:first-of-type {
-        margin-top: 0 !important;
-        padding-top: 0 !important;
     }
     
     /* Remove empty input bars */
@@ -360,47 +305,10 @@ st.markdown("""
         border-radius: 5px;
     }
     
-    /* Sidebar styling */
-    .css-1d391kg {
-        padding-top: 2rem;
-    }
-    
     .sidebar .sidebar-content {
         background-color: #f8f9fa;
     }
     
-     /* --- Start: Sidebar Collapse Arrow Fix --- */
-     /* Make collapsed sidebar wider to accommodate the arrow */
-     section[data-testid="stSidebar"][aria-collapsed="true"] {
-         width: 50px !important;
-         min-width: 50px !important;
-     }
-
-     /* Adjust button position and styling */
-     section[data-testid="stSidebar"][aria-collapsed="true"] button[data-testid="stSidebarCollapseButton"] {
-         transform: rotate(180deg); /* Flip the arrow */
-         position: absolute;
-         top: 50%; /* Center vertically */
-         left: 0;
-         margin-top: -1.5rem; /* Adjust for button height */
-         width: 100%;
-         height: 3rem;
-         border-radius: 0;
-         border: none;
-         background-color: #f0f2f6; /* Light mode background */
-     }
-
-     /* Hover effect for the button */
-     section[data-testid="stSidebar"][aria-collapsed="true"] button[data-testid="stSidebarCollapseButton"]:hover {
-         background-color: #e6e6e6;
-     }
-
-     /* Hide content in collapsed sidebar for clarity */
-     section[data-testid="stSidebar"][aria-collapsed="true"] [data-testid="stSidebarUserContent"] {
-         display: none;
-     }
-     /* --- End: Sidebar Collapse Arrow Fix --- */
-
     .upload-container {
         border: 2px dashed #aaaaaa;
         border-radius: 8px;
@@ -767,6 +675,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+
 # App state initialization
 def init_state():
     """Initialize all session state variables."""
@@ -836,11 +745,17 @@ def init_state():
     # Initialize state for the main navigation tabs
     if "active_main_tab" not in st.session_state:
         logger.debug("Initializing 'active_main_tab' in session state")
-        st.session_state.active_main_tab = "🎬 Text-to-Video"
+        st.session_state.active_main_tab = "🎬 Video"
 
     # State for files passed from history to editing tabs
     if 'edit_image_files' not in st.session_state:
         st.session_state.edit_image_files = []
+    if 'active_video_sub_tab' not in st.session_state:
+        st.session_state.active_video_sub_tab = "Text-to-Video"
+    if 'active_image_sub_tab' not in st.session_state:
+        st.session_state.active_image_sub_tab = "Text-to-Image"
+    if 'active_audio_sub_tab' not in st.session_state:
+        st.session_state.active_audio_sub_tab = "Text-to-Audio"
     if 'speed_change_video_file' not in st.session_state:
         st.session_state.speed_change_video_file = None
     if 'concat_video_files' not in st.session_state:
@@ -853,22 +768,43 @@ def init_state():
     if 'next_active_main_tab' not in st.session_state:
         st.session_state.next_active_main_tab = None
 
+    # State for the new Gemini Chat tab
+    if "gemini_messages" not in st.session_state:
+        logger.debug("Initializing 'gemini_messages' for chat history")
+        st.session_state.gemini_messages = []
+
+    # State for resetting the Gemini chat file uploader
+    if "gemini_uploader_key_counter" not in st.session_state:
+        logger.debug("Initializing 'gemini_uploader_key_counter' in session state")
+        st.session_state.gemini_uploader_key_counter = 0
+
+    # Flag to ensure pending operations are checked only once per session
+    if 'pending_ops_checked' not in st.session_state:
+        logger.debug("Initializing 'pending_ops_checked' flag in session state")
+        st.session_state.pending_ops_checked = False
+
     logger.end_section()
 
-def main():
-    """Main function to run the Streamlit app."""
-    logger.start_section("App Initialization")
-    
-    # Initialize session state
-    init_state()
-    
-    # Handle programmatic tab switching. This must be at the top.
-    if st.session_state.get("next_active_main_tab"):
-        st.session_state.active_main_tab = st.session_state.next_active_main_tab
-        st.session_state.next_active_main_tab = None
-        st.rerun()
+def _setup_page():
+    """
+    Configures the Streamlit page, applies the theme, and handles programmatic tab switching.
+    This function should be called at the very beginning of the main app script execution.
+    """
+    # Initialize dark_mode state if it doesn't exist. This ensures it's set only
+    # once per session and persists across all reruns.
+    if "dark_mode" not in st.session_state:
+        st.session_state.dark_mode = False
 
-    # --- Dark Mode CSS ---
+    # Configure the Streamlit page. This must be the first Streamlit command.
+    # The 'theme' argument is removed for compatibility with older Streamlit versions.
+    st.set_page_config(
+        page_title="Google Media Gen Tool",
+        page_icon="🎬",
+        layout="wide",
+        initial_sidebar_state="expanded"
+    )
+
+    # --- Dark Mode CSS Injection ---
     # This CSS is conditionally applied to style components that Streamlit's
     # native dark mode doesn't cover fully, like expanders.
     DARK_MODE_CSS = """
@@ -905,10 +841,230 @@ def main():
     </style>
     """
 
-    # Apply dark mode if toggled
+    # Apply dark mode CSS if the toggle is active.
     if st.session_state.get("dark_mode", False):
         st.markdown(DARK_MODE_CSS, unsafe_allow_html=True)
-        
+
+    # Handle programmatic tab switching. This must be done after applying CSS.
+    # By updating the state and allowing the script to continue without a second
+    # rerun, we prevent the "flicker" of the light theme.
+    if st.session_state.get("next_active_main_tab"):
+        st.session_state.active_main_tab = st.session_state.next_active_main_tab
+        st.session_state.next_active_main_tab = None
+
+def get_google_user_info(token_dict: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Fetches user information from Google's userinfo endpoint.
+
+    Args:
+        token_dict: The token dictionary received from the OAuth flow.
+
+    Returns:
+        A dictionary containing user info (email, name, etc.) or None on failure.
+    """
+    if not token_dict or 'access_token' not in token_dict:
+        return None
+
+    access_token = token_dict['access_token']
+    userinfo_endpoint = "https://www.googleapis.com/oauth2/v3/userinfo"
+    headers = {'Authorization': f'Bearer {access_token}'}
+
+    response = requests.get(userinfo_endpoint, headers=headers)
+    if response.status_code == 200:
+        return response.json()
+    return None
+
+def add_pending_operation_to_firestore(operation_id, operation_type, params, model_id, direct_response=None):
+    """Saves a new pending operation to Firestore."""
+    if not FIRESTORE_AVAILABLE:
+        logger.warning("Firestore not available. Cannot save pending operation.")
+        return
+
+    try:
+        doc_ref = db.collection('pending_operations').document()
+        operation_data = {
+            'user_id': st.session_state.user_id,
+            'operation_id': operation_id,
+            'operation_type': operation_type,
+            'model_id': model_id,
+            'params': params,
+            'timestamp': firestore.SERVER_TIMESTAMP
+        }
+        # For synchronous operations like Imagen, store the response directly
+        if direct_response:
+            operation_data['direct_response'] = direct_response
+
+        doc_ref.set(operation_data)
+        logger.info(f"Saved pending {operation_type} operation to Firestore (ID: {doc_ref.id}).")
+    except Exception as e:
+        logger.error(f"Failed to save pending operation to Firestore: {e}")
+
+def check_and_process_pending_operations(user_id):
+    """Checks Firestore for pending operations and processes them."""
+    if not FIRESTORE_AVAILABLE:
+        return
+
+    try:
+        pending_ref = db.collection('pending_operations').where('user_id', '==', user_id).stream()
+        pending_ops = list(pending_ref)
+
+        if not pending_ops:
+            return
+
+        st.info(f"Found {len(pending_ops)} pending generation(s) from a previous session. Checking status...")
+
+        for op_doc in pending_ops:
+            op_data = op_doc.to_dict()
+            op_id = op_data.get('operation_id')
+            op_type = op_data.get('operation_type')
+            model_id = op_data.get('model_id')
+            params = op_data.get('params', {})
+            prompt = params.get('prompt', 'N/A')
+            doc_id = op_doc.id
+
+            with st.spinner(f"Processing pending {op_type} operation..."):
+                # Handle synchronous operations (like Imagen) that have a direct response
+                if 'direct_response' in op_data:
+                    result = op_data['direct_response']
+                    is_done = True
+                # Handle asynchronous long-running operations
+                elif op_id and model_id:
+                    client.model_id = model_id # Ensure client is using the correct model for polling
+                    result = client.poll_operation(op_id)
+                    is_done = result.get("done", False)
+                else:
+                    logger.warning(f"Skipping invalid pending operation document: {doc_id}")
+                    continue
+
+                if is_done:
+                    logger.success(f"Pending operation {op_id or doc_id} is complete.")
+                    # Extract URI(s) based on operation type
+                    if op_type == 'video':
+                        uris = client.extract_video_uris(result)
+                    elif op_type in ['image', 'image_edit']:
+                        uris = client.extract_image_uris(result)
+                        if not uris: # Fallback for base64 encoded images
+                            image_data_list = client.extract_image_data(result)
+                            uris = []
+                            for image_data in image_data_list:
+                                img = Image.open(io.BytesIO(image_data))
+                                uri = history_manager.upload_image_to_history(img, f"recovered_{uuid.uuid4().hex}.png")
+                                uris.append(uri)
+                    elif op_type == 'audio':
+                        # For synchronous audio, the 'direct_response' will be set upon completion.
+                        # If we are here, it means the process was interrupted before the direct_response
+                        # could be saved. For now, we assume it failed and will remove the pending op.
+                        # A more advanced implementation could check GCS for the expected output file.
+                        uris = result.get('uris', [])
+                    elif op_type == 'audio':
+                        uris = result.get('uris', [])
+                    elif op_type == 'voice':
+                        # For voice, we get file paths and need to re-upload them
+                        file_paths = result.get('file_paths', [])
+                        uris = gemini_TTS_api.upload_audio_to_gcs(file_paths, f"{config.STORAGE_URI.rstrip('/')}/voiceovers/")
+                    else:
+                        uris = []
+
+                    # Add to history and delete pending doc
+                    if uris:
+                        for uri in uris:
+                            db.collection('history').add({
+                                'user_id': user_id,
+                                'timestamp': firestore.SERVER_TIMESTAMP,
+                                'type': op_type, # Use the dynamic operation type
+                                'uri': uri,
+                                'prompt': prompt,
+                                'params': params
+                            })
+                        st.success(f"✅ Recovered {len(uris)} generated asset(s) and added to your history.")
+                    db.collection('pending_operations').document(doc_id).delete()
+                    logger.info(f"Processed and removed pending operation: {doc_id}")
+                elif 'direct_response' not in op_data:
+                    # If the operation is not done and has no direct response, it's a genuinely pending LRO
+                    # or a synchronous one that was interrupted. We can leave it for the next check.
+                    logger.info(f"Pending operation {op_id or doc_id} is still in progress.")
+                else:
+                    # This case handles a synchronous operation that was logged but never completed.
+                    # We can safely remove it.
+                    logger.warning(f"Removing stale synchronous pending operation: {doc_id}")
+                    db.collection('pending_operations').document(doc_id).delete()
+
+    except Exception as e:
+        logger.error(f"Error processing pending operations: {e}")
+        st.error("An error occurred while checking for pending generations.")
+
+def main():
+    """Main function to run the Streamlit app."""
+    logger.start_section("App Initialization")
+    
+    init_state() # Initialize session state
+    # --- Bypass Authentication for Local Development ---
+    # Check for a command-line flag to bypass authentication.
+    if '--no-auth' in sys.argv:
+        if "user_id" not in st.session_state:
+            # If the flag is present and no user is logged in, set a default user.
+            st.session_state.user_id = "local_dev_user@example.com"
+            st.session_state.user_name = "Local Dev User"
+
+    # --- OAuth2 Configuration ---
+    oauth2 = OAuth2Component(
+        client_id=config.GOOGLE_CLIENT_ID,
+        client_secret=config.GOOGLE_CLIENT_SECRET,
+        authorize_endpoint="https://accounts.google.com/o/oauth2/v2/auth",
+        token_endpoint="https://oauth2.googleapis.com/token",
+        refresh_token_endpoint=None, # Google uses the same endpoint for refresh
+        revoke_token_endpoint="https://oauth2.googleapis.com/revoke",
+    )
+    # --- Password Hashing and Verification Helpers ---
+    def hash_password(password):
+        """Returns the SHA-256 hash of the password."""
+        return hashlib.sha256(str.encode(password)).hexdigest()
+
+    def verify_password(stored_hash, provided_password):
+        """Verifies a provided password against a stored hash."""
+        return stored_hash == hash_password(provided_password)
+
+    # --- Check for and process any pending operations from previous sessions ---
+    # This runs only once per session after the user is logged in.
+    if 'user_id' in st.session_state and not st.session_state.get('pending_ops_checked', False):
+        check_and_process_pending_operations(st.session_state.user_id)
+        st.session_state.pending_ops_checked = True # Set flag to prevent re-checking
+
+    # If we have a token, but no user_id, the user is returning to the session
+    # We need to fetch their info
+    if 'token' in st.session_state and st.session_state.token and 'user_id' not in st.session_state:
+        user_info = get_google_user_info(st.session_state['token'])
+        if user_info:
+            st.session_state['user_id'] = user_info.get("email")
+            st.session_state['user_name'] = user_info.get("name")
+        else:
+            # If token is invalid, clear it
+            st.session_state.token = None
+
+    # --- Authentication Gate ---
+    if 'user_id' not in st.session_state:
+        st.set_page_config(page_title="Login - Media Gen Tool")
+        st.title("🎬 Welcome to the Google AI Media Generator")
+        st.subheader("Please sign in to continue")
+
+        result = oauth2.authorize_button(
+            name="Sign in with Google",
+            icon="https://www.google.com.tw/favicon.ico",
+            redirect_uri=config.REDIRECT_URI,
+            scope="openid email profile",
+            key="google_login",
+            use_container_width=True,
+        )
+
+        if result and "token" in result:
+            st.session_state.token = result.get('token')
+            st.rerun()
+
+        return  # Stop execution until the user is logged in
+    
+    # Run the setup function to configure the page, theme, and handle tab switches.
+    _setup_page()
+
     # Sidebar for configuration
     with st.sidebar:
         # App title
@@ -1054,28 +1210,28 @@ def main():
     # Main content area with tabs - simple approach without extra complexity
     title_col, toggle_col = st.columns([5, 1])
     with title_col:
-        st.title("AI Media Generator")
+        st.title("📽️ Google AI Media Generator")
     with toggle_col:
-        # Add some padding to vertically align the toggle with the title
-        st.markdown('<div style="padding-top: 1.5rem;"></div>', unsafe_allow_html=True)
-        # Initialize dark_mode state right before the widget is created
-        # This is the most robust way to prevent it from being reset on reruns.
-        # if "dark_mode" not in st.session_state:
-        #     st.session_state.dark_mode = False
         st.toggle("🌙 Dark Mode", key="dark_mode", help="Toggle between light and dark themes.")
     
+    # --- User Info and Logout Button ---
+    user_col, _, logout_col = st.columns([4, 1, 1])
+    with user_col:
+        st.markdown(f"👤 **Logged in as:** {st.session_state.user_id}")
+    with logout_col:
+        if st.button("🚪 Logout", key="logout_button"):
+            st.session_state.clear()
+            st.query_params.clear() # Remove user from query params on logout
+            st.rerun()
+
     # Define the main tabs and their corresponding functions
     TABS = OrderedDict([
-        ("🎬 Text-to-Video", text_to_video_tab),
-        ("🖼️ Image-to-Video", image_to_video_tab),
-        ("🎨 Text-to-Image", text_to_image_tab),
-        ("✨ Nano Banana", image_editing_tab),
-        ("🎵 Text-to-Audio", text_to_audio_tab),
-        ("🎤 Text-to-Voiceover", text_to_voiceover_tab),
-        ("✂️ Video Editing", video_editing_tab),
+        ("🎬 Video", video_tab),
+        ("🎨 Image", image_tab),
+        ("🎵 Audio", audio_tab),
+        ("♊ Gemini", gemini_chat_tab),
         ("📋 History", history_tab),
     ])
-
     # Use a radio button for main navigation that is directly tied to the session state.
     # This is the standard way to create a "controlled" widget in Streamlit.
     st.radio(
@@ -1096,6 +1252,244 @@ def main():
     
     logger.end_section()
 
+def video_tab():
+    """Main tab for all video-related operations."""
+    # Define the video sub-tabs and their corresponding functions
+    sub_tabs = OrderedDict([
+        ("Text-to-Video", text_to_video_tab),
+        ("Image-to-Video", image_to_video_tab),
+        ("Video Editing", video_editing_tab),
+    ])
+
+    # Use a radio button styled as tabs for sub-navigation.
+    # This is a "controlled" component, allowing programmatic switching.
+    st.radio(
+        "Video Sub-Navigation",
+        options=list(sub_tabs.keys()),
+        horizontal=True,
+        label_visibility="collapsed",
+        key="active_video_sub_tab"  # Directly link to session state
+    )
+
+    # Call the function for the currently active sub-tab
+    active_sub_tab_func = sub_tabs.get(st.session_state.active_video_sub_tab)
+    if active_sub_tab_func:
+        active_sub_tab_func()
+    else:
+        # Fallback to the first tab if the state is somehow invalid
+        text_to_video_tab()
+
+def image_tab():
+    """Main tab for all image-related operations."""
+    # Define the image sub-tabs and their corresponding functions
+    sub_tabs = OrderedDict([
+        ("Text-to-Image", text_to_image_tab),
+        ("Image Editing (Nano Banana)", image_editing_tab),
+    ])
+
+    # Use a radio button for controlled sub-navigation
+    st.radio(
+        "Image Sub-Navigation",
+        options=list(sub_tabs.keys()),
+        horizontal=True,
+        label_visibility="collapsed",
+        key="active_image_sub_tab" # Directly link to session state
+    )
+
+    # Call the function for the active sub-tab
+    active_sub_tab_func = sub_tabs.get(st.session_state.active_image_sub_tab)
+    if active_sub_tab_func:
+        active_sub_tab_func()
+    else:
+        # Fallback to the first tab
+        text_to_image_tab()
+
+def audio_tab():
+    """Main tab for all audio-related operations."""
+    # Define the audio sub-tabs and their corresponding functions
+    sub_tabs = OrderedDict([
+        ("Text-to-Audio", text_to_audio_tab),
+        ("Text-to-Voiceover", text_to_voiceover_tab),
+    ])
+
+    # Use a radio button for controlled sub-navigation
+    st.radio(
+        "Audio Sub-Navigation",
+        options=list(sub_tabs.keys()),
+        horizontal=True,
+        label_visibility="collapsed",
+        key="active_audio_sub_tab" # Directly link to session state
+    )
+
+    # Call the function for the active sub-tab
+    active_sub_tab_func = sub_tabs.get(st.session_state.active_audio_sub_tab)
+    if active_sub_tab_func:
+        active_sub_tab_func()
+    else:
+        # Fallback to the first tab
+        text_to_audio_tab()
+
+def gemini_chat_tab():
+    """A tab for multimodal chat with Gemini."""
+    st.header("Chat with Gemini")
+
+    # Model selection
+    model_name = st.selectbox(
+        "Select Gemini Model",
+        options=["gemini-2.5-pro", "gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-2.0-flash-001", "gemini-2.0-flash-lite-001", "gemini-1.5-pro-002"],
+        key="gemini_chat_model",
+        help="Choose the Gemini model to chat with. 'Flash' is faster, 'Pro' is more capable."
+    )
+
+    # System instructions input
+    system_instructions = st.text_area(
+        "System Instructions (Optional)",
+        placeholder="e.g., You are a helpful assistant that speaks like a pirate.",
+        help="Provide instructions to guide the model's behavior and personality.",
+        key="gemini_system_instructions"
+    )
+
+    # Advanced settings for temperature and grounding
+    with st.expander("Advanced Settings"):
+        temperature = st.slider(
+            "Temperature",
+            min_value=0.0,
+            max_value=2.0,
+            value=1.0,
+            step=0.1,
+            help="Controls the randomness of the output. Lower values are more deterministic, higher values are more creative."
+        )
+        enable_grounding = st.toggle(
+            "Enable Google Search Grounding",
+            value=False,
+            help="Allows the model to use Google Search to ground its responses with real-time information."
+        )
+
+    # --- Microphone Input ---
+    # Place the mic recorder next to the file uploader.
+    st.write("OR")
+    # The mic_recorder returns audio data when the user stops recording
+    audio_data = mic_recorder(start_prompt="🎤 Start Recording", stop_prompt="⏹️ Stop Recording", key='gemini_mic')
+
+
+    # File uploader for multimodal input
+    uploaded_file = st.file_uploader(
+        "Upload an image, audio, or video file (optional)",
+        type=["jpg", "jpeg", "png", "webp", "mp3", "wav", "mp4", "mov", "avi", "mkv", "txt", "pdf"],
+        key=f"gemini_chat_uploader_{st.session_state.gemini_uploader_key_counter}"
+    )
+
+    # --- Handle Inputs ---
+    # We prioritize the last provided input: microphone audio takes precedence over file upload.
+    input_file_for_gemini = None
+    # A flag to indicate if we should trigger the API call automatically for audio.
+    trigger_from_audio = False
+    prompt_for_api = ""
+
+    if audio_data and audio_data['bytes']:
+        st.info("🎤 Voice recording is ready to be sent with your next message.")
+        st.audio(audio_data['bytes'])
+        # Wrap the recorded audio bytes in our file-like object for the API helper
+        input_file_for_gemini = SimulatedUploadFile(name="voice_recording.wav", content=audio_data['bytes'])
+        input_file_for_gemini.type = "audio/wav" # Set the mime type
+
+        # Set the flag to trigger the API call and provide a default prompt for the model.
+        trigger_from_audio = True
+        prompt_for_api = "Analyze the provided audio and respond to the query within it."
+
+    elif uploaded_file:
+        file_type = uploaded_file.type.split('/')[0]
+        st.info(f"File '{uploaded_file.name}' is ready to be sent with your next message.")
+        if file_type == "image":
+            st.image(uploaded_file, width=200)
+        elif file_type == "audio":
+            st.audio(uploaded_file)
+        elif file_type == "video":
+            st.video(uploaded_file)
+        input_file_for_gemini = uploaded_file
+
+    # Display chat messages from history
+    for message in st.session_state.gemini_messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"]["text"])
+            if message["content"].get("citations"):
+                with st.expander("View Citations"):
+                    for i, citation in enumerate(message["content"]["citations"], 1):
+                        st.markdown(f"**[{i}] [{citation['title']}]({citation['uri']})**")
+
+    # --- Clear Chat Button ---
+    # Place the button at the bottom, just above the chat input.
+    # Use columns to align the button to the right for a cleaner look.
+    _, button_col = st.columns([4, 1])
+    with button_col:
+        if st.button("🗑️ Clear Chat", key="clear_gemini_chat_bottom", help="Clear chat history and remove uploaded files."):
+            # Clear the chat message history
+            st.session_state.gemini_messages = []
+            # Increment the counter to force a re-render of the file_uploader with a new key
+            st.session_state.gemini_uploader_key_counter += 1
+            # Rerun the app to reflect the changes immediately
+            st.rerun()
+
+    # React to user input
+    if text_prompt := st.chat_input("What would you like to ask Gemini?"):
+        # If the user types a message, it takes precedence.
+        trigger_from_audio = False
+        prompt_for_api = text_prompt
+
+    # Trigger the API call if either a text prompt was entered or an audio recording was made.
+    if prompt_for_api:
+        # Add user message to chat history
+        st.session_state.gemini_messages.append({
+            "role": "user",
+            "content": {"text": prompt_for_api, "citations": []}
+        })
+        # Display user message in chat message container
+        # with st.chat_message("user"):
+            # st.markdown(prompt_for_api)
+
+        # Display assistant response in chat message container
+        with st.chat_message("assistant"):
+            message_placeholder = st.empty()
+            citations_placeholder = st.empty()
+            response_content = {"text": "", "citations": []}
+
+            with st.spinner("Gemini is thinking..." if not trigger_from_audio else "Processing audio..."):
+                try:
+                    # Use the existing gemini_helper for the API call
+                    # This function is assumed to return a dict: {'text': str, 'citations': list}
+                    response_dict = gemini_helper.generate_gemini_chat_response(
+                        model_name=model_name,
+                        prompt=prompt_for_api,
+                        uploaded_file=input_file_for_gemini, # Pass the selected input
+                        system_instructions=system_instructions,
+                        temperature=temperature,
+                        enable_grounding=enable_grounding
+                    )
+                    # Handle both dict (with citations) and str (without) responses
+                    if isinstance(response_dict, dict):
+                        response_content["text"] = response_dict.get("text", "No response text found.")
+                        response_content["citations"] = response_dict.get("citations", [])
+                    else:
+                        # Handle the case where a simple string is returned
+                        response_content["text"] = response_dict
+                        response_content["citations"] = []
+
+                except Exception as e:
+                    response_content["text"] = f"An error occurred: {e}"
+                    st.error(response_content["text"])
+
+            # Display the main response text
+            message_placeholder.markdown(response_content["text"])
+
+            # Display citations if they exist
+            if response_content["citations"]:
+                with citations_placeholder.expander("View Citations"):
+                    for i, citation in enumerate(response_content["citations"], 1):
+                        st.markdown(f"**[{i}] [{citation['title']}]({citation['uri']})**")
+
+        # Add assistant response to chat history
+        st.session_state.gemini_messages.append({"role": "assistant", "content": response_content})
+
 def text_to_image_tab():
     """Text-to-Image generation tab."""
     st.header("Text-to-Image Generation with Imagen")
@@ -1113,7 +1507,7 @@ def text_to_image_tab():
         model = st.selectbox(
             "Model",
             # Using placeholder names as requested. User can change if needed.
-            options=["imagen-3.0-generate-002","imagen-3.0-fast-generate-001","imagen-4.0-generate-001", "imagen-4.0-ultra-generate-001", "imagen-4.0-fast-generate-001" ],
+            options=["imagen-4.0-generate-001", "imagen-4.0-ultra-generate-001", "imagen-4.0-fast-generate-001", "imagen-3.0-generate-002","imagen-3.0-fast-generate-001"],
             index=0,
             help="Choose the Imagen model for generation.",
             key="t2i_model"
@@ -1167,16 +1561,16 @@ def text_to_image_tab():
         with col1_adv:
             person_generation = st.selectbox(
                 "Person Generation",
-                options=["Allow (All ages)", "Allow (Adults only)", "Don't Allow"],
+                options=["Allow", "Don't Allow"],
                 index=0,
-                help="Allow or disallow the generation of human faces.",
+                help="Allow or disallow the generation of people.",
                 key="t2i_person_generation"
             )
 
         with col2_adv:
             safety_filter_threshold = st.selectbox(
                 "Safety Filter Strength",
-                options=["block_most", "block_few", "block_some",],
+                options=["BLOCK_MOST", "BLOCK_SOME", "BLOCK_FEW", "BLOCK_NONE"],
                 index=2,
                 help="Set the threshold for safety filters.",
                 key="t2i_safety_threshold"
@@ -1304,7 +1698,7 @@ def text_to_video_tab():
 
     model = st.selectbox(
         "Model",
-        options=["veo-2.0-generate-001", "veo-3.0-generate-preview", "veo-3.0-fast-generate-preview", "veo-3.0-fast-generate-001", "veo-3.0-generate-001"],  # Assuming these are the model IDs
+        options=["veo-3.0-generate-preview", "veo-3.0-fast-generate-preview", "veo-3.0-fast-generate-001", "veo-3.0-generate-001", "veo-2.0-generate-001"],  # Assuming these are the model IDs
         index=0,  # Default to Veo 2
         help="Choose the video generation model (Veo 2 or Veo 3)",
         key="text_model"
@@ -1707,6 +2101,7 @@ def text_to_voiceover_tab():
                                 try:
                                     doc_ref = db.collection('history').document()
                                     doc_ref.set({
+                                        'user_id': st.session_state.user_id,
                                         'timestamp': firestore.SERVER_TIMESTAMP,
                                         'type': 'voice',
                                         'uri': uri,
@@ -1822,6 +2217,7 @@ def video_editing_tab():
                             st.video(signed_url)
                             if FIRESTORE_AVAILABLE:
                                 db.collection('history').add({
+                                    'user_id': st.session_state.user_id,
                                     'timestamp': firestore.SERVER_TIMESTAMP,
                                     'type': 'video',
                                     'uri': final_video_uri,
@@ -1923,6 +2319,7 @@ def video_editing_tab():
                             st.video(signed_url)
                             if FIRESTORE_AVAILABLE:
                                 db.collection('history').add({
+                                    'user_id': st.session_state.user_id,
                                     'timestamp': firestore.SERVER_TIMESTAMP,
                                     'type': 'video', 'uri': final_video_uri,
                                     'prompt': f'Video speed changed by factor of {speed_factor}',
@@ -2102,6 +2499,7 @@ def video_editing_tab():
                                 st.video(signed_url)
                                 if FIRESTORE_AVAILABLE:
                                     db.collection('history').add({
+                                        'user_id': st.session_state.user_id,
                                         'timestamp': firestore.SERVER_TIMESTAMP,
                                         'type': 'video', 'uri': final_gcs_uri,
                                         'prompt': f'Video interpolated and changed by factor of {playback_speed_factor}',
@@ -2378,7 +2776,7 @@ def image_to_video_tab():
         # Model selection
         model = st.selectbox(
             "Model",
-            options=["veo-2.0-generate-001", "veo-3.0-generate-preview", "veo-3.0-fast-generate-001"],  # Assuming these are the model IDs
+            options=["veo-3.0-generate-preview", "veo-3.0-fast-generate-001", "veo-2.0-generate-001"],  # Assuming these are the model IDs
             index=0,  # Default to Veo 2
             help="Choose the video generation model (Veo 2 or Veo 3)",
             key="image_model"
@@ -2614,6 +3012,7 @@ def image_to_video_tab():
                             if FIRESTORE_AVAILABLE:
                                 doc_ref = db.collection('history').document()
                                 doc_ref.set({
+                                    'user_id': st.session_state.user_id,
                                     'timestamp': firestore.SERVER_TIMESTAMP,
                                     'type': 'image',
                                     'uri': uploaded_image_uri,
@@ -2668,12 +3067,13 @@ def image_to_video_tab():
     logger.end_section()
 
 
-def get_history_from_firestore(limit=200):
+def get_history_from_firestore(user_id, limit=200):
     """
     Get the history of generated content from Firestore.
     
     Args:
-        limit (int): Maximum number of entries to return
+        user_id (str): The ID of the user to fetch history for.
+        limit (int): Maximum number of entries to return.
         
     Returns:
         pandas.DataFrame: DataFrame containing the history entries
@@ -2683,9 +3083,9 @@ def get_history_from_firestore(limit=200):
         return pd.DataFrame(columns=['timestamp', 'type', 'uri', 'prompt', 'params'])
 
     try:
-        history_ref = db.collection('history').order_by(
-            'timestamp', direction=firestore.Query.DESCENDING
-        ).limit(limit)
+        # Fetch all documents for the user first, then sort and limit in pandas.
+        # This avoids the need for a composite index in Firestore.
+        history_ref = db.collection('history').where('user_id', '==', user_id)
         
         docs = history_ref.stream()
         
@@ -2696,8 +3096,11 @@ def get_history_from_firestore(limit=200):
             
         df = pd.DataFrame(history_list)
         # Ensure timestamp column is of datetime type for proper sorting
-        df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
-        return df.sort_values('timestamp', ascending=False)
+        if 'timestamp' in df.columns:
+            df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
+            # Sort by timestamp descending and then take the top 'limit' results
+            return df.sort_values('timestamp', ascending=False).head(limit)
+        return df
 
     except Exception as e:
         logger.error(f"Error getting history from Firestore: {str(e)}")
@@ -3000,7 +3403,7 @@ def history_tab():
     try:
         if not st.session_state.get("history_loaded", False) or "history_data" not in st.session_state:
             with st.spinner("Loading history data..."):
-                history_data = get_history_from_firestore(limit=200)
+                history_data = get_history_from_firestore(user_id=st.session_state.user_id, limit=200)
                 st.session_state.history_data = history_data
                 st.session_state.history_loaded = True
         else:
@@ -3338,6 +3741,7 @@ def generate_video(
             operation_id = operation_name.split("/")[-1]
             st.info(f"✅ Operation started: {operation_id}")
             
+            add_pending_operation_to_firestore(operation_id, "video", params, model)
             # Wait for completion if requested
             if wait_for_completion:
                 progress_bar = st.progress(0)
@@ -3410,6 +3814,7 @@ def generate_video(
                                     doc_ref = db.collection('history').document()
                                     doc_ref.set({
                                         'timestamp': firestore.SERVER_TIMESTAMP,
+                                        'user_id': st.session_state.user_id,
                                         'type': "video", 'uri': uri, 'prompt': prompt, 'params': params
                                     })
                                     logger.info(f"Added video {uri} to Firestore history.")
@@ -3482,6 +3887,7 @@ def generate_image(
                 enhance_prompt=enhance_prompt
             )
 
+            add_pending_operation_to_firestore(None, "image", {"prompt": prompt, "model": model}, model, response)
             if "error" in response:
                 error_msg = response.get("error", {}).get("message", "Unknown error")
                 st.error(f"⚠️ Image generation failed: {error_msg}")
@@ -3525,6 +3931,7 @@ def generate_image(
                 for uri in image_uris:
                     db.collection('history').document().set({
                         'timestamp': firestore.SERVER_TIMESTAMP, 'type': 'image', 'uri': uri,
+                        'user_id': st.session_state.user_id,
                         'prompt': prompt, 'params': params
                     })
 
@@ -3583,12 +3990,21 @@ def edit_image(
                 # Note: 'seed' and other unused parameters are ignored by the new function
             )
 
+            # Create a unique ID for this synchronous operation to track it
+            operation_id = f"image_edit-{uuid.uuid4().hex}"
+            # Add to pending operations BEFORE the API call
+            add_pending_operation_to_firestore(
+                operation_id=operation_id,
+                operation_type='image_edit',
+                params={"prompt": prompt, "model": model},
+                model_id=model
+            )
+
             if "error" in response:
                 error_msg = response.get("error", {}).get("message", "Unknown error")
                 st.error(f"⚠️ Image editing failed: {error_msg}")
-                st.json(response)
-                return
-
+            else:
+                update_pending_operation_with_result(operation_id, response)
             # Try to get URIs first, as this is the expected response when storage_uri is provided
             image_uris = client.extract_image_uris(response)
             image_data_list = []
@@ -3625,6 +4041,7 @@ def edit_image(
                 for uri in image_uris:
                     db.collection('history').document().set({
                         'timestamp': firestore.SERVER_TIMESTAMP, 'type': 'image', 'uri': uri,
+                        'user_id': st.session_state.user_id,
                         'prompt': f"Edited image with prompt: {prompt}", 'params': params
                     })
 
@@ -3937,6 +4354,7 @@ def dub_video(uploaded_video, input_language, output_language, bucket_name):
             
             if FIRESTORE_AVAILABLE:
                 db.collection('history').add({
+                    'user_id': st.session_state.user_id,
                     'timestamp': firestore.SERVER_TIMESTAMP,
                     'type': 'video',
                     'uri': full_gcs_uri,
@@ -3989,6 +4407,17 @@ def generate_audio(
                 "seed": seed if seed else "random",
             }
 
+            # Create a unique ID for this synchronous operation to track it
+            operation_id = f"audio-{uuid.uuid4().hex}"
+
+            # Add to pending operations BEFORE the API call
+            add_pending_operation_to_firestore(
+                operation_id=operation_id,
+                operation_type='audio',
+                params=params,
+                model_id='lyria-002', # Hardcoded model for Lyria
+            )
+
             # Make the API call
             response = client.generate_audio(
                 prompt=prompt,
@@ -4009,6 +4438,7 @@ def generate_audio(
                         doc_ref = db.collection('history').document()
                         doc_ref.set({
                             'timestamp': firestore.SERVER_TIMESTAMP,
+                            'user_id': st.session_state.user_id,
                             'type': "audio",
                             'uri': uri,
                             'prompt': prompt,
@@ -4264,26 +4694,31 @@ def handle_history_action(operation: str, uris: List[str]):
 
         if operation == "Edit Image(s)":
             st.session_state.edit_image_files = simulated_files
-            st.session_state.next_active_main_tab = "✨ Nano Banana"
+            st.session_state.active_image_sub_tab = "Image Editing (Nano Banana)"
+            st.session_state.next_active_main_tab = "🎨 Image"
         elif operation == "Use for Image-to-Video":
             # Set the canonical active image data. The Image-to-Video tab will
             # pick this up on the next run. This is the safe way.
             st.session_state.active_image_data = simulated_files[0]
             # Clear any URL that might have been there to avoid conflicts
             st.session_state.current_image_url = ""
-            st.session_state.next_active_main_tab = "🖼️ Image-to-Video"
+            st.session_state.active_video_sub_tab = "Image-to-Video"
+            st.session_state.next_active_main_tab = "🎬 Video"
         elif operation == "Concatenate Videos":
             st.session_state.concat_video_files = simulated_files
             st.session_state.video_edit_option = "Concatenate Videos"
-            st.session_state.next_active_main_tab = "✂️ Video Editing"
+            st.session_state.active_video_sub_tab = "Video Editing"
+            st.session_state.next_active_main_tab = "🎬 Video"
         elif operation == "Change Video Speed":
             st.session_state.speed_change_video_file = simulated_files[0]
             st.session_state.video_edit_option = "Change Playback Speed"
-            st.session_state.next_active_main_tab = "✂️ Video Editing"
+            st.session_state.active_video_sub_tab = "Video Editing"
+            st.session_state.next_active_main_tab = "🎬 Video"
         elif operation == "Dubbing":
             st.session_state.dub_video_file = simulated_files[0]
             st.session_state.video_edit_option = "Dubbing"
-            st.session_state.next_active_main_tab = "✂️ Video Editing"
+            st.session_state.active_video_sub_tab = "Video Editing"
+            st.session_state.next_active_main_tab = "🎬 Video"
 
         # Clear selection and rerun to switch tab and apply state changes
         st.session_state.selected_history_items.clear()
@@ -4340,5 +4775,4 @@ if __name__ == "__main__":
     logger = Logger(debug=config.DEBUG_MODE)
     logger.info("Starting Veo2 Video Generator app")
     
-    # Run the app
-    main() 
+    main()
