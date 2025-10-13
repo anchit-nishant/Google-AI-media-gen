@@ -1641,7 +1641,7 @@ def image_editing_tab():
     with col1:
         model = st.selectbox(
             "Model",
-            options=["gemini-2.5-flash-image-preview"],
+            options=["gemini-2.5-flash-image"],
             index=0,
             help="Choose the model for editing.",
             key="i2i_model"

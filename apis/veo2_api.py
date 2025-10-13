@@ -938,7 +938,7 @@ def generate_image_gemini_image_preview(
     prompt: str,
     aspectRatio: str,
     input_images: Optional[List[Dict[str, str]]] = None,
-    model: str = "gemini-2.5-flash-image-preview",
+    model: str = "gemini-2.5-flash-image",
     temperature: float = 1.0,
     top_p: float = 0.95,
     max_output_tokens: int = 32768,
