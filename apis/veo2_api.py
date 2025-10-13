@@ -936,6 +936,7 @@ class Veo2API:
 def generate_image_gemini_image_preview(
     self,
     prompt: str,
+    aspectRatio: str,
     input_images: Optional[List[Dict[str, str]]] = None,
     model: str = "gemini-2.5-flash-image-preview",
     temperature: float = 1.0,
@@ -979,7 +980,11 @@ def generate_image_gemini_image_preview(
         "temperature": temperature,
         "maxOutputTokens": max_output_tokens,
         "responseModalities": ["TEXT", "IMAGE"],
+        "imageConfig": {
+            "aspectRatio": aspectRatio 
+        },
         "topP": top_p,
+
     }
 
     safety_categories = [
