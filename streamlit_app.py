@@ -1637,13 +1637,25 @@ def image_editing_tab():
         key="i2i_prompt"
     )
 
-    model = st.selectbox(
-        "Model",
-        options=["gemini-2.5-flash-image-preview"],
-        index=0,
-        help="Choose the model for editing.",
-        key="i2i_model"
-    )
+    col1, col2 = st.columns(2)
+    with col1:
+        model = st.selectbox(
+            "Model",
+            options=["gemini-2.5-flash-image"],
+            index=0,
+            help="Choose the model for editing.",
+            key="i2i_model"
+        )
+    with col2:
+        aspect_ratio = st.selectbox(
+            "Aspect Ratio",
+            options=["1:1", "3:2", "2:3", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"],
+            index=0,
+            help="Choose the aspect ratio of the edited image.",
+            key="i2i_aspect_ratio"
+        )
+
+
 
     enhance_prompt = st.checkbox(
         "Enhance Prompt",
@@ -1671,6 +1683,7 @@ def image_editing_tab():
                 project_id=st.session_state.get("project_id", config.PROJECT_ID),
                 prompt=prompt,
                 model=model,
+                aspect_ratio=aspect_ratio,
                 seed=None,
                 person_generation="Don't Allow",
                 safety_filter_level="OFF",
@@ -1698,8 +1711,8 @@ def text_to_video_tab():
 
     model = st.selectbox(
         "Model",
-        options=["veo-3.0-generate-preview", "veo-3.0-fast-generate-preview", "veo-3.0-fast-generate-001", "veo-3.0-generate-001", "veo-2.0-generate-001"],  # Assuming these are the model IDs
-        index=0,  # Default to Veo 2
+        options=["veo-3.1-generate-preview", "veo-3.1-generate-fast-preview", "veo-3.0-generate-preview", "veo-3.0-fast-generate-preview", "veo-3.0-fast-generate-001", "veo-3.0-generate-001", "veo-2.0-generate-001"],  # Assuming these are the model IDs
+        index=0,  # Default to Veo 3
         help="Choose the video generation model (Veo 2 or Veo 3)",
         key="text_model"
     )
@@ -2776,7 +2789,7 @@ def image_to_video_tab():
         # Model selection
         model = st.selectbox(
             "Model",
-            options=["veo-3.0-generate-preview", "veo-3.0-fast-generate-001", "veo-2.0-generate-001"],  # Assuming these are the model IDs
+            options=["veo-3.1-generate-preview", "veo-3.1-generate-fast-preview", "veo-3.0-generate-preview", "veo-3.0-fast-generate-001", "veo-2.0-generate-001"],  # Assuming these are the model IDs
             index=0,  # Default to Veo 2
             help="Choose the video generation model (Veo 2 or Veo 3)",
             key="image_model"
@@ -3947,6 +3960,7 @@ def edit_image(
     project_id,
     prompt,
     model,
+    aspect_ratio,
     seed,
     person_generation,
     safety_filter_level,
@@ -3986,6 +4000,7 @@ def edit_image(
                 prompt=prompt,
                 input_images=input_images_data, # Pass the list of encoded images
                 model=model,
+                aspectRatio=aspect_ratio,
                 safety_threshold=safety_filter_level,
                 # Note: 'seed' and other unused parameters are ignored by the new function
             )
@@ -4003,8 +4018,6 @@ def edit_image(
             if "error" in response:
                 error_msg = response.get("error", {}).get("message", "Unknown error")
                 st.error(f"⚠️ Image editing failed: {error_msg}")
-            else:
-                update_pending_operation_with_result(operation_id, response)
             # Try to get URIs first, as this is the expected response when storage_uri is provided
             image_uris = client.extract_image_uris(response)
             image_data_list = []
@@ -4035,7 +4048,7 @@ def edit_image(
             # Add to history
             if image_uris and FIRESTORE_AVAILABLE:
                 params = {
-                    "prompt": prompt, "model": model, "safetyFilterThreshold": safety_filter_level,
+                    "prompt": prompt, "model": model, "aspectRatio": aspect_ratio, "safetyFilterThreshold": safety_filter_level,
                     "input_images": [os.path.basename(p) for p in input_image_paths or []]
                 }
                 for uri in image_uris:
