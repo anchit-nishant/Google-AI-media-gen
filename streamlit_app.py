@@ -1711,8 +1711,8 @@ def text_to_video_tab():
 
     model = st.selectbox(
         "Model",
-        options=["veo-3.0-generate-preview", "veo-3.0-fast-generate-preview", "veo-3.0-fast-generate-001", "veo-3.0-generate-001", "veo-2.0-generate-001"],  # Assuming these are the model IDs
-        index=0,  # Default to Veo 2
+        options=["veo-3.1-generate-preview", "veo-3.1-generate-fast-preview", "veo-3.0-generate-preview", "veo-3.0-fast-generate-preview", "veo-3.0-fast-generate-001", "veo-3.0-generate-001", "veo-2.0-generate-001"],  # Assuming these are the model IDs
+        index=0,  # Default to Veo 3
         help="Choose the video generation model (Veo 2 or Veo 3)",
         key="text_model"
     )
@@ -2789,7 +2789,7 @@ def image_to_video_tab():
         # Model selection
         model = st.selectbox(
             "Model",
-            options=["veo-3.0-generate-preview", "veo-3.0-fast-generate-001", "veo-2.0-generate-001"],  # Assuming these are the model IDs
+            options=["veo-3.1-generate-preview", "veo-3.1-generate-fast-preview", "veo-3.0-generate-preview", "veo-3.0-fast-generate-001", "veo-2.0-generate-001"],  # Assuming these are the model IDs
             index=0,  # Default to Veo 2
             help="Choose the video generation model (Veo 2 or Veo 3)",
             key="image_model"
