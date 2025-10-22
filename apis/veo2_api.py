@@ -4,6 +4,7 @@ import os
 import shutil
 import time
 import re
+import uuid
 import datetime
 from typing import Dict, List, Optional, Union, Any
 import requests
@@ -790,6 +791,227 @@ class Veo2API:
             print(f"  ERROR: An unexpected error occurred during Veo 2 API call (with bytes): {e}")
         
         return generated_videos_uri
+
+
+    def interpolate_video_veo3(
+        self,
+        start_image_path: str,
+        end_image_path: str,
+        prompt_text: str,
+        model: str,
+        output_local_video_path: str,
+        resolution: str,
+        aspect_ratio: str,
+        generate_audio: bool,
+        duration_seconds: int = 8,
+        sample_count: int = 1,
+        storage_uri: str = None,
+       
+    ) ->  List[str] | None:
+        """
+        Calls the Veo 3.1 API to generate a video using interpolation from two frames.
+        This function handles the long-running operation and returns the final API response.
+        """
+        print(f"Performing Veo 3.1 Interpolation with model {model}: from '{os.path.basename(start_image_path)}' "
+            f"to '{os.path.basename(end_image_path)}'")
+
+        self.model_id = model # Set the model for polling
+
+        # --- 1. Authenticate and Get Access Token ---
+        try:
+            # Get application default credentials
+            credentials, _ = google.auth.default(scopes=['https://www.googleapis.com/auth/cloud-platform'])
+            auth_req = google.auth.transport.requests.Request()
+            credentials.refresh(auth_req)
+            access_token = credentials.token
+        except Exception as e:
+            st.error(f"Could not get authentication credentials. Please ensure you are authenticated. Error: {e}")
+            return
+
+        # --- 2. Set Up API Endpoint and Headers ---
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json"
+        }
+            
+        generated_videos_uris = None
+
+        try:
+            with open(start_image_path, "rb") as f:
+                start_frame_bytes = f.read()
+            start_frame_base64 = base64.b64encode(start_frame_bytes).decode('utf-8')
+
+            with open(end_image_path, "rb") as f:
+                end_frame_bytes = f.read()
+            end_frame_base64 = base64.b64encode(end_frame_bytes).decode('utf-8')
+        
+        
+        except Exception as e:
+            print(f"  ERROR: Failed to read and encode local image files to base64: {e}")
+            return None
+
+        bucket_name, folder_path = storage_uri[5:].split("/", 1)
+        client = storage.Client()
+        bucket = client.bucket(bucket_name)
+
+        # --- MODIFICATION: Upload images to GCS first ---
+        temp_image_blobs = []
+        try:
+            print("Uploading input frames to GCS as temporary files...")
+            
+            # Upload start image
+            start_image_blob_name = f"temp_interpolate_inputs/{uuid.uuid4().hex}_{os.path.basename(start_image_path)}"
+            start_blob = bucket.blob(start_image_blob_name)
+            start_blob.upload_from_filename(start_image_path)
+            start_image_gcs_uri = f"gs://{bucket_name}/{start_image_blob_name}"
+            temp_image_blobs.append(start_blob)
+            print(f"  Uploaded start frame to: {start_image_gcs_uri}")
+
+            # Upload end image
+            end_image_blob_name = f"temp_interpolate_inputs/{uuid.uuid4().hex}_{os.path.basename(end_image_path)}"
+            end_blob = bucket.blob(end_image_blob_name)
+            end_blob.upload_from_filename(end_image_path)
+            end_image_gcs_uri = f"gs://{bucket_name}/{end_image_blob_name}"
+            temp_image_blobs.append(end_blob)
+            print(f"  Uploaded end frame to: {end_image_gcs_uri}")
+
+        except Exception as e:
+            print(f"  ERROR: Failed to upload temporary images to GCS: {e}")
+            # Clean up any blobs that might have been uploaded before the error
+            for blob in temp_image_blobs:
+                try:
+                    blob.delete()
+                except Exception as cleanup_e:
+                    print(f"  WARNING: Failed to clean up temporary blob {blob.name}: {cleanup_e}")
+            return None
+        # --- END MODIFICATION ---
+        
+        target_output_video_gcs_uri = f"gs://{bucket_name}/{output_local_video_path}"
+
+        api_url = f"https://us-central1-aiplatform.googleapis.com/v1/projects/{self.project_id}/locations/us-central1/publishers/google/models/{model}:predictLongRunning"
+
+        headers['Content-Type'] = 'application/json'
+        headers['charset'] = 'utf-8'
+
+        polling_url = f"https://us-central1-aiplatform.googleapis.com/v1/projects/{self.project_id}/locations/us-central1/publishers/google/models/{model}:fetchPredictOperation"
+
+        # Determine MIME type for start_image
+        start_image_ext = os.path.splitext(start_image_path)[1].lower()
+        if start_image_ext == ".png":
+            start_mime_type = "image/png"
+        elif start_image_ext in [".jpg", ".jpeg"]:
+            start_mime_type = "image/jpeg"
+        else:
+            print(f"  ERROR: Unsupported file extension for start image: {start_image_ext}")
+            return None
+        
+        # Determine MIME type for end_image
+        end_image_ext = os.path.splitext(end_image_path)[1].lower()
+        if end_image_ext == ".png":
+            end_mime_type = "image/png"
+        elif end_image_ext in [".jpg", ".jpeg"]:
+            end_mime_type = "image/jpeg"
+        else:
+            print(f"  ERROR: Unsupported file extension for end image: {end_image_ext}")
+            return None
+        
+        request_body = {
+            "instances": [{
+                "prompt": prompt_text,
+               "image": {
+                    "gcsUri": start_image_gcs_uri,
+                    "mimeType": start_mime_type
+                },
+            }],
+            "parameters": {
+                "config": {
+                    "lastFrame": {
+                    "gcsUri": end_image_gcs_uri,
+                    "mimeType": end_mime_type
+                    },
+                },
+                "aspectRatio": aspect_ratio,
+                "resolution": resolution,
+                "generateAudio": generate_audio,
+                "sampleCount": sample_count,
+                "durationSeconds": duration_seconds,
+                "storageUri": target_output_video_gcs_uri,
+            }
+        }
+        
+        os.makedirs(os.path.dirname(output_local_video_path), exist_ok=True)
+
+        print(f"--- Veo 3.1 Interpolate Request Body ---\n{json.dumps(request_body, indent=2)}\n----------------")
+
+        try:
+            response = requests.post(api_url, headers=headers, data=json.dumps(request_body))
+            response.raise_for_status() 
+            
+            operation_details = response.json()
+            op_name = operation_details.get('name', 'N/A')
+
+            print(f"API Response: {operation_details}")
+            print(f"  SUCCESS (LRO Initiated): Veo 3.1 API call successful. Operation: {op_name}")
+
+            max_iterations = 600
+            interval_sec = 10
+
+            new_request_body = {
+                "operationName": op_name,
+            }
+
+
+            for i in range(max_iterations):
+                try:
+                    polling_response = requests.post(polling_url, headers=headers, data=json.dumps(new_request_body))
+                    polling_response.raise_for_status()
+
+                    print(f" Reponse from polling: {polling_response.text}")
+
+                    if '"done": true' in polling_response.text:
+                        print(f" Reponse from polling: {polling_response.text}")
+                        generated_videos = (
+                            polling_response.json()["response"]["videos"]
+                        )
+
+                        print(f"The generated video samples are: {generated_videos}")
+
+                        # Extract all video URIs
+                        generated_videos_uris = [v.get("gcsUri") for v in generated_videos if v.get("gcsUri")]
+                        
+                        return generated_videos_uris
+                except requests.exceptions.RequestException as e:
+                    print(f"Polling failed for operation {op_name}: {e}")
+                    break  # Exit polling loop on error.
+                except KeyError as e:
+                    print(f"KeyError during polling for {op_name}: {e}. polling_response: {polling_response.text}")
+                    break
+                except Exception as e:
+                    print(f"An unexpected error occurred during polling: {e}")
+                    break
+
+            print(f"Polling operation {op_name}, iteration {i+1}. Retrying in {interval_sec} seconds...")
+            time.sleep(interval_sec)
+
+        except requests.exceptions.HTTPError as e:
+            print(f"  ERROR: HTTP Error during Veo 3.1 API call (with bytes): {e.response.status_code} - {e.response.text}")
+            print(f"--- Full Error Response ---\n{e.response.text}\n--------------------------")
+            print(f"           This may indicate the API does not support byte content for images, expecting gcsUri.")
+        except requests.exceptions.RequestException as e:
+            print(f"  ERROR: Network or other Request Error during Veo 3.1 API call (with bytes): {e}")
+        except Exception as e:
+            print(f"  ERROR: An unexpected error occurred during Veo 3.1 API call (with bytes): {e}")
+        finally:
+            # --- MODIFICATION: Clean up temporary GCS images ---
+            print("Cleaning up temporary input frames from GCS...")
+            for blob in temp_image_blobs:
+                try:
+                    blob.delete()
+                    print(f"  Deleted temporary blob: {blob.name}")
+                except Exception as cleanup_e:
+                    print(f"  WARNING: Failed to clean up temporary blob {blob.name}: {cleanup_e}")
+        
+        return generated_videos_uris
 
     def generate_image_imagen(
         self,

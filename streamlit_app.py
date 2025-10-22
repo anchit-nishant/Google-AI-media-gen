@@ -2351,162 +2351,146 @@ def video_editing_tab():
 
     elif edit_option == "Frame Interpolation":
         st.subheader("Frame Interpolation")
-        st.markdown("Upload pairs of images with 'imgName_first_slate' or 'imgName_last_slate' as filenames")
-        uploaded_images = st.file_uploader(
-            "Upload images for frame interpolation (JPG, PNG, JPEG)",
-            type=["jpg", "png", "jpeg"],
-            accept_multiple_files=True,
-            key="interpolate_images"
+
+        col1, col2 = st.columns(2)
+        with col1:
+            first_frame_file = st.file_uploader(
+                "Upload First Frame",
+                type=["jpg", "png", "jpeg"],
+                key="interpolate_first_frame"
+            )
+            if first_frame_file:
+                st.image(first_frame_file, caption="First Frame")
+
+        with col2:
+            last_frame_file = st.file_uploader(
+                "Upload Last Frame",
+                type=["jpg", "png", "jpeg"],
+                key="interpolate_last_frame"
+            )
+            if last_frame_file:
+                st.image(last_frame_file, caption="Last Frame")
+
+        interpolation_prompt = st.text_area(
+            "Prompt",
+            value="Seamlessly transition from the first frame to the last frame.",
+            height=100,
+            help="Describe the transition between the frames.",
+            key="frame_interpolation_prompt"
         )
 
-        if uploaded_images and len(uploaded_images) > 1:
-            st.write(f"{len(uploaded_images)} images selected:")
-            for image in uploaded_images:
-                st.write(f"- {image.name}")
-
-            playback_speed_factor = st.number_input(
-                "Playback Speed Factor",
-                min_value=0.1,
-                value=1.0,
-                step=0.1,
-                format="%.1f",
-                help="0.5 for half speed, 1.0 for normal, 2.0 for double speed."
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            interpolation_model = st.selectbox(
+                "Model Version", 
+                options=["veo-3.1-fast-generate-preview", "veo-3.1-generate-preview"],
+                key="interpolate_model_version",
+                help="Select the model for frame interpolation."
             )
-
-            interpolation_prompt = st.text_area(
-                "Prompt",
-                value="Seamlessly transition from the first frame to last frame.",
-                height=100,
-                help="Describe the audio you want to generate",
-                key="frame_interpolation_prompt"
+        with col2:
+            interpolation_resolution = st.selectbox(
+                "Output Resolution",
+                options=["720p", "1080p"],
+                key="interpolate_resolution",
+                help="Select the output resolution for the video."
             )
-
-            enable_concatenation = st.checkbox(
-                "Enable Concatenation",
-                value=False
-            )
-
+        with col3:
             aspect_ratio = st.selectbox(
-                "Aspect Ratio", 
-                options=["16:9", "9:16"]   
+                "Aspect Ratio",
+                options=["16:9", "9:16"],
+                key="interpolate_aspect_ratio"
             )
 
-            if st.button("✨ Interpolate Frames", type="primary"):
-                run_temp_dir = None
-                with st.spinner("Interpolating frames and uploading..."):
-                    try:
-                        # 1. SETUP TEMPORARY DIRECTORY
-                        run_id = str(uuid.uuid4())
-                        run_temp_dir = os.path.join("temp_processing_space", run_id)
-                        os.makedirs(os.path.join(run_temp_dir, "original_images"), exist_ok=True)
-                        os.makedirs(os.path.join(run_temp_dir, "interpolated_videos"), exist_ok=True)
+        # Veo 3.1 models support audio generation during interpolation.
+        generate_audio = st.checkbox(
+            "Generate Audio",
+            value=True,
+            disabled=False,
+            key="interpolate_audio"
+        )
 
-                        dir_paths = {
-                            "original_images": os.path.join(run_temp_dir, "0_original_images"),
-                            "interpolated_videos": os.path.join(run_temp_dir, "1_interpolated_videos"),
-                            "final_output": os.path.join(run_temp_dir, "2_final_output")
-                        }
+        col1, col2 = st.columns(2)
+        with col1:
+            interpolation_sample_count = st.slider(
+                "Sample Count",
+                min_value=1,
+                max_value=4,
+                value=1,
+                step=1,
+                key="interpolate_sample_count",
+                help="Number of video variations to generate."
+            )
+        with col2:
+            interpolation_duration = st.select_slider(
+                "Duration (seconds)",
+                options=[4, 7, 8],
+                value=8,
+                key="interpolate_duration",
+                help="Set the duration of the generated video."
+            )
 
-                         # Create all directories from the dictionary
-                        for path in dir_paths.values():
-                            os.makedirs(path, exist_ok=True)
+        if st.button("✨ Interpolate Frames", type="primary"):
+            if not first_frame_file or not last_frame_file:
+                st.error("Please upload both a first frame and a last frame.")
+                return
 
+            run_temp_dir = None
+            with st.spinner("Interpolating frames and uploading..."):
+                try:
+                    # 1. SETUP TEMPORARY DIRECTORY
+                    run_id = str(uuid.uuid4())
+                    run_temp_dir = os.path.join("temp_processing_space", run_id)
+                    os.makedirs(run_temp_dir, exist_ok=True)
 
-                        # 2. PREPARE INPUT IMAGE PAIRS
+                    # 2. SAVE UPLOADED IMAGES TO TEMP FILES
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(first_frame_file.name)[1], dir=run_temp_dir) as tmp_first:
+                        tmp_first.write(first_frame_file.getvalue())
+                        start_image_path = tmp_first.name
 
-                        local_image_paths_map = OrderedDict()
-                        
-                        # Save uploaded files to a temporary location first
-                        for uploaded_file in uploaded_images:
-                            # Create a destination path in your temporary directory
-                            dst_path = os.path.join(dir_paths["original_images"], uploaded_file.name)
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(last_frame_file.name)[1], dir=run_temp_dir) as tmp_last:
+                        tmp_last.write(last_frame_file.getvalue())
+                        end_image_path = tmp_last.name
+
+                    # 3. GENERATE INTERPOLATED VIDEO
+                    st.info(f"Calling {interpolation_model} API for interpolation...")
+                    output_local_path = os.path.join(run_temp_dir, "interpolated_video.mp4")
+
+                    interpolated_video_gcs_uris = client.interpolate_video_veo3(
+                        start_image_path=start_image_path,
+                        end_image_path=end_image_path,
+                        prompt_text=interpolation_prompt,
+                        model=interpolation_model,
+                        output_local_video_path=output_local_path, # This is used for naming in GCS
+                        resolution=interpolation_resolution,
+                        aspect_ratio=aspect_ratio,
+                        generate_audio=generate_audio,
+                        duration_seconds=interpolation_duration,
+                        sample_count=interpolation_sample_count,
+                        storage_uri=f"gs://{BUCKET_NAME}/interpolated_videos/"
+                    )
+
+                    if not interpolated_video_gcs_uris:
+                        st.error("Frame interpolation failed. The API did not return a video URI.")
+                        return
+
+                    st.subheader("Interpolation Results")
+                    for i, uri in enumerate(interpolated_video_gcs_uris):
+                        with st.expander(f"Video Result {i+1}", expanded=True):
+                            # 4. DOWNLOAD THE GENERATED VIDEO FOR DISPLAY AND HISTORY
+                            st.info(f"Downloading generated video {i+1} from GCS...")
+                            # Extract the blob name from the full GCS URI
+                            blob_name = uri.replace(f"gs://{BUCKET_NAME}/", "")
                             
-                            # Write the file's content to the destination path
-                            with open(dst_path, "wb") as f:
-                                f.write(uploaded_file.getbuffer())
-                            
-                            # Now, store the actual disk path in your map
-                            local_image_paths_map[uploaded_file.name] = dst_path
+                            # Use a unique local path for each download
+                            downloaded_local_path = os.path.join(run_temp_dir, f"interpolated_video_{i}.mp4")
+                            Veo2API.download_blob(BUCKET_NAME, blob_name, downloaded_local_path)
 
-                        sorted_product_slate_pairs = OrderedDict()
-                        for original_filename, original_path in local_image_paths_map.items():
-                            if "_first_slate" in original_filename: key = original_filename.split("_first_slate")[0]
-                            elif "_last_slate" in original_filename: key = original_filename.split("_last_slate")[0]
-                            else: continue
-                            if key not in sorted_product_slate_pairs: sorted_product_slate_pairs[key] = {}
-                            if "_first_slate" in original_filename: sorted_product_slate_pairs[key]['first'] = original_path
-                            elif "_last_slate" in original_filename: sorted_product_slate_pairs[key]['last'] = original_path
-                        
-                        valid_pairs = OrderedDict([(k,v) for k,v in sorted_product_slate_pairs.items() if 'first' in v and 'last' in v])
-                        # valid_pairs = _prepare_image_pairs(uploaded_images, os.path.join(run_temp_dir, "original_images"))
-                        if not valid_pairs:
-                            st.error("No valid '_first_slate' and '_last_slate' image pairs found.")
-                            return
+                            if not os.path.exists(downloaded_local_path):
+                                st.error(f"Failed to download the generated video {i+1}.")
+                                continue
 
-                        # 3. GENERATE INTERPOLATED VIDEO SEGMENTS LOCALLY
-                        local_interpolated_paths = []
-                        project_id = st.session_state.get("project_id", config.PROJECT_ID)
-                        api_client = Veo2API(project_id)
-                        
-                        for i, (base_name, slates) in enumerate(valid_pairs.items()):
-                            st.info(f"Interpolating pair {i+1}: {base_name}...")
-                            output_local_path = os.path.join(run_temp_dir, "interpolated_videos", f"{base_name}_interpolated.mp4")
-                            
-                            # This API call should download the generated video to output_local_path
-                            interpolated_video_gcs_uri=client.interpolate_video_veo2(
-                                start_image_path=slates['first'],
-                                end_image_path=slates['last'],
-                                prompt_text=interpolation_prompt,
-                                output_local_video_path=output_local_path,
-                                aspect_ratio=aspect_ratio,
-                                storage_uri=f"gs://{BUCKET_NAME}/interpolated_videos/"
-                            )
-                            base_uri = st.session_state.get("storage_uri", config.STORAGE_URI)
-                                # Construct a clean path for the voiceovers folder, avoiding the f-string syntax error.
-                            base_storage_uri = f"{base_uri.rstrip('/')}/interpolated_videos/"
-                            storage_uri = base_storage_uri # This is the GCS folder where Veo will store the output
-                            path = base_uri[5:]
-                            bucket_name = path.split("/")[0]
-                            link_to_download = interpolated_video_gcs_uri.split(base_uri)[1]
-                                    
-                            Veo2API.download_blob(BUCKET_NAME, link_to_download, output_local_path)
-
-                            if os.path.exists(output_local_path):
-                                st.success(f"Generated segment for {base_name}")
-                                local_interpolated_paths.append(output_local_path)
-                            else:
-                                st.warning(f"Failed to generate segment for {base_name}")
-
-                        if not local_interpolated_paths:
-                            st.error("No video segments were successfully generated.")
-                            return
-                            
-                        # 4. PROCESS FINAL OUTPUT
-                        final_videos_to_process = []
-                        if enable_concatenation and len(local_interpolated_paths) > 1:
-                            st.info("Concatenating video segments...")
-                            final_path = os.path.join(run_temp_dir, "final_concatenated.mp4")
-                            # Using the Veo2API helper for consistency
-                            Veo2API.concatenate_videos(local_interpolated_paths, final_path, run_temp_dir)
-                            final_videos_to_process.append((final_path, "interpolated-concatenated.mp4"))
-                        else:
-                            final_videos_to_process = [(p, os.path.basename(p)) for p in local_interpolated_paths]
-
-                        # 5. APPLY SPEED CHANGE IF NEEDED
-                        if playback_speed_factor != 1.0:
-                            st.info(f"Applying speed factor of {playback_speed_factor}x...")
-                            speed_altered_videos = []
-                            for path, name in final_videos_to_process:
-                                new_path = os.path.join(run_temp_dir, f"speed_{name}")
-                                # Using the Veo2API helper for consistency
-                                Veo2API.alter_video_speed(path, new_path, playback_speed_factor, run_temp_dir)
-                                speed_altered_videos.append((new_path, name))
-                            final_videos_to_process = speed_altered_videos
-                        
-                        # 6. UPLOAD AND DISPLAY FINAL VIDEOS
-                        st.subheader("Interpolation Results")
-                        for local_path, original_name in final_videos_to_process:
-                            final_gcs_uri = video_upload_to_gcs(local_path, BUCKET_NAME, original_name)
+                            # 5. UPLOAD AND DISPLAY FINAL VIDEO
+                            final_gcs_uri = video_upload_to_gcs(downloaded_local_path, BUCKET_NAME, f"interpolated-video-{run_id}-{i}.mp4")
                             if final_gcs_uri:
                                 signed_url = client.generate_signed_url(final_gcs_uri)
                                 st.video(signed_url)
@@ -2515,22 +2499,23 @@ def video_editing_tab():
                                         'user_id': st.session_state.user_id,
                                         'timestamp': firestore.SERVER_TIMESTAMP,
                                         'type': 'video', 'uri': final_gcs_uri,
-                                        'prompt': f'Video interpolated and changed by factor of {playback_speed_factor}',
-                                        'params': {'operation': 'Interpolation and change_speed', 'factor': playback_speed_factor}
+                                        'prompt': f'Video interpolated with prompt: {interpolation_prompt}',
+                                        'params': {'operation': 'frame_interpolation', 'aspect_ratio': aspect_ratio, 'sample': i+1},
+                                        'model': interpolation_model, 'aspect_ratio': aspect_ratio,
+                                        'resolution': interpolation_resolution, 'audio_generated': generate_audio,
+                                        'duration_seconds': interpolation_duration, 'sample_count': interpolation_sample_count
                                     })
-                        
-                    except Exception as e:
-                        st.error(f"An error occurred during frame interpolation: {e}")
-                        import traceback
-                        st.code(traceback.format_exc())
-                    finally:
-                        # 7. SAFE CLEANUP
-                        if run_temp_dir and os.path.exists(run_temp_dir):
-                            shutil.rmtree(run_temp_dir)
-                            logger.info(f"Cleaned up temporary directory: {run_temp_dir}")
 
-        elif uploaded_images:
-            st.warning("Please upload at least two images for frame interpolation.")
+
+                except Exception as e:
+                    st.error(f"An error occurred during frame interpolation: {e}")
+                    import traceback
+                    st.code(traceback.format_exc())
+                finally:
+                    # 6. SAFE CLEANUP
+                    if run_temp_dir and os.path.exists(run_temp_dir):
+                        shutil.rmtree(run_temp_dir)
+                        logger.info(f"Cleaned up temporary directory: {run_temp_dir}")
 
     elif edit_option == "Dubbing":
         st.subheader("Dub Video")
@@ -4005,16 +3990,6 @@ def edit_image(
                 # Note: 'seed' and other unused parameters are ignored by the new function
             )
 
-            # Create a unique ID for this synchronous operation to track it
-            operation_id = f"image_edit-{uuid.uuid4().hex}"
-            # Add to pending operations BEFORE the API call
-            add_pending_operation_to_firestore(
-                operation_id=operation_id,
-                operation_type='image_edit',
-                params={"prompt": prompt, "model": model},
-                model_id=model
-            )
-
             if "error" in response:
                 error_msg = response.get("error", {}).get("message", "Unknown error")
                 st.error(f"⚠️ Image editing failed: {error_msg}")
@@ -4078,7 +4053,7 @@ def display_videos(video_uris, client, enable_streaming=True):
     for i, uri in enumerate(video_uris):
         # Create a collapsible section for each video
         with st.expander(f"Video {i+1}", expanded=True):
-            display_single_video(uri, client, enable_streaming)
+             display_single_video(uri, client, enable_streaming)
 
 def display_single_video(uri, client, enable_streaming):
     """Helper function to display a single video."""
