@@ -94,6 +94,8 @@ Next, create the necessary database and storage resources.
 
 To allow users to sign in with their Google accounts, you must create OAuth 2.0 credentials.
 
+[Login Screen](login-screen.png)
+
 ##### 2.4.1 Configure the OAuth Consent Screen
 
 First, configure what users will see when they grant permission to your app.

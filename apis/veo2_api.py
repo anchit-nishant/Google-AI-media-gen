@@ -778,9 +778,10 @@ class Veo2API:
                 except Exception as e:
                     print(f"An unexpected error occurred during polling: {e}")
                     break
-
-            print(f"Polling operation {op_name}, iteration {i+1}. Retrying in {interval_sec} seconds...")
-            time.sleep(interval_sec)
+                
+                # This was outside the loop, causing it to timeout. Moved inside.
+                print(f"Polling operation {op_name}, iteration {i+1}. Retrying in {interval_sec} seconds...")
+                time.sleep(interval_sec)
 
         except requests.exceptions.HTTPError as e:
             print(f"  ERROR: HTTP Error during Veo 2 API call (with bytes): {e.response.status_code} - {e.response.text}")
@@ -989,9 +990,10 @@ class Veo2API:
                 except Exception as e:
                     print(f"An unexpected error occurred during polling: {e}")
                     break
-
-            print(f"Polling operation {op_name}, iteration {i+1}. Retrying in {interval_sec} seconds...")
-            time.sleep(interval_sec)
+                
+                # This was outside the loop, causing it to timeout. Moved inside.
+                print(f"Polling operation {op_name}, iteration {i+1}. Retrying in {interval_sec} seconds...")
+                time.sleep(interval_sec)
 
         except requests.exceptions.HTTPError as e:
             print(f"  ERROR: HTTP Error during Veo 3.1 API call (with bytes): {e.response.status_code} - {e.response.text}")
