@@ -2,6 +2,8 @@
 
 This application provides a streamlined interface for generating different typesd of media content using Google's in-house AI models. The Streamlit web application has the following features:
 
+![Home Screen](home-screen.png)
+
 ## Features
 
 - **Text-to-Video Generation**: Create videos from text prompts with customizable parameters using Veo 3 and Veo 2.
