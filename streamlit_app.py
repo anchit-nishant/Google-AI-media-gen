@@ -3088,9 +3088,11 @@ def get_history_from_firestore(user_id, limit=200):
         docs = history_ref.stream()
         
         history_list = [doc.to_dict() for doc in docs]
-            
+        for item in history_list:
+            # Add the Firestore document ID to each item
+            item['doc_id'] = item.get('doc_id', str(uuid.uuid4())) # Fallback for older entries if doc_id isn't directly available
         if not history_list:
-            return pd.DataFrame(columns=['timestamp', 'type', 'uri', 'prompt', 'params'])
+            return pd.DataFrame(columns=['timestamp', 'type', 'uri', 'prompt', 'params', 'doc_id'])
             
         df = pd.DataFrame(history_list)
         # Ensure timestamp column is of datetime type for proper sorting
@@ -3103,7 +3105,7 @@ def get_history_from_firestore(user_id, limit=200):
     except Exception as e:
         logger.error(f"Error getting history from Firestore: {str(e)}")
         st.error(f"Error getting history from Firestore: {str(e)}")
-        return pd.DataFrame(columns=['timestamp', 'type', 'uri', 'prompt', 'params'])
+        return pd.DataFrame(columns=['timestamp', 'type', 'uri', 'prompt', 'params', 'doc_id'])
 
 def display_recent_videos(history_data):
     """Displays the 'Recent Videos' sub-tab content."""
@@ -3447,6 +3449,7 @@ def history_tab():
 def display_history_video_card(row):
     """Display a video history card with details and buttons."""
     uri = row['uri']
+    doc_id = row['doc_id'] # Get the unique Firestore document ID
     timestamp = row['timestamp']
     prompt = row.get('prompt', 'No prompt available.')
     params = _parse_history_params(row.get('params', {}))
@@ -3460,7 +3463,7 @@ def display_history_video_card(row):
         else:
             st.session_state.selected_history_items[uri] = 'video'
 
-    st.checkbox("Select this video", value=is_selected, key=f"select_{uri}", on_change=toggle_selection, label_visibility="collapsed")
+    st.checkbox("Select this video", value=is_selected, key=f"select_{doc_id}", on_change=toggle_selection, label_visibility="collapsed")
     # Generate a signed URL for the video
     try:
         # Check if we already have a cached signed URL for this video
@@ -4578,6 +4581,7 @@ def video_upload_to_gcs(file_path: str, bucket_name: str, object_name: str) -> s
 def display_history_image_card(row):
     """Display an image history card with details and buttons."""
     # Extract data
+    doc_id = row['doc_id'] # Get the unique Firestore document ID
     uri = row['uri']
     # Generate a unique identifier for this image based on more of the URI
     unique_id = uri.replace("/", "_").replace(".", "_").replace(":", "_")[-20:]
@@ -4601,8 +4605,8 @@ def display_history_image_card(row):
             del st.session_state.selected_history_items[uri]
         else:
             st.session_state.selected_history_items[uri] = 'image'
-    st.checkbox("Select this image", value=is_selected, key=f"select_{uri}", on_change=toggle_selection, label_visibility="collapsed")
-    # Generate a signed URL for the image
+    # Use the unique Firestore document ID for the checkbox key
+    st.checkbox("Select this image", value=is_selected, key=f"select_{doc_id}", on_change=toggle_selection, label_visibility="collapsed")
     try:
 
         signed_url = get_cached_signed_url(uri)
