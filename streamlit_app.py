@@ -10,6 +10,7 @@ import json
 import tempfile
 import io
 import queue
+import base64
 import sys
 import hashlib
 import pandas as pd
@@ -1827,35 +1828,34 @@ def text_to_audio_tab():
         key="audio_prompt"
     )
 
-    # Number of results slider
-    # sample_count = st.slider(
-    #     "Number of Results",
-    #     min_value=1,
-    #     max_value=4,
-    #     value=1,
-    #     help="Generate multiple audio variations",
-    #     key="audio_sample_count"
-    # )
+    col1, col2 = st.columns(2)
+    with col1:
+        sample_count = st.slider(
+            "Number of Samples",
+            min_value=1,
+            max_value=4,
+            value=1,
+            help="Generate multiple audio variations. Using more than 1 sample will disable the 'Seed' option.",
+            key="audio_sample_count"
+        )
 
-    # Seed input and Sample count interaction
-    # seed_disabled = sample_count > 1
-    # seed_help_text = "Optional seed for deterministic generation"
-    # if seed_disabled:
-    #     seed_help_text += " (disabled for more than one sample)"
-    seed = st.number_input(
-        "Seed",
-        min_value=0,
-        max_value=4294967295,
-        value=None,
-        # help=seed_help_text,
-        key="audio_seed",
-        # disabled=seed_disabled
-    )
-    if seed is not None and seed == 0:
-        seed = None  # Treat 0 as None
+    # The audio API requires seed to be unset if sample_count > 1
+    seed_disabled = sample_count > 1
+    seed_help_text = "Optional seed for deterministic generation."
+    if seed_disabled:
+        seed_help_text += " Disabled when generating multiple samples."
 
-    # Disable sample count if seed is provided
-    sample_count_disabled = seed is not None
+    with col2:
+        seed_value = None if seed_disabled else st.session_state.get("audio_seed_input", None)
+        seed = st.number_input(
+            "Seed",
+            min_value=0,
+            max_value=4294967295,
+            value=seed_value,
+            help=seed_help_text,
+            key="audio_seed_input",
+            disabled=seed_disabled
+        )
 
     # Advanced options for audio
     with st.expander("Advanced Options"):
@@ -1873,7 +1873,7 @@ def text_to_audio_tab():
         generate_audio(
             project_id=st.session_state.get("project_id", config.PROJECT_ID),
             prompt=prompt,
-            sample_count=1,
+            sample_count=sample_count,
             negative_prompt=negative_prompt,
             seed=seed,
             storage_uri=f"{base_uri.rstrip('/')}/generated_audio/",
@@ -2336,7 +2336,8 @@ def video_editing_tab():
                                     'timestamp': firestore.SERVER_TIMESTAMP,
                                     'type': 'video', 'uri': final_video_uri,
                                     'prompt': f'Video speed changed by factor of {speed_factor}',
-                                    'params': {'operation': 'change_speed', 'factor': speed_factor}
+                                    'params': {'operation': 'change_speed', 'factor': speed_factor},
+                                    'favorite': False
                                 })
                     else:
                         st.error("Failed to process video speed.")
@@ -2502,7 +2503,7 @@ def video_editing_tab():
                                         'prompt': f'Video interpolated with prompt: {interpolation_prompt}',
                                         'params': {'operation': 'frame_interpolation', 'aspect_ratio': aspect_ratio, 'sample': i+1},
                                         'model': interpolation_model, 'aspect_ratio': aspect_ratio,
-                                        'resolution': interpolation_resolution, 'audio_generated': generate_audio,
+                                        'resolution': interpolation_resolution, 'audio_generated': generate_audio, 'favorite': False,
                                         'duration_seconds': interpolation_duration, 'sample_count': interpolation_sample_count
                                     })
 
@@ -3014,7 +3015,7 @@ def image_to_video_tab():
                                     'timestamp': firestore.SERVER_TIMESTAMP,
                                     'type': 'image',
                                     'uri': uploaded_image_uri,
-                                    'prompt': 'Input image',
+                                    'prompt': 'Input image', 'favorite': False,
                                     'params': image_params
                                 })
                                 logger.info(f"Added image {uploaded_image_uri} to Firestore history.")
@@ -3078,34 +3079,78 @@ def get_history_from_firestore(user_id, limit=200):
     """
     if not FIRESTORE_AVAILABLE:
         logger.error("Firestore is not available. Cannot get history.")
-        return pd.DataFrame(columns=['timestamp', 'type', 'uri', 'prompt', 'params'])
+        return pd.DataFrame(columns=['timestamp', 'type', 'uri', 'prompt', 'params', 'doc_id', 'favorite'])
 
     try:
         # Fetch all documents for the user first, then sort and limit in pandas.
         # This avoids the need for a composite index in Firestore.
         history_ref = db.collection('history').where('user_id', '==', user_id)
-        
         docs = history_ref.stream()
         
-        history_list = [doc.to_dict() for doc in docs]
-        for item in history_list:
-            # Add the Firestore document ID to each item
-            item['doc_id'] = item.get('doc_id', str(uuid.uuid4())) # Fallback for older entries if doc_id isn't directly available
+        history_list = []
+        for doc in docs:
+            item = doc.to_dict()
+            item['doc_id'] = doc.id  # Use the actual document ID
+            # Ensure 'favorite' key exists, defaulting to False for old records
+            if 'favorite' not in item:
+                item['favorite'] = False
+            history_list.append(item)
+
         if not history_list:
-            return pd.DataFrame(columns=['timestamp', 'type', 'uri', 'prompt', 'params', 'doc_id'])
+            return pd.DataFrame(columns=['timestamp', 'type', 'uri', 'prompt', 'params', 'doc_id', 'favorite'])
             
         df = pd.DataFrame(history_list)
         # Ensure timestamp column is of datetime type for proper sorting
         if 'timestamp' in df.columns:
             df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
-            # Sort by timestamp descending and then take the top 'limit' results
-            return df.sort_values('timestamp', ascending=False).head(limit)
+            df = df.sort_values('timestamp', ascending=False).head(limit)
+        
         return df
 
     except Exception as e:
         logger.error(f"Error getting history from Firestore: {str(e)}")
         st.error(f"Error getting history from Firestore: {str(e)}")
         return pd.DataFrame(columns=['timestamp', 'type', 'uri', 'prompt', 'params', 'doc_id'])
+
+def toggle_favorite_status(doc_id: str, current_status: bool):
+    """Toggles the 'favorite' field for a history document in Firestore."""
+    if not FIRESTORE_AVAILABLE:
+        st.error("Firestore is not available. Cannot update favorite status.")
+        return
+    try:
+        db.collection('history').document(doc_id).update({'favorite': not current_status})
+        st.session_state.history_loaded = False # Force a history reload
+    except Exception as e:
+        st.error(f"Failed to update favorite status: {e}")
+
+def delete_history_items(items_to_delete: Dict[str, str]):
+    """Deletes multiple history items from Firestore and their corresponding files from GCS."""
+    if not FIRESTORE_AVAILABLE:
+        st.error("Firestore is not available. Cannot delete items.")
+        return
+
+    total_items = len(items_to_delete)
+    progress_bar = st.progress(0, text=f"Starting deletion of {total_items} items...")
+
+    for i, (uri, doc_id) in enumerate(items_to_delete.items()):
+        progress_text = f"Deleting item {i+1}/{total_items}: {uri.split('/')[-1]}"
+        progress_bar.progress((i + 1) / total_items, text=progress_text)
+        try:
+            # 1. Delete from Firestore
+            db.collection('history').document(doc_id).delete()
+            logger.info(f"Deleted history document from Firestore: {doc_id}")
+
+            # 2. Delete from GCS
+            if uri and uri.startswith("gs://"):
+                storage_client = storage.Client()
+                bucket_name, blob_name = uri[5:].split("/", 1)
+                bucket = storage_client.bucket(bucket_name)
+                blob = bucket.blob(blob_name)
+                blob.delete()
+                logger.info(f"Deleted file from GCS: {uri}")
+
+        except Exception as e:
+            st.error(f"Failed to delete item {uri}: {e}")
 
 def display_recent_videos(history_data):
     """Displays the 'Recent Videos' sub-tab content."""
@@ -3116,6 +3161,13 @@ def display_recent_videos(history_data):
     else:
         video_header_col, clear_col = st.columns([5, 1])
         with video_header_col:
+            # Add a toggle to show only favorites
+            show_favorites_only = st.toggle(
+                "Show only favorites ⭐️", 
+                key="video_favorites_toggle"
+            )
+            if show_favorites_only:
+                video_history = video_history[video_history['favorite'] == True]
             st.markdown(f"### Recent Generated Videos ({len(video_history)})")
         with clear_col:
             if st.button("🗑️ Clear All", key="clear_history_btn", type="secondary"):
@@ -3205,6 +3257,12 @@ def display_recent_audios(history_data):
     if audio_history.empty:
         st.info("No audio generation history found.")
     else:
+        show_favorites_only = st.toggle(
+            "Show only favorites ⭐️", 
+            key="audio_favorites_toggle"
+        )
+        if show_favorites_only:
+            audio_history = audio_history[audio_history['favorite'] == True]
         st.markdown(f"Found {len(audio_history)} audio generations.")
         audio_history = audio_history.sort_values('timestamp', ascending=False)
         st.markdown('<div class="history-grid">', unsafe_allow_html=True)
@@ -3226,6 +3284,12 @@ def display_recent_voices(history_data):
     if voice_history.empty:
         st.info("No voiceover generation history found.")
     else:
+        show_favorites_only = st.toggle(
+            "Show only favorites ⭐️", 
+            key="voice_favorites_toggle"
+        )
+        if show_favorites_only:
+            voice_history = voice_history[voice_history['favorite'] == True]
         st.markdown(f"Found {len(voice_history)} voiceover generations.")
         voice_history = voice_history.sort_values('timestamp', ascending=False)
         st.markdown('<div class="history-grid">', unsafe_allow_html=True)
@@ -3250,7 +3314,14 @@ def display_all_images(history_data):
     if image_history.empty:
         st.info("No source images in history yet.")
     else:
-        st.markdown("### Filter Source Images")
+        st.markdown("### Source Images")
+        
+        show_favorites_only = st.toggle(
+            "Show only favorites ⭐️", 
+            key="image_favorites_toggle"
+        )
+        if show_favorites_only:
+            image_history = image_history[image_history['favorite'] == True]
         col1, col2 = st.columns([3, 2])
         with col1:
             search_term = st.text_input("Search by filename:", key="image_search", placeholder="Enter filename or leave empty to show all")
@@ -3272,7 +3343,7 @@ def display_all_images(history_data):
         max_pages = max(1, (total_images + items_per_page - 1) // items_per_page)
         if "image_page" not in st.session_state:
             st.session_state.image_page = 0
-            
+
         st.markdown(f"### Source Images ({total_images})")
         
         col1, col2, col3 = st.columns([1, 3, 1])
@@ -3324,6 +3395,12 @@ def display_all_history(history_data):
     with col3:
         sort_order = st.selectbox("Order:", ["Newest first", "Oldest first"], key="sort_order")
     with col4:
+        show_favorites_only = st.toggle(
+            "Show only favorites ⭐️", 
+            key="all_history_favorites_toggle"
+        )
+
+    with st.columns(1)[0]: # Use a column to align the view mode selector
         view_mode = st.selectbox("View as:", ["Table", "Grid"], key="view_mode")
     
     filtered_history = history_data.copy()
@@ -3332,6 +3409,9 @@ def display_all_history(history_data):
     elif filter_type == "Image":
         filtered_history = filtered_history[filtered_history['type'] == 'image']
     
+    if show_favorites_only:
+        filtered_history = filtered_history[filtered_history['favorite'] == True]
+
     if sort_field == "Date":
         if sort_order == "Newest first":
             filtered_history = filtered_history.sort_values('timestamp', ascending=False)
@@ -3441,6 +3521,10 @@ def history_tab():
             st.session_state.previous_history_sub_tab = st.session_state.active_history_sub_tab
         # Call the appropriate function to display the content of the active tab
         HISTORY_SUB_TABS[st.session_state.active_history_sub_tab](history_data)
+    elif st.session_state.get("history_loaded", False):
+        # This case handles when history is cleared and becomes empty.
+        # We still need to render the tab structure.
+        st.info("No generation history found. Generate some videos or images to see them here!")
     else:
         st.info("No generation history found. Generate some videos or images to see them here!")
     
@@ -3449,10 +3533,11 @@ def history_tab():
 def display_history_video_card(row):
     """Display a video history card with details and buttons."""
     uri = row['uri']
-    doc_id = row['doc_id'] # Get the unique Firestore document ID
+    doc_id = row.get('doc_id') # Get the unique Firestore document ID
     timestamp = row['timestamp']
     prompt = row.get('prompt', 'No prompt available.')
     params = _parse_history_params(row.get('params', {}))
+    is_favorite = row.get('favorite', False)
 
     # --- Selection Checkbox ---
     is_selected = uri in st.session_state.get('selected_history_items', {})
@@ -3461,9 +3546,20 @@ def display_history_video_card(row):
         if uri in st.session_state.selected_history_items:
             del st.session_state.selected_history_items[uri]
         else:
-            st.session_state.selected_history_items[uri] = 'video'
+            st.session_state.selected_history_items[uri] = {'type': 'video', 'doc_id': doc_id}
 
-    st.checkbox("Select this video", value=is_selected, key=f"select_{doc_id}", on_change=toggle_selection, label_visibility="collapsed")
+    # Use columns for checkbox and favorite button
+    select_col, fav_col = st.columns([1, 5])
+    with select_col:
+        st.checkbox("Select", value=is_selected, key=f"select_{doc_id}", on_change=toggle_selection, label_visibility="collapsed")
+    with fav_col:
+        st.button(
+            "⭐️" if is_favorite else "☆", 
+            key=f"fav_{doc_id}", 
+            on_click=toggle_favorite_status, 
+            args=(doc_id, is_favorite),
+            help="Mark as favorite"
+        )
     # Generate a signed URL for the video
     try:
         # Check if we already have a cached signed URL for this video
@@ -3818,7 +3914,8 @@ def generate_video(
                                         'user_id': st.session_state.user_id,
                                         'type': "video", 'uri': uri, 'prompt': prompt, 'params': params
                                     })
-                                    logger.info(f"Added video {uri} to Firestore history.")
+                                db.collection('history').document(doc_ref.id).update({'favorite': False})
+                                logger.info(f"Added video {uri} to Firestore history with favorite set to false.")
 
                                 logger.success("Successfully added video to Firestore history")
                             except Exception as e:
@@ -3933,6 +4030,7 @@ def generate_image(
                     db.collection('history').document().set({
                         'timestamp': firestore.SERVER_TIMESTAMP, 'type': 'image', 'uri': uri,
                         'user_id': st.session_state.user_id,
+                        'favorite': False,
                         'prompt': prompt, 'params': params
                     })
 
@@ -4033,6 +4131,7 @@ def edit_image(
                     db.collection('history').document().set({
                         'timestamp': firestore.SERVER_TIMESTAMP, 'type': 'image', 'uri': uri,
                         'user_id': st.session_state.user_id,
+                        'favorite': False,
                         'prompt': f"Edited image with prompt: {prompt}", 'params': params
                     })
 
@@ -4055,7 +4154,15 @@ def display_videos(video_uris, client, enable_streaming=True):
     
     for i, uri in enumerate(video_uris):
         # Create a collapsible section for each video
-        with st.expander(f"Video {i+1}", expanded=True):
+        expander_title = f"Video {i+1}"
+        # Find the corresponding history entry to check favorite status
+        history_entry = st.session_state.get('history_data', pd.DataFrame())
+        if not history_entry.empty:
+            entry = history_entry[history_entry['uri'] == uri]
+            if not entry.empty and entry.iloc[0].get('favorite'):
+                expander_title += " ⭐️"
+
+        with st.expander(expander_title, expanded=True):
              display_single_video(uri, client, enable_streaming)
 
 def display_single_video(uri, client, enable_streaming):
@@ -4064,6 +4171,21 @@ def display_single_video(uri, client, enable_streaming):
     st.markdown(f"**URI**: {uri}")
     
     # Always display GCS links clearly
+    # Add favorite button
+    history_df = st.session_state.get('history_data', pd.DataFrame())
+    if not history_df.empty:
+        entry = history_df[history_df['uri'] == uri]
+        if not entry.empty:
+            doc_id = entry.iloc[0]['doc_id']
+            is_favorite = entry.iloc[0].get('favorite', False)
+            st.button(
+                "⭐️" if is_favorite else "☆",
+                key=f"fav_new_{doc_id}",
+                on_click=toggle_favorite_status,
+                args=(doc_id, is_favorite),
+                help="Mark as favorite"
+            )
+
     if uri.startswith("gs://"):
         st.code(uri, language="bash")
     
@@ -4168,6 +4290,20 @@ def display_images(image_uris):
     for i, uri in enumerate(image_uris):
         with cols[i % len(cols)]:
             try:
+                # Add favorite button
+                history_df = st.session_state.get('history_data', pd.DataFrame())
+                if not history_df.empty:
+                    entry = history_df[history_df['uri'] == uri]
+                    if not entry.empty:
+                        doc_id = entry.iloc[0]['doc_id']
+                        is_favorite = entry.iloc[0].get('favorite', False)
+                        st.button(
+                            "⭐️" if is_favorite else "☆",
+                            key=f"fav_new_img_{doc_id}",
+                            on_click=toggle_favorite_status,
+                            args=(doc_id, is_favorite),
+                            help="Mark as favorite"
+                        )
                 signed_url = get_cached_signed_url(uri)
                 st.image(signed_url, caption=f"Generated Image {i+1}", use_container_width=True)
                 st.markdown(f'<div style="text-align: center;"><a href="{signed_url}" target="_blank" style="font-size: 0.8rem;">Open in new tab</a></div>', unsafe_allow_html=True)
@@ -4220,6 +4356,8 @@ def display_history_audio_card(row):
     timestamp = row['timestamp']
     prompt = row.get('prompt', 'No prompt available.')
     params = _parse_history_params(row.get('params', {}))
+    is_favorite = row.get('favorite', False)
+    doc_id = row.get('doc_id')
 
     try:
         signed_url = get_cached_signed_url(uri)
@@ -4228,6 +4366,24 @@ def display_history_audio_card(row):
         signed_url = None
 
     if signed_url:
+        is_selected = uri in st.session_state.get('selected_history_items', {})
+        def toggle_selection():
+            if uri in st.session_state.selected_history_items:
+                del st.session_state.selected_history_items[uri]
+            else:
+                st.session_state.selected_history_items[uri] = {'type': 'audio', 'doc_id': doc_id}
+
+        select_col, fav_col = st.columns([1, 5])
+        with select_col:
+            st.checkbox("Select", value=is_selected, key=f"select_{doc_id}", on_change=toggle_selection, label_visibility="collapsed")
+        with fav_col:
+            st.button(
+                "⭐️" if is_favorite else "☆",
+                key=f"fav_hist_audio_{doc_id}",
+                on_click=toggle_favorite_status,
+                args=(doc_id, is_favorite),
+                help="Mark as favorite"
+            )
         st.audio(signed_url, format="audio/wav") # The API saves as WAV
     else:
         st.error("Could not generate a signed URL for this audio.")
@@ -4259,6 +4415,8 @@ def display_history_voice_card(row):
     timestamp = row['timestamp']
     script = row.get('prompt', 'No script available.')
     params = _parse_history_params(row.get('params', {}))
+    is_favorite = row.get('favorite', False)
+    doc_id = row.get('doc_id')
 
     try:
         signed_url = get_cached_signed_url(uri)
@@ -4267,6 +4425,24 @@ def display_history_voice_card(row):
         signed_url = None
 
     if signed_url:
+        is_selected = uri in st.session_state.get('selected_history_items', {})
+        def toggle_selection():
+            if uri in st.session_state.selected_history_items:
+                del st.session_state.selected_history_items[uri]
+            else:
+                st.session_state.selected_history_items[uri] = {'type': 'voice', 'doc_id': doc_id}
+
+        select_col, fav_col = st.columns([1, 5])
+        with select_col:
+            st.checkbox("Select", value=is_selected, key=f"select_{doc_id}", on_change=toggle_selection, label_visibility="collapsed")
+        with fav_col:
+            st.button(
+                "⭐️" if is_favorite else "☆",
+                key=f"fav_hist_voice_{doc_id}",
+                on_click=toggle_favorite_status,
+                args=(doc_id, is_favorite),
+                help="Mark as favorite"
+            )
         st.audio(signed_url, format="audio/wav") # TTS often produces WAV
     else:
         st.error("Could not generate a signed URL for this voiceover.")
@@ -4350,7 +4526,8 @@ def dub_video(uploaded_video, input_language, output_language, bucket_name):
                     'type': 'video',
                     'uri': full_gcs_uri,
                     'prompt': f'Video dubbed from {input_language} to {output_language}.',
-                    'params': {'operation': 'dub_video', 'input_language': input_language, 'output_language': output_language}
+                    'params': {'operation': 'dub_video', 'input_language': input_language, 'output_language': output_language},
+                    'favorite': False
                 })
                 st.success(f"✅ Dubbed video saved to history: {full_gcs_uri}")
         else:
@@ -4418,11 +4595,52 @@ def generate_audio(
                 storage_uri=storage_uri,
             )
 
-            # The response will contain the URIs of the generated audio files.
-            audio_uris = response if isinstance(response, list) else []
+            # --- NEW RESPONSE HANDLING LOGIC ---
+            predictions = response.get("predictions", [])
+            if not predictions:
+                st.warning("Audio generation succeeded, but the API response contained no audio data. This may be due to safety filters.")
+                st.json(response) # Show the full response for debugging
+                return
+
+            audio_uris = []
+            st.success(f"Successfully generated {len(predictions)} audio sample(s)!")
+
+            for i, prediction in enumerate(predictions):
+                audio_content_b64 = prediction.get("bytesBase64Encoded")
+                if not audio_content_b64:
+                    st.warning(f"Sample {i+1} did not contain audio data.")
+                    continue
+
+                try:
+                    audio_bytes = base64.b64decode(audio_content_b64)
+                    if storage_uri:
+                        try:
+                            bucket_name, folder_path = storage_uri.replace("gs://", "").split("/", 1)
+                            storage_client = storage.Client()
+                            bucket = storage_client.bucket(bucket_name)
+                            
+                            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                            audio_filename = f"audio_{timestamp}_{i+1}.wav"
+                            gcs_filepath = f"{folder_path}{audio_filename}"
+                            
+                            blob = bucket.blob(gcs_filepath)
+                            blob.upload_from_string(audio_bytes, content_type="audio/wav")
+                            
+                            gcs_uri = f"gs://{bucket_name}/{gcs_filepath}"
+                            audio_uris.append(gcs_uri)
+                            logger.info(f"Uploaded audio sample {i+1} to {gcs_uri}")
+
+                        except Exception as e:
+                            st.error(f"Error uploading audio sample {i+1} to GCS: {e}")
+                    else:
+                        # If no storage URI, we can't create a history item, but we can still play it
+                        # For simplicity, we'll just rely on the GCS path for history and display
+                        pass
+                except Exception as e:
+                    st.error(f"Failed to process audio sample {i + 1}: {e}")
 
             # Add to history if URIs were generated
-            if audio_uris and FIRESTORE_AVAILABLE:
+            if audio_uris:
                 logger.info(f"Adding {len(audio_uris)} audio entries to Firestore history.")
                 for uri in audio_uris:
                     try:
@@ -4432,12 +4650,17 @@ def generate_audio(
                             'user_id': st.session_state.user_id,
                             'type': "audio",
                             'uri': uri,
+                            'favorite': False,
                             'prompt': prompt,
                             'params': params
                         })
                         logger.debug(f"Added audio {uri} to Firestore history.")
                     except Exception as e:
                         logger.error(f"Could not add audio {uri} to history: {str(e)}")
+                
+                # Display the generated audios
+                display_audios(audio_uris, client, enable_streaming)
+
                 logger.success("Successfully added audio generation details to Firestore.")
 
         except Exception as e:
@@ -4446,68 +4669,48 @@ def generate_audio(
             st.exception(e)
 
 
-def display_audios(audio_uris, enable_streaming=True):
-    """Display a list of audio samples in Streamlit (placeholder)."""
+def display_audios(audio_uris, client, enable_streaming=True):
+    """Display a list of audio samples in Streamlit."""
     if not audio_uris:
-        st.warning("No audio samples were generated (placeholder)")
+        st.warning("No audio samples were generated.")
         return
 
-    st.subheader(f"Generated {len(audio_uris)} audio sample(s): (Placeholder)")
+    st.subheader(f"Generated {len(audio_uris)} audio sample(s):")
 
     for i, uri in enumerate(audio_uris):
         # Create a collapsible section for each audio
         with st.expander(f"Audio {i+1}", expanded=True):
-            display_single_audio(uri, enable_streaming)
+            display_single_audio(uri, client, enable_streaming)
 
 
-def display_single_audio(uri, enable_streaming):
-    """Helper function to display a single audio sample (placeholder)."""
+def display_single_audio(uri, client, enable_streaming):
+    """Helper function to display a single audio sample."""
     # Display the raw URI
-    st.markdown(f"**URI**: {uri} (Placeholder)")
+    st.markdown(f"**URI**: {uri}")
 
     # Always display GCS links clearly
     if uri.startswith("gs://"):
         st.code(uri, language="bash")
 
     try:
-        # Handle different URI types (adjust for your audio API)
-        if uri.startswith("http") and not uri.startswith("[Base64"):
-            # Direct HTTP URL - can be embedded directly (adjust if needed for audio)
-            st.markdown(f"**Direct link**: [Open in new tab]({uri}) (Placeholder)")
-            st.audio(uri)  # Use st.audio for playback
-        elif uri.startswith("gs://") and enable_streaming:
-            # GCS URI - generate a signed URL (if needed by your audio API)
-            auth_url = None
-            # You might need to adjust the logic here depending on your audio API's
-            # streaming capabilities and authentication requirements.
-            # auth_url = client.generate_signed_url(uri)  # Example (adjust as needed)
-            auth_url = uri # Placeholder - assuming direct access or other logic
-
+        if uri.startswith("gs://") and enable_streaming:
+            auth_url = get_cached_signed_url(uri)
             if auth_url:
-                st.markdown(f"**Streaming link**: [Open in new tab]({auth_url}) (Placeholder)")
-                st.audio(auth_url)  # Use st.audio for playback
+                st.audio(auth_url, format="audio/wav")
             else:
-                st.error("⚠️ Failed to generate streaming URL (placeholder)")
+                st.error("⚠️ Failed to generate streaming URL.")
         elif uri.startswith("gs://") and not enable_streaming:
-            # GCS URI without streaming (provide instructions)
             st.info("""
             ⚠️ Audio is available in Google Cloud Storage. To access it:
             1. Use the Google Cloud Console: https://console.cloud.google.com/storage/browser
             2. Navigate to the bucket and folder
             3. Download the audio file
-
-            You can enable streaming in the sidebar to attempt direct playback.
             """)
-        elif uri.startswith("[Base64"):
-            # Base64 encoded data (handle as needed by your audio API)
-            st.info("The audio is available as base64-encoded data (placeholder)")
-            # You'd need to decode and handle the audio data here.
         else:
-            # Unknown format
-            st.warning(f"Unknown URI format: {uri} (Placeholder)")
+            st.warning(f"Unknown or unhandled URI format: {uri}")
 
     except Exception as e:
-        st.error(f"Error displaying audio: {str(e)} (Placeholder)")
+        st.error(f"Error displaying audio: {str(e)}")
 
 
 # --- Helper Function to Upload to GCS ---
@@ -4581,7 +4784,7 @@ def video_upload_to_gcs(file_path: str, bucket_name: str, object_name: str) -> s
 def display_history_image_card(row):
     """Display an image history card with details and buttons."""
     # Extract data
-    doc_id = row['doc_id'] # Get the unique Firestore document ID
+    doc_id = row.get('doc_id') # Get the unique Firestore document ID
     uri = row['uri']
     # Generate a unique identifier for this image based on more of the URI
     unique_id = uri.replace("/", "_").replace(".", "_").replace(":", "_")[-20:]
@@ -4596,6 +4799,7 @@ def display_history_image_card(row):
     params = _parse_history_params(params_json)
     is_generated = 'model' in params
     filename = params.get('filename', default_filename)
+    is_favorite = row.get('favorite', False)
     
     # --- Selection Checkbox ---
     is_selected = uri in st.session_state.get('selected_history_items', {})
@@ -4604,9 +4808,20 @@ def display_history_image_card(row):
         if uri in st.session_state.selected_history_items:
             del st.session_state.selected_history_items[uri]
         else:
-            st.session_state.selected_history_items[uri] = 'image'
+            st.session_state.selected_history_items[uri] = {'type': 'image', 'doc_id': doc_id}
     # Use the unique Firestore document ID for the checkbox key
-    st.checkbox("Select this image", value=is_selected, key=f"select_{doc_id}", on_change=toggle_selection, label_visibility="collapsed")
+    select_col, fav_col = st.columns([1, 5])
+    with select_col:
+        st.checkbox("Select", value=is_selected, key=f"select_{doc_id}", on_change=toggle_selection, label_visibility="collapsed")
+    with fav_col:
+        st.button(
+            "⭐️" if is_favorite else "☆",
+            key=f"fav_hist_img_{doc_id}",
+            on_click=toggle_favorite_status,
+            args=(doc_id, is_favorite),
+            help="Mark as favorite"
+        )
+
     try:
 
         signed_url = get_cached_signed_url(uri)
@@ -4716,17 +4931,23 @@ def handle_history_action(operation: str, uris: List[str]):
         st.session_state.selected_history_items.clear()
         st.rerun()
 
+
 def display_history_actions():
     """Displays the action panel for selected history items."""
     with st.container(border=True):
         items = st.session_state.selected_history_items
         st.subheader(f"{len(items)} item(s) selected")
 
-        item_types = set(items.values())
+        # Extract just the 'type' from the dictionary value
+        # Ensure that we handle both old (str) and new (dict) formats gracefully
+        item_types = set()
+        for item in items.values():
+            item_type = item['type'] if isinstance(item, dict) else item
+            item_types.add(item_type)
         operations = ["-- Select an action --"]
 
         if item_types == {'image'}:
-            operations.append("Edit Image(s)")
+            operations.append("Edit Image(s) (Nano Banana)")
             if len(items) == 1:
                 operations.append("Use for Image-to-Video")
         elif item_types == {'video'}:
@@ -4735,18 +4956,51 @@ def display_history_actions():
             if len(items) == 1:
                 operations.append("Change Video Speed")
                 operations.append("Dubbing") # Add Dubbing option for single video
-
+        elif item_types == {'audio'}:
+            pass # No specific actions for audio yet, but delete is available
+        elif item_types == {'voice'}:
+            pass # No specific actions for voice yet, but delete is available
+        
+        # Add delete option for any selection
+        operations.append("Delete Selected")
 
         if len(operations) > 1:
             selected_op = st.selectbox("Perform an action:", options=operations, key="history_action_selector", index=0)
             if selected_op != "-- Select an action --":
-                handle_history_action(selected_op, list(items.keys()))
+                if selected_op == "Delete Selected":
+                    st.warning(f"⚠️ You are about to permanently delete {len(items)} item(s) from your history and from Cloud Storage. This cannot be undone.")
+                    confirm_col1, confirm_col2 = st.columns(2)
+                    with confirm_col1:
+                        # The data can be a dict (new) or str (old), so handle both
+                        items_to_delete = {}
+                        for uri, data in items.items():
+                            if isinstance(data, dict) and 'doc_id' in data:
+                                items_to_delete[uri] = data['doc_id']
+                            # This part is intentionally left blank to skip items in the old format
+                            # that don't have a doc_id, preventing a crash.
+                        
+                        if st.button("✅ Yes, Delete Permanently", key="confirm_delete"):
+                            items_to_delete = {uri: data['doc_id'] for uri, data in items.items()}
+                            delete_history_items(items_to_delete)
+                            st.session_state.selected_history_items.clear()
+                            st.session_state.history_loaded = False
+                            st.success("Selected items have been deleted.")
+                            st.rerun()
+                    with confirm_col2:
+                        if st.button("❌ Cancel", key="cancel_delete"):
+                            # Just rerun to hide the confirmation
+                            st.rerun()
+                else:
+                    handle_history_action(selected_op, list(items.keys()))
         else:
             st.warning("No actions available for the current selection (e.g., mixed types or unsupported count).")
 
-        if st.button("Clear Selection"):
-            st.session_state.selected_history_items.clear()
-            st.rerun()
+        # Use columns to align the clear button
+        _, clear_btn_col = st.columns([4, 1])
+        with clear_btn_col:
+            if st.button("Clear Selection"):
+                st.session_state.selected_history_items.clear()
+                st.rerun()
 
 if __name__ == "__main__":
     # Initialize minimal session state variables

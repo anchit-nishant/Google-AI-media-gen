@@ -1447,7 +1447,7 @@ def generate_video_simple(
     # Wait for operation to complete and return the result
     return client.wait_for_operation(operation_id)
 
-def generate_audio(self, prompt: str, negative_prompt: str = None, sample_count: int = 1, seed: Optional[int] = None, storage_uri: Optional[str] = None):
+def generate_audio(self, prompt: str, sample_count: int, negative_prompt: str = None, seed: Optional[int] = None, storage_uri: Optional[str] = None):
     """
     Calls a generative audio API, processes the response, and displays the audio on the Streamlit UI.
 
@@ -1485,101 +1485,37 @@ def generate_audio(self, prompt: str, negative_prompt: str = None, sample_count:
     instance = {"prompt": prompt}
     if negative_prompt:
         instance["negative_prompt"] = negative_prompt
+    # Only add the seed to the instance if it's provided
     if seed:
-        instance = {"seed": seed}
+        instance["seed"] = seed
 
-    parameters = {"sample_count": sample_count}
-
-
-    print(parameters)
+    parameters = {
+        "sample_count": sample_count
+    }
 
     payload = {
         "instances": [instance],
         "parameters": parameters
     }
 
+    print("--- AUDIO API REQUEST BODY ---")
+    print(json.dumps(payload, indent=2))
+
     # --- 4. Make the API Call ---
     try:
         response = requests.post(api_endpoint, headers=headers, data=json.dumps(payload))
-        response.raise_for_status()  # Raise an exception for bad status codes (4xx or 5xx)
+        response.raise_for_status()
         response_data = response.json()
     except requests.exceptions.RequestException as e:
         st.error(f"API Error: Failed to get a valid response. Status Code: {e.response.status_code if e.response else 'N/A'}")
         # Display the detailed error from the API if available
         st.json(e.response.json() if e.response else "No response from server.")
         return
+    
+    print("--- AUDIO API RESPONSE ---")
+    print(json.dumps(response_data, indent=2))
 
-    # --- 5. Process Response and Display Audio on UI ---
-    predictions = response_data.get("predictions", [])
-    if not predictions:
-        st.warning("Audio generation succeeded, but the API response contained no audio data.")
-        st.json(response_data)  # Show the full response for debugging
-        return []
-
-    audio_uris = []
-    st.success(f"Successfully generated {len(predictions)} audio sample(s)!")
-
-    # Loop through each prediction and display an audio player
-    for i, prediction in enumerate(predictions):
-        audio_content_b64 = prediction.get("bytesBase64Encoded")
-
-        if audio_content_b64:
-            try:
-                # Decode the Base64 string into raw audio bytes
-                audio_bytes = base64.b64decode(audio_content_b64)
-
-                st.markdown("---")
-                st.markdown(f"### Audio Sample {i + 1}")
-                
-                if storage_uri:
-                    try:
-                        from google.cloud import storage
-                        
-                        if not storage_uri.startswith("gs://") or not storage_uri.endswith("/"):
-                            st.error("Invalid storage URI. It should start with 'gs://' and end with a '/' (e.g., 'gs://your-bucket/generated_audio/')")
-                            return []
-
-                        bucket_name, folder_path = storage_uri[5:].split("/", 1)
-                        client = storage.Client()
-                        bucket = client.bucket(bucket_name)
-                        
-                        # Generate a unique filename for the audio
-                        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                        audio_filename = f"audio_{timestamp}_{i+1}.wav"
-                        gcs_filepath = f"{folder_path}{audio_filename}"
-                        
-                        # Upload the audio data to GCS
-                        blob = bucket.blob(gcs_filepath)
-                        blob.upload_from_string(audio_bytes, content_type="audio/wav")
-                        
-                        st.success(f"Audio sample {i+1} successfully uploaded to GCS: gs://{bucket_name}/{gcs_filepath}")
-                        audio_uris.append(f"gs://{bucket_name}/{gcs_filepath}")
-                    except ImportError:
-                        st.error("Google Cloud Storage SDK not found. Install it using: pip install google-cloud-storage")
-                        return []
-                    except Exception as e:
-                        st.error(f"Error uploading audio sample {i+1} to GCS: {e}")
-                
-                # Play audio directly in Streamlit
-                st.audio(audio_bytes, format="audio/wav")
-                # Display the raw prediction object (optional, for debugging)
-                # st.json(prediction)
-
-            except Exception as e:
-                st.error(f"Failed to decode or display audio sample {i + 1}. Please check the response format. Error: {e}")
-        else:
-            st.warning(f"Prediction {i+1} did not contain the audio bytes. This is often due to safety filters.")
-            # Check for safety ratings, which is a common reason for missing content.
-            safety_ratings = prediction.get("safetyRatings")
-            if safety_ratings:
-                st.error(f"Audio generation for sample {i+1} was likely blocked due to safety policies.")
-                with st.expander("View Safety Ratings"):
-                    st.json(safety_ratings)
-            else:
-                # If no specific reason is found, show the whole prediction object for general debugging.
-                st.info(f"Here is the full content of prediction {i+1} for debugging:")
-                st.json(prediction)
-    return audio_uris
+    return response_data
 
     # Optionally display the model information from the response
     # with st.expander("View Model Information"):
