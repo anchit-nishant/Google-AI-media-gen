@@ -919,18 +919,16 @@ class Veo2API:
         request_body = {
             "instances": [{
                 "prompt": prompt_text,
-               "image": {
+                "image": {
                     "gcsUri": start_image_gcs_uri,
                     "mimeType": start_mime_type
                 },
-            }],
-            "parameters": {
-                "config": {
-                    "lastFrame": {
+                "lastFrame": {
                     "gcsUri": end_image_gcs_uri,
                     "mimeType": end_mime_type
-                    },
                 },
+            }],
+            "parameters": {
                 "aspectRatio": aspect_ratio,
                 "resolution": resolution,
                 "generateAudio": generate_audio,
