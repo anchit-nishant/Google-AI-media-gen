@@ -2618,12 +2618,19 @@ def video_editing_tab():
                                     db.collection('history').add({
                                         'user_id': st.session_state.user_id,
                                         'timestamp': firestore.SERVER_TIMESTAMP,
-                                        'type': 'video', 'uri': final_gcs_uri,
+                                        'type': 'video',
+                                        'uri': final_gcs_uri,
                                         'prompt': f'Video interpolated with prompt: {interpolation_prompt}',
-                                        'params': {'operation': 'frame_interpolation', 'aspect_ratio': aspect_ratio, 'sample': i+1},
-                                        'model': interpolation_model, 'aspect_ratio': aspect_ratio,
-                                        'resolution': interpolation_resolution, 'audio_generated': generate_audio, 'favorite': False,
-                                        'duration_seconds': interpolation_duration, 'sample_count': interpolation_sample_count
+                                        'params': {
+                                            'operation': 'frame_interpolation',
+                                            'model': interpolation_model,
+                                            'aspectRatio': aspect_ratio,
+                                            'resolution': interpolation_resolution,
+                                            'durationSeconds': interpolation_duration,
+                                            'sampleCount': interpolation_sample_count,
+                                            'generateAudio': generate_audio
+                                        },
+                                        'favorite': False
                                     })
 
 
@@ -3619,6 +3626,7 @@ def history_tab():
             ("🖼️ All Images", display_all_images),
             ("📋 All History", display_all_history)
         ])
+        HISTORY_SUB_TABS["📊 Dashboard"] = display_dashboard
 
         # Use a key to make this a "controlled" widget. Its state is now directly
         # read from and written to st.session_state.active_history_sub_tab.
@@ -3649,6 +3657,80 @@ def history_tab():
     
     logger.end_section()
         
+def display_dashboard(history_data):
+    """Displays an analytics dashboard based on the user's generation history."""
+    st.markdown("### 📊 Generation Dashboard")
+
+    if history_data.empty:
+        st.info("No history data available to build a dashboard. Generate some media first!")
+        return
+
+    # --- Data Preparation ---
+    df = history_data.copy()
+    df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
+    df = df.dropna(subset=['timestamp']) # Remove entries with invalid timestamps
+    df['date'] = df['timestamp'].dt.date
+
+    # --- Key Metrics ---
+    st.subheader("Key Metrics")
+    
+    # Calculate metrics
+    total_videos = len(df[df['type'] == 'video'])
+    total_images = len(df[df['type'] == 'image'])
+    total_audios = len(df[df['type'] == 'audio'])
+    total_voices = len(df[df['type'] == 'voice'])
+
+    # Calculate total video duration
+    def get_duration(row):
+        """Extracts duration from params or top-level of the history row."""
+        try:
+            # First, check inside the 'params' dictionary
+            p_dict = _parse_history_params(row.get('params', {}))
+            duration = p_dict.get('durationSeconds', p_dict.get('duration_seconds'))
+            if duration is not None:
+                return duration
+            # If not in params, check the top-level of the row (for older/other records)
+            return row.get('duration_seconds', 0)
+        except:
+            return 0
+            
+    df['duration'] = df.apply(lambda row: get_duration(row) if row['type'] == 'video' else 0, axis=1)
+    total_video_seconds = df['duration'].sum()
+
+    # Display metrics in columns
+    col1, col2, col3, col4, col5 = st.columns(5)
+    col1.metric("🎬 Videos Generated", total_videos)
+    col2.metric("⏱️ Total Video Seconds", f"{total_video_seconds:.0f}s")
+    col3.metric("🎨 Images Generated", total_images)
+    col4.metric("🎵 Audios Generated", total_audios)
+    col5.metric("🎤 Voices Generated", total_voices)
+
+    st.divider()
+
+    # --- Charts ---
+    st.subheader("Generation Trends")
+
+    # Generations over time
+    generations_by_day = df.groupby('date').size().reset_index(name='count')
+    generations_by_day = generations_by_day.rename(columns={'date': 'Date', 'count': 'Total Generations'})
+    st.markdown("#### Daily Generation Activity")
+    st.line_chart(generations_by_day, x='Date', y='Total Generations')
+
+    # Generation type breakdown
+    type_counts = df['type'].value_counts().reset_index()
+    type_counts.columns = ['type', 'count']
+
+    col1_chart, col2_chart = st.columns(2)
+    with col1_chart:
+        st.markdown("#### Generation by Type (Bar Chart)")
+        st.bar_chart(type_counts, x='type', y='count')
+
+    with col2_chart:
+        st.markdown("#### Generation by Type (Pie Chart)")
+        # Use altair for a better pie chart if needed, but st.bar_chart is simpler
+        st.bar_chart(type_counts.set_index('type')) # Another way to visualize
+
+
 def display_history_video_card(row):
     """Display a video history card with details and buttons."""
     uri = row['uri']
