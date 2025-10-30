@@ -17,6 +17,7 @@ import pandas as pd
 import subprocess
 from datetime import datetime
 from PIL import Image
+import altair as alt
 import streamlit as st
 import requests
 from moviepy.editor import VideoFileClip, concatenate_videoclips
@@ -3218,12 +3219,14 @@ def get_history_from_firestore(user_id, limit=200):
             item = doc.to_dict()
             item['doc_id'] = doc.id  # Use the actual document ID
             # Ensure 'favorite' key exists, defaulting to False for old records
+            if 'deleted' not in item:
+                item['deleted'] = False
             if 'favorite' not in item:
                 item['favorite'] = False
             history_list.append(item)
 
         if not history_list:
-            return pd.DataFrame(columns=['timestamp', 'type', 'uri', 'prompt', 'params', 'doc_id', 'favorite'])
+            return pd.DataFrame(columns=['timestamp', 'type', 'uri', 'prompt', 'params', 'doc_id', 'favorite', 'deleted'])
             
         df = pd.DataFrame(history_list)
         # Ensure timestamp column is of datetime type for proper sorting
@@ -3263,16 +3266,17 @@ def delete_history_items(items_to_delete: Dict[str, str]):
         progress_bar.progress((i + 1) / total_items, text=progress_text)
         try:
             # 1. Delete from Firestore
-            db.collection('history').document(doc_id).delete()
-            logger.info(f"Deleted history document from Firestore: {doc_id}")
+            # Instead of deleting, mark as deleted
+            db.collection('history').document(doc_id).update({
+                'deleted': True,
+                'deleted_timestamp': firestore.SERVER_TIMESTAMP
+            })
+            logger.info(f"Marked history document as deleted in Firestore: {doc_id}")
 
             # 2. Delete from GCS
             if uri and uri.startswith("gs://"):
-                storage_client = storage.Client()
-                bucket_name, blob_name = uri[5:].split("/", 1)
-                bucket = storage_client.bucket(bucket_name)
-                blob = bucket.blob(blob_name)
-                blob.delete()
+                # The GCS file deletion logic is now in a separate function
+                delete_gcs_file(uri)
                 logger.info(f"Deleted file from GCS: {uri}")
 
         except Exception as e:
@@ -3280,7 +3284,11 @@ def delete_history_items(items_to_delete: Dict[str, str]):
 
 def display_recent_videos(history_data):
     """Displays the 'Recent Videos' sub-tab content."""
-    video_history = history_data[history_data['type'] == 'video'].copy()
+    # Filter out soft-deleted items for display, checking if 'deleted' column exists
+    active_history = history_data
+    if 'deleted' in history_data.columns:
+        active_history = history_data[history_data['deleted'] != True]
+    video_history = active_history[active_history['type'] == 'video'].copy()
         
     if video_history.empty:
         st.info("No videos in history yet. Generate some videos to see them here!")
@@ -3378,7 +3386,11 @@ def display_recent_videos(history_data):
 def display_recent_audios(history_data):
     """Displays the 'Recent Audios' sub-tab content."""
     st.markdown("### Recent Generated Audios")
-    audio_history = history_data[history_data['type'] == 'audio'].copy()
+    # Filter out soft-deleted items for display, checking if 'deleted' column exists
+    active_history = history_data
+    if 'deleted' in history_data.columns:
+        active_history = history_data[history_data['deleted'] != True]
+    audio_history = active_history[active_history['type'] == 'audio'].copy()
     
     if audio_history.empty:
         st.info("No audio generation history found.")
@@ -3405,7 +3417,11 @@ def display_recent_audios(history_data):
 def display_recent_voices(history_data):
     """Displays the 'Recent Voices' sub-tab content."""
     st.markdown("### Recent Generated Voiceovers")
-    voice_history = history_data[history_data['type'] == 'voice'].copy()
+    # Filter out soft-deleted items for display, checking if 'deleted' column exists
+    active_history = history_data
+    if 'deleted' in history_data.columns:
+        active_history = history_data[history_data['deleted'] != True]
+    voice_history = active_history[active_history['type'] == 'voice'].copy()
     
     if voice_history.empty:
         st.info("No voiceover generation history found.")
@@ -3433,8 +3449,11 @@ def display_all_images(history_data):
     """Displays the 'All Images' sub-tab content."""
     # Filter for images and remove any duplicates based on the URI.
     # This prevents the StreamlitDuplicateElementKey error if the same image
-    # appears multiple times in the history. We keep the most recent entry.
-    image_history = history_data[history_data['type'] == 'image'].copy()
+    # appears multiple times in the history. We keep the most recent entry.    
+    active_history = history_data
+    if 'deleted' in history_data.columns:
+        active_history = history_data[history_data['deleted'] != True]
+    image_history = active_history[active_history['type'] == 'image'].copy()
     image_history = image_history.drop_duplicates(subset=['uri'], keep='first')
     
     if image_history.empty:
@@ -3523,7 +3542,8 @@ def display_all_history(history_data):
     with col4:
         show_favorites_only = st.toggle(
             "Show only favorites ⭐️", 
-            key="all_history_favorites_toggle"
+            key="all_history_favorites_toggle",
+            help="Show only items you have marked as favorites."
         )
 
     with st.columns(1)[0]: # Use a column to align the view mode selector
@@ -3531,7 +3551,11 @@ def display_all_history(history_data):
     
     filtered_history = history_data.copy()
     if filter_type == "Video":
-        filtered_history = filtered_history[filtered_history['type'] == 'video']
+        # Show only non-deleted videos, checking if 'deleted' column exists
+        if 'deleted' in filtered_history.columns:
+            filtered_history = filtered_history[(filtered_history['type'] == 'video') & (filtered_history['deleted'] != True)]
+        else:
+            filtered_history = filtered_history[filtered_history['type'] == 'video']
     elif filter_type == "Image":
         filtered_history = filtered_history[filtered_history['type'] == 'image']
     
@@ -3727,8 +3751,13 @@ def display_dashboard(history_data):
 
     with col2_chart:
         st.markdown("#### Generation by Type (Pie Chart)")
-        # Use altair for a better pie chart if needed, but st.bar_chart is simpler
-        st.bar_chart(type_counts.set_index('type')) # Another way to visualize
+        # Create a proper pie chart using Altair
+        pie_chart = alt.Chart(type_counts).mark_arc(innerRadius=50).encode(
+            theta=alt.Theta(field="count", type="quantitative"),
+            color=alt.Color(field="type", type="nominal", title="Media Type"),
+            tooltip=['type', 'count']
+        ).properties(title="Generation Breakdown")
+        st.altair_chart(pie_chart, use_container_width=True)
 
 
 def display_history_video_card(row):
