@@ -4,6 +4,7 @@ import os
 import shutil
 import time
 import re
+import mimetypes
 import uuid
 import datetime
 from typing import Dict, List, Optional, Union, Any
@@ -14,7 +15,6 @@ import streamlit as st
 from google.auth import default as google_auth_default
 from google.auth.transport.requests import Request
 from google.cloud import storage
-from moviepy.editor import VideoFileClip, concatenate_videoclips, vfx
 
 TEMP_DOWNLOAD_SUBDIR = "temp_gcs_downloads"
 
@@ -83,6 +83,91 @@ class Veo2API:
         
         # Return the access token.
         return credentials.token
+
+    def extend_video_veo3(
+        self,
+        video_path: str,
+        prompt: str,
+        storage_uri: str,
+        model: str = "veo-3.1-generate-preview",
+        resolution: str = "720p",
+        duration_seconds: int = 7,
+    ) -> Dict:
+        """
+        Extends a video using the Veo 3.1 API via a REST call.
+
+        Args:
+            video_path: Local path to the video file to extend.
+            prompt: Text prompt describing how to extend the video.
+            storage_uri: GCS URI to store the output video.
+            model: The Veo model to use for the extension.
+            resolution: The resolution of the output video ('720p' or '1080p').
+            duration_seconds: The desired duration of the extended portion.
+
+        Returns:
+            A dictionary containing the long-running operation details.
+        """
+        print(f"Extending video '{os.path.basename(video_path)}' with prompt: '{prompt[:50]}...'")
+
+        # 1. Upload the source video to GCS to get a URI
+        if not storage_uri or not storage_uri.startswith("gs://"):
+            raise ValueError("A valid GCS storage_uri (e.g., 'gs://your-bucket/') is required for video extension.")
+
+        bucket_name, folder_path = storage_uri.replace("gs://", "").split("/", 1)
+        gcs_client = storage.Client()
+        bucket = gcs_client.bucket(bucket_name)
+
+        video_blob_name = f"{folder_path.rstrip('/')}/video_extension_inputs/{uuid.uuid4().hex}-{os.path.basename(video_path)}"
+        video_blob = bucket.blob(video_blob_name)
+
+        print(f"Uploading source video to GCS at gs://{bucket_name}/{video_blob_name}...")
+        # Guess the content type of the video file
+        content_type, _ = mimetypes.guess_type(video_path)
+        if content_type is None:
+            content_type = 'video/mp4' # Default to mp4 if guess fails
+        video_blob.upload_from_filename(video_path, content_type=content_type)
+        video_gcs_uri = f"gs://{bucket_name}/{video_blob_name}"
+
+        # 2. Construct the REST API request body
+        instance = {
+            "prompt": prompt,
+            "video": {
+                "gcsUri": video_gcs_uri,
+                "mimeType": content_type # Add the determined MIME type here
+            }
+        }
+
+        parameters = {
+            "resolution": resolution,
+            "durationSeconds": duration_seconds,
+            "sampleCount": 1, # Assuming 1 for now
+            "storageUri": f"{storage_uri.rstrip('/')}/video_extensions_output/"
+        }
+
+        request_body = {
+            "instances": [instance],
+            "parameters": parameters
+        }
+
+        # 3. Make the API request
+        self.model_id = model # Set model for polling
+        url = f"{self.base_url}/projects/{self.project_id}/locations/{self.location}/publishers/google/models/{self.model_id}:predictLongRunning"
+        headers = {
+            "Authorization": f"Bearer {self._get_access_token()}",
+            "Content-Type": "application/json; charset=utf-8"
+        }
+
+        print("Initiating video extension operation via REST API...")
+        response = requests.post(url, headers=headers, json=request_body)
+
+        # Clean up the uploaded input video from GCS after starting the operation
+        try:
+            video_blob.delete()
+            print(f"Cleaned up temporary input video: {video_gcs_uri}")
+        except Exception as cleanup_error:
+            print(f"Warning: Failed to clean up temporary input video {video_gcs_uri}: {cleanup_error}")
+
+        return response.json()
     
     def generate_video(
         self,

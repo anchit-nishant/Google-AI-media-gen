@@ -1259,6 +1259,7 @@ def video_tab():
     sub_tabs = OrderedDict([
         ("Text-to-Video", text_to_video_tab),
         ("Image-to-Video", image_to_video_tab),
+        ("Video Extension", video_extension_tab),
         ("Video Editing", video_editing_tab),
     ])
 
@@ -1279,6 +1280,124 @@ def video_tab():
     else:
         # Fallback to the first tab if the state is somehow invalid
         text_to_video_tab()
+
+
+def video_extension_tab():
+    """UI for the Video Extension feature."""
+    st.header("Video Extension")
+    st.info("Upload a video and provide a prompt to extend it using Veo 3.1.")
+
+    uploaded_video = st.file_uploader(
+        "Upload a video to extend",
+        type=["mp4", "mov", "avi", "mkv"],
+        key="video_extension_uploader"
+    )
+    if uploaded_video:
+        st.video(uploaded_video)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        model = st.selectbox(
+            "Model",
+            options=["veo-3.1-generate-preview", "veo-3.1-generate-fast-preview"],
+            key="video_extension_model"
+        )
+    with col2:
+        resolution = st.selectbox(
+            "Resolution",
+            options=["720p", "1080p"],
+            key="video_extension_resolution"
+        )
+
+    prompt = st.text_area(
+        "Prompt",
+        placeholder="Describe how you want to extend the video. For example, 'continue the scene for another 4 seconds, showing the car driving further down the road'.",
+        height=100,
+        key="video_extension_prompt"
+    )
+
+    storage_uri = st.session_state.get("storage_uri", config.STORAGE_URI)
+    if not storage_uri:
+        st.error("A GCS Storage URI must be configured in the sidebar settings to use this feature.")
+
+    if st.button("Extend Video", type="primary", disabled=not (uploaded_video and prompt)):
+        with st.spinner("Extending video... This may take a few minutes."):
+            input_video_path = None
+            standardized_video_path = None
+            try:
+                # 1. Save the uploaded video to a temporary file
+                with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(uploaded_video.name)[1]) as tmp_in:
+                    tmp_in.write(uploaded_video.getvalue())
+                    input_video_path = tmp_in.name
+
+                # 2. Re-encode the video with moviepy to ensure a standard format
+                st.info("Standardizing video format for API compatibility...")
+                standardized_video_path = os.path.splitext(input_video_path)[0] + "_standardized.mp4"
+                with VideoFileClip(input_video_path) as video_clip:
+                    video_clip.write_videofile(
+                        standardized_video_path,
+                        codec="libx264",
+                        audio_codec="aac",
+                        ffmpeg_params=["-pix_fmt", "yuv420p"], # Ensures a web-compatible pixel format
+                        logger=None
+                    )
+                
+                st.info("Video standardized. Starting extension process...")
+                
+                # This now returns a long-running operation response
+                # 3. Call the API with the standardized video
+                response = client.extend_video_veo3(
+                    video_path=standardized_video_path,
+                    prompt=prompt,
+                    storage_uri=storage_uri,
+                    model=model,
+                    resolution=resolution,
+                    duration_seconds=7 # Hardcoded to 7 seconds as per API constraints
+                )
+
+                operation_name = response.get("name")
+                if not operation_name:
+                    st.error("Failed to start video extension operation.")
+                    st.json(response)
+                    return
+
+                operation_id = operation_name.split("/")[-1]
+                st.info(f"✅ Video extension operation started: {operation_id}")
+
+                # Poll for completion
+                with st.spinner("Waiting for operation to complete..."):
+                    for _ in range(60): # Poll for up to 10 minutes (60 * 10s)
+                        poll_response = client.poll_operation(operation_id)
+                        if poll_response.get("done"):
+                            break
+                        time.sleep(10)
+                    else:
+                        st.warning("Operation is taking a long time. You can check the status later in the history tab.")
+                        return
+
+                if "error" in poll_response:
+                    st.error(f"Video extension failed: {poll_response['error'].get('message', 'Unknown error')}")
+                    st.json(poll_response)
+                    return
+
+                video_uris = client.extract_video_uris(poll_response)
+                if video_uris:
+                    st.success("✅ Video extended successfully!")
+                    for uri in video_uris:
+                        # Add to history here if needed
+                        display_single_video(uri, client, enable_streaming=True)
+                else:
+                    st.error("Video extension finished, but no video was returned.")
+                    st.json(poll_response)
+
+            except Exception as e:
+                st.error(f"An error occurred: {e}")
+            finally:
+                # 4. Clean up both temporary files
+                if input_video_path and os.path.exists(input_video_path):
+                    os.unlink(input_video_path)
+                if standardized_video_path and os.path.exists(standardized_video_path):
+                    os.unlink(standardized_video_path)
 
 def image_tab():
     """Main tab for all image-related operations."""
@@ -3985,7 +4104,6 @@ def generate_image(
                 enhance_prompt=enhance_prompt
             )
 
-            add_pending_operation_to_firestore(None, "image", {"prompt": prompt, "model": model}, model, response)
             if "error" in response:
                 error_msg = response.get("error", {}).get("message", "Unknown error")
                 st.error(f"⚠️ Image generation failed: {error_msg}")
@@ -4574,17 +4692,6 @@ def generate_audio(
                 "negativePrompt": negative_prompt if negative_prompt else "",
                 "seed": seed if seed else "random",
             }
-
-            # Create a unique ID for this synchronous operation to track it
-            operation_id = f"audio-{uuid.uuid4().hex}"
-
-            # Add to pending operations BEFORE the API call
-            add_pending_operation_to_firestore(
-                operation_id=operation_id,
-                operation_type='audio',
-                params=params,
-                model_id='lyria-002', # Hardcoded model for Lyria
-            )
 
             # Make the API call
             response = client.generate_audio(
