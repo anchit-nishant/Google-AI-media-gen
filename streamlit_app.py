@@ -3627,57 +3627,6 @@ def image_to_video_tab():
                             os.unlink(png_path)
                 except Exception as cleanup_error:
                     logger.error(f"Error cleaning up temporary files: {str(cleanup_error)}")
-    
-    logger.end_section()
-
-
-def get_history_from_firestore(user_id, limit=200):
-    """
-    Get the history of generated content from Firestore.
-    
-    Args:
-        user_id (str): The ID of the user to fetch history for.
-        limit (int): Maximum number of entries to return.
-        
-    Returns:
-        pandas.DataFrame: DataFrame containing the history entries
-    """
-    if not FIRESTORE_AVAILABLE:
-        logger.error("Firestore is not available. Cannot get history.")
-        return pd.DataFrame(columns=['timestamp', 'type', 'uri', 'prompt', 'params', 'doc_id', 'favorite'])
-
-    try:
-        # Fetch all documents for the user first, then sort and limit in pandas.
-        # This avoids the need for a composite index in Firestore.
-        history_ref = db.collection('history').where('user_id', '==', user_id)
-        docs = history_ref.stream()
-        
-        history_list = []
-        for doc in docs:
-            item = doc.to_dict()
-            item['doc_id'] = doc.id  # Use the actual document ID
-            # Ensure 'favorite' key exists, defaulting to False for old records
-            if 'deleted' not in item:
-                item['deleted'] = False
-            if 'favorite' not in item:
-                item['favorite'] = False
-            history_list.append(item)
-
-        if not history_list:
-            return pd.DataFrame(columns=['timestamp', 'type', 'uri', 'prompt', 'params', 'doc_id', 'favorite', 'deleted'])
-            
-        df = pd.DataFrame(history_list)
-        # Ensure timestamp column is of datetime type for proper sorting
-        if 'timestamp' in df.columns:
-            df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
-            df = df.sort_values('timestamp', ascending=False).head(limit)
-        
-        return df
-
-    except Exception as e:
-        logger.error(f"Error getting history from Firestore: {str(e)}")
-        st.error(f"Error getting history from Firestore: {str(e)}")
-        return pd.DataFrame(columns=['timestamp', 'type', 'uri', 'prompt', 'params', 'doc_id'])
 
 def toggle_favorite_status(doc_id: str, current_status: bool):
     """Toggles the 'favorite' field for a history document in Firestore."""
@@ -3719,6 +3668,48 @@ def delete_history_items(items_to_delete: Dict[str, str]):
 
         except Exception as e:
             st.error(f"Failed to delete item {uri}: {e}")
+
+def get_history_from_firestore(user_id, limit=200):
+    """
+    Get the history of generated content from Firestore.
+    
+    Args:
+        user_id (str): The ID of the user to fetch history for.
+        limit (int): Maximum number of entries to return.
+        
+    Returns:
+        pandas.DataFrame: DataFrame containing the history entries
+    """
+    if not FIRESTORE_AVAILABLE:
+        logger.error("Firestore is not available. Cannot get history.")
+        return pd.DataFrame(columns=['timestamp', 'type', 'uri', 'prompt', 'params', 'doc_id', 'favorite'])
+
+    try:
+        history_ref = db.collection('history').where('user_id', '==', user_id)
+        docs = history_ref.stream()
+        
+        history_list = []
+        for doc in docs:
+            item = doc.to_dict()
+            item['doc_id'] = doc.id
+            if 'deleted' not in item:
+                item['deleted'] = False
+            if 'favorite' not in item:
+                item['favorite'] = False
+            history_list.append(item)
+
+        if not history_list:
+            return pd.DataFrame(columns=['timestamp', 'type', 'uri', 'prompt', 'params', 'doc_id', 'favorite', 'deleted'])
+            
+        df = pd.DataFrame(history_list)
+        if 'timestamp' in df.columns:
+            df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
+            df = df.sort_values('timestamp', ascending=False).head(limit)
+        return df
+    except Exception as e:
+        logger.error(f"Error getting history from Firestore: {str(e)}")
+        st.error(f"Error getting history from Firestore: {str(e)}")
+        return pd.DataFrame(columns=['timestamp', 'type', 'uri', 'prompt', 'params', 'doc_id'])
 
 def display_recent_videos(history_data):
     """Displays the 'Recent Videos' sub-tab content."""
@@ -3783,17 +3774,26 @@ def display_recent_videos(history_data):
         if "video_page" not in st.session_state:
             st.session_state.video_page = 0
             
-        col1, col2, col3 = st.columns([1, 3, 1])
-        with col1:
-            if st.button("◀ Previous", disabled=(st.session_state.video_page <= 0), key="prev_video"):
-                st.session_state.video_page = max(0, st.session_state.video_page - 1)
-                st.rerun()
-        with col2:
-            st.markdown(f"**Page {st.session_state.video_page + 1} of {max(1, max_pages)}** (showing {min(items_per_page, total_videos - st.session_state.video_page * items_per_page)} of {total_videos} videos)")
-        with col3:
-            if st.button("Next ▶", disabled=(st.session_state.video_page >= max_pages - 1), key="next_video"):
-                st.session_state.video_page = min(max_pages - 1, st.session_state.video_page + 1)
-                st.rerun()
+        # --- Enhanced Pagination Controls ---
+        if max_pages > 1:
+            col1, col2, col3 = st.columns([1, 2, 1])
+            with col1:
+                if st.button("◀ Previous", disabled=(st.session_state.video_page <= 0), key="prev_video"):
+                    st.session_state.video_page -= 1
+                    st.rerun()
+            with col2:
+                # Create a list of page numbers for the selectbox (1-based for display)
+                page_options = list(range(1, max_pages + 1))
+                # The selectbox needs a 0-based index.
+                selected_page = st.selectbox(
+                    "Go to page", options=page_options, index=st.session_state.video_page,
+                    label_visibility="collapsed", key="video_page_selector"
+                )
+                st.session_state.video_page = selected_page - 1 # Convert back to 0-based index
+            with col3:
+                if st.button("Next ▶", disabled=(st.session_state.video_page >= max_pages - 1), key="next_video"):
+                    st.session_state.video_page += 1
+                    st.rerun()
     
         start_idx = st.session_state.video_page * items_per_page
         end_idx = min(start_idx + items_per_page, total_videos)
@@ -3809,20 +3809,24 @@ def display_recent_videos(history_data):
                         display_history_video_card(row)
         st.markdown('</div>', unsafe_allow_html=True)
         
-        col1, col2, col3 = st.columns([1, 3, 1])
-        with col1:
-            if st.button("◀ Previous", disabled=(st.session_state.video_page <= 0), key="prev_video_bottom"):
-                st.session_state.video_page = max(0, st.session_state.video_page - 1)
-                st.rerun()
-        with col2:
-            st.markdown(f"**Page {st.session_state.video_page + 1} of {max(1, max_pages)}**")
-        with col3:
-            if st.button("Next ▶", disabled=(st.session_state.video_page >= max_pages - 1), key="next_video_bottom"):
-                st.session_state.video_page = min(max_pages - 1, st.session_state.video_page + 1)
-                st.rerun()
+        # --- Bottom Pagination ---
+        if max_pages > 1:
+            col1_bottom, col2_bottom, col3_bottom = st.columns([1, 2, 1])
+            with col1_bottom:
+                if st.button("◀ Previous", disabled=(st.session_state.video_page <= 0), key="prev_video_bottom"):
+                    st.session_state.video_page -= 1
+                    st.rerun()
+            with col2_bottom:
+                # Display current page info
+                st.markdown(f"<div style='text-align: center;'>Page {st.session_state.video_page + 1} of {max_pages}</div>", unsafe_allow_html=True)
+            with col3_bottom:
+                if st.button("Next ▶", disabled=(st.session_state.video_page >= max_pages - 1), key="next_video_bottom"):
+                    st.session_state.video_page += 1
+                    st.rerun()
+
+
 
 def display_recent_audios(history_data):
-    """Displays the 'Recent Audios' sub-tab content."""
     st.markdown("### Recent Generated Audios")
     # Filter out soft-deleted items for display, checking if 'deleted' column exists
     active_history = history_data
@@ -3839,21 +3843,64 @@ def display_recent_audios(history_data):
         )
         if show_favorites_only:
             audio_history = audio_history[audio_history['favorite'] == True]
-        st.markdown(f"Found {len(audio_history)} audio generations.")
-        audio_history = audio_history.sort_values('timestamp', ascending=False)
+
+        audio_history = audio_history.sort_values('timestamp', ascending=False).reset_index(drop=True)
+        total_audios = len(audio_history)
+        items_per_page = 9
+        max_pages = (total_audios + items_per_page - 1) // items_per_page
+        if "audio_page" not in st.session_state:
+            st.session_state.audio_page = 0
+
+        st.markdown(f"Found {total_audios} audio generations.")
+
+        # --- Enhanced Pagination Controls ---
+        if max_pages > 1:
+            col1, col2, col3 = st.columns([1, 2, 1])
+            with col1:
+                if st.button("◀ Previous", disabled=(st.session_state.audio_page <= 0), key="prev_audio"):
+                    st.session_state.audio_page -= 1
+                    st.rerun()
+            with col2:
+                page_options = list(range(1, max_pages + 1))
+                selected_page = st.selectbox(
+                    "Go to page", options=page_options, index=st.session_state.audio_page,
+                    label_visibility="collapsed", key="audio_page_selector"
+                )
+                st.session_state.audio_page = selected_page - 1
+            with col3:
+                if st.button("Next ▶", disabled=(st.session_state.audio_page >= max_pages - 1), key="next_audio"):
+                    st.session_state.audio_page += 1
+                    st.rerun()
+
+        start_idx = st.session_state.audio_page * items_per_page
+        end_idx = min(start_idx + items_per_page, total_audios)
+        page_audios = audio_history.iloc[start_idx:end_idx]
+
         st.markdown('<div class="history-grid">', unsafe_allow_html=True)
-        rows = [audio_history.iloc[i:i+3] for i in range(0, len(audio_history), 3)]
+        rows = [page_audios.iloc[i:i+3] for i in range(0, len(page_audios), 3)]
         for row_items in rows:
             cols = st.columns(3)
             for i, (_, row) in enumerate(row_items.iterrows()):
                 if i < len(cols):
                     with cols[i]:
-                        with st.container(border=True, height=350):
-                            display_history_audio_card(row)
+                        display_history_audio_card(row)
         st.markdown('</div>', unsafe_allow_html=True)
 
+        # --- Bottom Pagination ---
+        if max_pages > 1:
+            col1_bottom, col2_bottom, col3_bottom = st.columns([1, 2, 1])
+            with col1_bottom:
+                if st.button("◀ Previous", disabled=(st.session_state.audio_page <= 0), key="prev_audio_bottom"):
+                    st.session_state.audio_page -= 1
+                    st.rerun()
+            with col2_bottom:
+                st.markdown(f"<div style='text-align: center;'>Page {st.session_state.audio_page + 1} of {max_pages}</div>", unsafe_allow_html=True)
+            with col3_bottom:
+                if st.button("Next ▶", disabled=(st.session_state.audio_page >= max_pages - 1), key="next_audio_bottom"):
+                    st.session_state.audio_page += 1
+                    st.rerun()
+
 def display_recent_voices(history_data):
-    """Displays the 'Recent Voices' sub-tab content."""
     st.markdown("### Recent Generated Voiceovers")
     # Filter out soft-deleted items for display, checking if 'deleted' column exists
     active_history = history_data
@@ -3870,18 +3917,62 @@ def display_recent_voices(history_data):
         )
         if show_favorites_only:
             voice_history = voice_history[voice_history['favorite'] == True]
-        st.markdown(f"Found {len(voice_history)} voiceover generations.")
-        voice_history = voice_history.sort_values('timestamp', ascending=False)
+
+        voice_history = voice_history.sort_values('timestamp', ascending=False).reset_index(drop=True)
+        total_voices = len(voice_history)
+        items_per_page = 9
+        max_pages = (total_voices + items_per_page - 1) // items_per_page
+        if "voice_page" not in st.session_state:
+            st.session_state.voice_page = 0
+
+        st.markdown(f"Found {total_voices} voiceover generations.")
+
+        # --- Enhanced Pagination Controls ---
+        if max_pages > 1:
+            col1, col2, col3 = st.columns([1, 2, 1])
+            with col1:
+                if st.button("◀ Previous", disabled=(st.session_state.voice_page <= 0), key="prev_voice"):
+                    st.session_state.voice_page -= 1
+                    st.rerun()
+            with col2:
+                page_options = list(range(1, max_pages + 1))
+                selected_page = st.selectbox(
+                    "Go to page", options=page_options, index=st.session_state.voice_page,
+                    label_visibility="collapsed", key="voice_page_selector"
+                )
+                st.session_state.voice_page = selected_page - 1
+            with col3:
+                if st.button("Next ▶", disabled=(st.session_state.voice_page >= max_pages - 1), key="next_voice"):
+                    st.session_state.voice_page += 1
+                    st.rerun()
+
+        start_idx = st.session_state.voice_page * items_per_page
+        end_idx = min(start_idx + items_per_page, total_voices)
+        page_voices = voice_history.iloc[start_idx:end_idx]
+
         st.markdown('<div class="history-grid">', unsafe_allow_html=True)
-        rows = [voice_history.iloc[i:i+3] for i in range(0, len(voice_history), 3)]
+        rows = [page_voices.iloc[i:i+3] for i in range(0, len(page_voices), 3)]
         for row_items in rows:
             cols = st.columns(3)
             for i, (_, row) in enumerate(row_items.iterrows()):
                 if i < len(cols):
                     with cols[i]:
-                        with st.container(border=True, height=350):
-                            display_history_voice_card(row)
+                        display_history_voice_card(row)
         st.markdown('</div>', unsafe_allow_html=True)
+
+        # --- Bottom Pagination ---
+        if max_pages > 1:
+            col1_bottom, col2_bottom, col3_bottom = st.columns([1, 2, 1])
+            with col1_bottom:
+                if st.button("◀ Previous", disabled=(st.session_state.voice_page <= 0), key="prev_voice_bottom"):
+                    st.session_state.voice_page -= 1
+                    st.rerun()
+            with col2_bottom:
+                st.markdown(f"<div style='text-align: center;'>Page {st.session_state.voice_page + 1} of {max_pages}</div>", unsafe_allow_html=True)
+            with col3_bottom:
+                if st.button("Next ▶", disabled=(st.session_state.voice_page >= max_pages - 1), key="next_voice_bottom"):
+                    st.session_state.voice_page += 1
+                    st.rerun()
 
 def display_all_images(history_data):
     """Displays the 'All Images' sub-tab content."""
@@ -3929,17 +4020,24 @@ def display_all_images(history_data):
 
         st.markdown(f"### Source Images ({total_images})")
         
-        col1, col2, col3 = st.columns([1, 3, 1])
-        with col1:
-            if st.button("◀ Previous", disabled=(st.session_state.image_page <= 0), key="prev_image"):
-                st.session_state.image_page = max(0, st.session_state.image_page - 1)
-                st.rerun()
-        with col2:
-            st.markdown(f"**Page {st.session_state.image_page + 1} of {max(1, max_pages)}** (showing {min(items_per_page, total_images - st.session_state.image_page * items_per_page)} of {total_images} images)")
-        with col3:
-            if st.button("Next ▶", disabled=(st.session_state.image_page >= max_pages - 1), key="next_image"):
-                st.session_state.image_page = min(max_pages - 1, st.session_state.image_page + 1)
-                st.rerun()
+        # --- Enhanced Pagination Controls ---
+        if max_pages > 1:
+            col1, col2, col3 = st.columns([1, 2, 1])
+            with col1:
+                if st.button("◀ Previous", disabled=(st.session_state.image_page <= 0), key="prev_image"):
+                    st.session_state.image_page -= 1
+                    st.rerun()
+            with col2:
+                page_options = list(range(1, max_pages + 1))
+                selected_page = st.selectbox(
+                    "Go to page", options=page_options, index=st.session_state.image_page,
+                    label_visibility="collapsed", key="image_page_selector"
+                )
+                st.session_state.image_page = selected_page - 1
+            with col3:
+                if st.button("Next ▶", disabled=(st.session_state.image_page >= max_pages - 1), key="next_image"):
+                    st.session_state.image_page += 1
+                    st.rerun()
         start_idx = st.session_state.image_page * items_per_page
         end_idx = min(start_idx + items_per_page, total_images)
         page_images = image_history.iloc[start_idx:end_idx]
@@ -3954,17 +4052,19 @@ def display_all_images(history_data):
                         display_history_image_card(row)
         st.markdown('</div>', unsafe_allow_html=True)
         
-        col1, col2, col3 = st.columns([1, 3, 1])
-        with col1:
-            if st.button("◀ Previous", disabled=(st.session_state.image_page <= 0), key="prev_image_bottom"):
-                st.session_state.image_page = max(0, st.session_state.image_page - 1)
-                st.rerun()
-        with col2:
-            st.markdown(f"**Page {st.session_state.image_page + 1} of {max(1, max_pages)}**")
-        with col3:
-            if st.button("Next ▶", disabled=(st.session_state.image_page >= max_pages - 1), key="next_image_bottom"):
-                st.session_state.image_page = min(max_pages - 1, st.session_state.image_page + 1)
-                st.rerun()
+        # --- Bottom Pagination ---
+        if max_pages > 1:
+            col1_bottom, col2_bottom, col3_bottom = st.columns([1, 2, 1])
+            with col1_bottom:
+                if st.button("◀ Previous", disabled=(st.session_state.image_page <= 0), key="prev_image_bottom"):
+                    st.session_state.image_page -= 1
+                    st.rerun()
+            with col2_bottom:
+                st.markdown(f"<div style='text-align: center;'>Page {st.session_state.image_page + 1} of {max_pages}</div>", unsafe_allow_html=True)
+            with col3_bottom:
+                if st.button("Next ▶", disabled=(st.session_state.image_page >= max_pages - 1), key="next_image_bottom"):
+                    st.session_state.image_page += 1
+                    st.rerun()
 
 def display_all_history(history_data):
     """Displays the 'All History' sub-tab content."""
@@ -5050,7 +5150,7 @@ def _parse_history_params(params_json):
         print(f"Error parsing params: {e}")
         return {}
 
-def display_history_audio_card(row, project_id=None):
+def display_history_audio_card(row, project_id=None):    
     uri = row['uri']
     timestamp = row['timestamp']
     prompt = row.get('prompt', 'No prompt available.')
@@ -5064,19 +5164,28 @@ def display_history_audio_card(row, project_id=None):
         st.error(f"Error generating signed URL: {e}")
         signed_url = None
 
-    if signed_url:
-        if not project_id:
-            is_selected = uri in st.session_state.get('selected_history_items', {})
-            def toggle_selection():
-                if uri in st.session_state.selected_history_items:
-                    del st.session_state.selected_history_items[uri]
-                else:
-                    st.session_state.selected_history_items[uri] = {'type': 'audio', 'doc_id': doc_id}
+    with st.container(border=True, height=450):        
+        if signed_url:
+            if not project_id:
+                is_selected = uri in st.session_state.get('selected_history_items', {})
+                def toggle_selection():
+                    if uri in st.session_state.selected_history_items:
+                        del st.session_state.selected_history_items[uri]
+                    else:
+                        st.session_state.selected_history_items[uri] = {'type': 'audio', 'doc_id': doc_id}
 
-            select_col, fav_col = st.columns([1, 5])
-            with select_col:
-                st.checkbox("Select", value=is_selected, key=f"select_{doc_id}", on_change=toggle_selection, label_visibility="collapsed")
-            with fav_col:
+                select_col, fav_col = st.columns([1, 5])
+                with select_col:
+                    st.checkbox("Select", value=is_selected, key=f"select_{doc_id}", on_change=toggle_selection, label_visibility="collapsed")
+                with fav_col:
+                    st.button(
+                        "⭐️" if is_favorite else "☆",
+                        key=f"fav_hist_audio_{doc_id}",
+                        on_click=toggle_favorite_status,
+                        args=(doc_id, is_favorite),
+                        help="Mark as favorite"
+                    )
+            else:
                 st.button(
                     "⭐️" if is_favorite else "☆",
                     key=f"fav_hist_audio_{doc_id}",
@@ -5084,17 +5193,9 @@ def display_history_audio_card(row, project_id=None):
                     args=(doc_id, is_favorite),
                     help="Mark as favorite"
                 )
+            st.audio(signed_url, format="audio/wav") # The API saves as WAV
         else:
-            st.button(
-                "⭐️" if is_favorite else "☆",
-                key=f"fav_hist_audio_{doc_id}",
-                on_click=toggle_favorite_status,
-                args=(doc_id, is_favorite),
-                help="Mark as favorite"
-            )
-        st.audio(signed_url, format="audio/wav") # The API saves as WAV
-    else:
-        st.error("Could not generate a signed URL for this audio.")
+            st.error("Could not generate a signed URL for this audio.")
 
     try:
         if pd.notna(timestamp):
@@ -5141,6 +5242,9 @@ def display_history_audio_card(row, project_id=None):
             if st.button("Remove from Project", key=f"remove_{doc_id}", use_container_width=True):
                 st.session_state[confirm_key] = True
                 st.rerun()
+    
+    return
+
 def display_history_voice_card(row, project_id=None):
     """Display a voiceover history card with details and buttons."""
     uri = row['uri']
@@ -5156,19 +5260,28 @@ def display_history_voice_card(row, project_id=None):
         st.error(f"Error generating signed URL: {e}")
         signed_url = None
 
-    if signed_url:
-        if not project_id:
-            is_selected = uri in st.session_state.get('selected_history_items', {})
-            def toggle_selection():
-                if uri in st.session_state.selected_history_items:
-                    del st.session_state.selected_history_items[uri]
-                else:
-                    st.session_state.selected_history_items[uri] = {'type': 'voice', 'doc_id': doc_id}
+    with st.container(border=True, height=450):        
+        if signed_url:
+            if not project_id:
+                is_selected = uri in st.session_state.get('selected_history_items', {})
+                def toggle_selection():
+                    if uri in st.session_state.selected_history_items:
+                        del st.session_state.selected_history_items[uri]
+                    else:
+                        st.session_state.selected_history_items[uri] = {'type': 'voice', 'doc_id': doc_id}
 
-            select_col, fav_col = st.columns([1, 5])
-            with select_col:
-                st.checkbox("Select", value=is_selected, key=f"select_{doc_id}", on_change=toggle_selection, label_visibility="collapsed")
-            with fav_col:
+                select_col, fav_col = st.columns([1, 5])
+                with select_col:
+                    st.checkbox("Select", value=is_selected, key=f"select_{doc_id}", on_change=toggle_selection, label_visibility="collapsed")
+                with fav_col:
+                    st.button(
+                        "⭐️" if is_favorite else "☆",
+                        key=f"fav_hist_voice_{doc_id}",
+                        on_click=toggle_favorite_status,
+                        args=(doc_id, is_favorite),
+                        help="Mark as favorite"
+                    )
+            else:
                 st.button(
                     "⭐️" if is_favorite else "☆",
                     key=f"fav_hist_voice_{doc_id}",
@@ -5176,17 +5289,9 @@ def display_history_voice_card(row, project_id=None):
                     args=(doc_id, is_favorite),
                     help="Mark as favorite"
                 )
+            st.audio(signed_url, format="audio/wav") # TTS often produces WAV
         else:
-            st.button(
-                "⭐️" if is_favorite else "☆",
-                key=f"fav_hist_voice_{doc_id}",
-                on_click=toggle_favorite_status,
-                args=(doc_id, is_favorite),
-                help="Mark as favorite"
-            )
-        st.audio(signed_url, format="audio/wav") # TTS often produces WAV
-    else:
-        st.error("Could not generate a signed URL for this voiceover.")
+            st.error("Could not generate a signed URL for this voiceover.")
 
     try:
         if pd.notna(timestamp):
