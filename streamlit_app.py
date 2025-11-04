@@ -674,6 +674,28 @@ st.markdown("""
         display: block;
         object-fit: contain;
     }
+
+    /* Folder Icon Styling */
+    .folder-container {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        text-align: center;
+        cursor: pointer;
+        padding: 20px;
+        border-radius: 10px;
+        transition: background-color 0.2s;
+    }
+    .folder-container:hover {
+        background-color: #f0f0f0;
+    }
+    .folder-icon {
+        font-size: 4rem; /* Larger folder icon */
+    }
+    .folder-name {
+        margin-top: 10px;
+        object-fit: contain;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -995,6 +1017,31 @@ def check_and_process_pending_operations(user_id):
         logger.error(f"Error processing pending operations: {e}")
         st.error("An error occurred while checking for pending generations.")
 
+def clear_pending_operations(user_id: str) -> int:
+    """
+    Deletes all pending operations for a specific user from Firestore.
+
+    Args:
+        user_id: The ID of the user whose pending operations should be cleared.
+
+    Returns:
+        The number of deleted operations.
+    """
+    if not FIRESTORE_AVAILABLE:
+        raise Exception("Firestore is not available.")
+
+    pending_ref = db.collection('pending_operations').where('user_id', '==', user_id)
+    docs = list(pending_ref.stream())
+    
+    if not docs:
+        return 0
+
+    for doc in docs:
+        doc.reference.delete()
+        logger.info(f"Deleted stale pending operation document: {doc.id}")
+    
+    return len(docs)
+
 def main():
     """Main function to run the Streamlit app."""
     logger.start_section("App Initialization")
@@ -1181,6 +1228,22 @@ def main():
             if "debug_mode" not in st.session_state or st.session_state.debug_mode != debug_mode:
                 st.session_state.debug_mode = debug_mode
                 logger.debug_mode = debug_mode
+
+        with st.expander("Maintenance", expanded=False):
+            st.markdown("#### Maintenance Tools")
+            if st.button("Clear Pending Operations", help="Deletes all 'in-progress' generation records from the database. Use this if you have stale operations stuck from a previous session."):
+                try:
+                    with st.spinner("Finding and deleting pending operations..."):
+                        deleted_count = clear_pending_operations(st.session_state.user_id)
+                    if deleted_count > 0:
+                        st.success(f"Successfully deleted {deleted_count} pending operation(s).")
+                    else:
+                        st.info("No pending operations found to delete.")
+                    # Force a re-check on the next run if needed, though clearing should be sufficient
+                    st.session_state.pending_ops_checked = False
+                except Exception as e:
+                    st.error(f"Failed to clear pending operations: {e}")
+
         st.markdown('</div>', unsafe_allow_html=True)
         
         # Display configuration summary if in debug mode
@@ -1232,6 +1295,7 @@ def main():
         ("🎨 Image", image_tab),
         ("🎵 Audio", audio_tab),
         ("♊ Gemini", gemini_chat_tab),
+        ("📁 Projects", projects_tab),
         ("📋 History", history_tab),
     ])
     # Use a radio button for main navigation that is directly tied to the session state.
@@ -1400,12 +1464,286 @@ def video_extension_tab():
                 if standardized_video_path and os.path.exists(standardized_video_path):
                     os.unlink(standardized_video_path)
 
+def projects_tab():
+    """A tab for creating, viewing, and managing collaborative projects."""
+    st.header("📁 Projects")
+
+    # If the user is just navigating to this tab, always reset to the project list view.
+    # We detect this by checking if the previous tab was different.
+    if st.session_state.get('previous_main_tab') != "📁 Projects":
+        if 'viewing_project_id' in st.session_state:
+            st.session_state.viewing_project_id = None
+    st.session_state.previous_main_tab = "📁 Projects"
+    
+    # Initialize state for viewing asset categories within a project
+    if 'viewing_project_asset_category' not in st.session_state:
+        st.session_state.viewing_project_asset_category = None
+
+
+    # Check if we are viewing a specific project
+    if 'viewing_project_id' in st.session_state and st.session_state.viewing_project_id:
+        display_project_view(st.session_state.viewing_project_id)
+        return
+
+    # --- Display the list of all projects if not viewing a specific one ---
+    display_project_list()
+
+    # --- Create New Project Form ---
+    with st.expander("➕ Create a New Project"):
+        with st.form("new_project_form", clear_on_submit=True):
+            project_name = st.text_input("Project Name", placeholder="e.g., Summer Campaign Videos")
+            project_desc = st.text_area("Project Description (Optional)", placeholder="A brief description of the project's goals.")
+            submitted = st.form_submit_button("Create Project")
+
+            if submitted and project_name:
+                try:
+                    create_project_in_firestore(project_name, project_desc, st.session_state.user_id)
+                    st.success(f"Project '{project_name}' created successfully!")
+                    # We don't need to rerun, the list will update on the next natural rerun.
+                except Exception as e:
+                    st.error(f"Failed to create project: {e}")
+
+def display_project_list():
+    """Displays the list of all user projects."""
+    st.divider()
+
+    # --- Display User's Projects ---
+    st.subheader("Your Projects")
+    try:
+        with st.spinner("Loading projects..."):
+            user_projects = get_user_projects(st.session_state.user_id)
+
+        if not user_projects:
+            st.info("You are not a part of any projects yet. Create one above to get started!")
+            return
+        
+        # Display projects in a grid of folder icons
+        num_projects = len(user_projects)
+        cols_per_row = 4
+        for i in range(0, num_projects, cols_per_row):
+            cols = st.columns(cols_per_row)
+            for j in range(cols_per_row):
+                if i + j < num_projects:
+                    project = user_projects[i + j]
+                    with cols[j]:
+                        # Use a button with custom markdown to simulate a folder
+                        if st.button(f"📁\n\n**{project['name']}**", key=f"open_{project['id']}", use_container_width=True):
+                            st.session_state.viewing_project_id = project['id']
+                            # Reset category view when opening a new project
+                            st.session_state.viewing_project_asset_category = None
+                            st.rerun()
+                        member_count = len(project.get('members', []))
+                        st.caption(f"{member_count} member(s)")
+                        
+    except Exception as e:
+        st.error(f"Could not load projects: {e}")
+
+def display_project_view(project_id: str):
+    """Displays the detailed view for a single project, including its assets."""
+    try:
+        # Fetch project details
+        project_ref = db.collection('projects').document(project_id)
+        project_data = project_ref.get().to_dict()
+        if not project_data:
+            st.error("Project not found.")
+            st.session_state.viewing_project_id = None
+            return
+
+        # --- Header and Back Button ---
+        col1, col2 = st.columns([4, 1])
+        with col1:
+            st.header(f"Project: {project_data.get('name')}")
+            if project_data.get('description'):
+                st.caption(project_data.get('description'))
+        with col2:
+            if st.button("⬅️ Back to All Projects"):
+                st.session_state.viewing_project_id = None
+                st.session_state.viewing_project_asset_category = None # Reset category view
+                st.rerun()
+
+        st.divider()
+
+        # --- Fetch Assets and Group by Type ---
+        with st.spinner("Loading project assets..."):
+            asset_uris = get_project_assets_from_firestore(project_id)
+            project_assets_df = get_asset_details_from_firestore(asset_uris) if asset_uris else pd.DataFrame()
+
+        # --- Display Asset Category Folders ---
+        asset_types_present = project_assets_df['type'].unique() if not project_assets_df.empty else []
+        
+        # Define all possible categories and their icons
+        all_categories = {
+            "video": "🎬 Videos",
+            "image": "🖼️ Images",
+            "audio": "🎵 Audios",
+            "voice": "🎤 Voices"
+        }
+
+        st.subheader("Asset Categories")
+        folder_cols = st.columns(4)
+        category_map = {}
+        
+        for i, (cat_key, cat_name) in enumerate(all_categories.items()):
+            with folder_cols[i]:
+                # Check if there are any assets of this type
+                assets_of_type = project_assets_df[project_assets_df['type'] == cat_key] if not project_assets_df.empty else pd.DataFrame()
+                is_present = not assets_of_type.empty
+                
+                # Use a button to act as the folder
+                if st.button(f"{cat_name} ({len(assets_of_type)})", key=f"folder_{cat_key}", disabled=not is_present, use_container_width=True):
+                    st.session_state.viewing_project_asset_category = cat_key
+                    # No rerun needed, the rest of the script will handle the display
+
+        st.divider()
+
+        # --- Display Assets for the Selected Category ---
+        selected_category = st.session_state.get('viewing_project_asset_category')
+
+        if selected_category:
+            st.subheader(f"Displaying: {all_categories[selected_category]}")
+            
+            assets_to_display = project_assets_df[project_assets_df['type'] == selected_category]
+
+            if assets_to_display.empty:
+                st.info(f"No {selected_category} assets found in this project.")
+            else:
+                # Use the existing card display functions in a grid
+                num_assets = len(assets_to_display)
+                cols_per_row = 3
+                for i in range(0, num_assets, cols_per_row):
+                    cols = st.columns(cols_per_row)
+                    for j in range(cols_per_row):
+                        if i + j < num_assets:
+                            with cols[j]:
+                                row = assets_to_display.iloc[i + j]
+                                if selected_category == 'video':
+                                    display_history_video_card(row, project_id=project_id)
+                                elif selected_category == 'image':
+                                    display_history_image_card(row, project_id=project_id)
+                                elif selected_category == 'audio':
+                                    display_history_audio_card(row, project_id=project_id)
+                                elif selected_category == 'voice':
+                                    display_history_voice_card(row, project_id=project_id)
+
+    except Exception as e:
+        st.error(f"An error occurred while displaying the project: {e}")
+
+def create_project_in_firestore(name: str, description: str, user_id: str):
+    """Creates a new project document in Firestore."""
+    if not FIRESTORE_AVAILABLE:
+        raise Exception("Firestore is not available.")
+    
+    doc_ref = db.collection('projects').document()
+    doc_ref.set({
+        'name': name,
+        'description': description,
+        'owner_id': user_id,
+        'members': [user_id], # The creator is the first member
+        'created_timestamp': firestore.SERVER_TIMESTAMP
+    })
+    logger.info(f"User '{user_id}' created project '{name}' (ID: {doc_ref.id}).")
+
+def get_user_projects(user_id: str) -> List[Dict]:
+    """Fetches all projects a user is an owner of or a member of."""
+    if not FIRESTORE_AVAILABLE:
+        return []
+
+    # Firestore doesn't support OR queries on different fields, so we run two queries and merge.
+    owned_projects_query = db.collection('projects').where('owner_id', '==', user_id).stream()
+    member_projects_query = db.collection('projects').where('members', 'array_contains', user_id).stream()
+
+    projects = {} # Use a dict to automatically handle duplicates by ID
+    for doc in owned_projects_query:
+        projects[doc.id] = {**doc.to_dict(), 'id': doc.id}
+    for doc in member_projects_query:
+        projects[doc.id] = {**doc.to_dict(), 'id': doc.id}
+
+    # Sort by creation time, newest first
+    return sorted(projects.values(), key=lambda p: p.get('created_timestamp', 0), reverse=True)
+
+def get_asset_details_from_firestore(asset_uris: List[str]) -> pd.DataFrame:
+    """
+    Fetches details for a specific list of asset URIs from the history collection.
+    This is used for projects to show assets from all users.
+    """
+    if not FIRESTORE_AVAILABLE or not asset_uris:
+        return pd.DataFrame()
+
+    asset_details = []
+    # Firestore 'in' query is limited to 30 items. We need to batch.
+    for i in range(0, len(asset_uris), 30):
+        batch_uris = asset_uris[i:i + 30]
+        query = db.collection('history').where('uri', 'in', batch_uris).stream()
+        for doc in query:
+            doc_data = doc.to_dict()
+            doc_data['doc_id'] = doc.id
+            asset_details.append(doc_data)
+
+    if not asset_details:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(asset_details)
+    # Ensure required columns exist for display functions
+    if 'favorite' not in df.columns:
+        df['favorite'] = False
+    if 'deleted' not in df.columns:
+        df['deleted'] = False
+
+    return df
+
+def get_project_assets_from_firestore(project_id: str) -> List[str]:
+    """Fetches all asset URIs from a project's subcollection."""
+    if not FIRESTORE_AVAILABLE:
+        return []
+    
+    assets_ref = db.collection('projects').document(project_id).collection('assets')
+    docs = assets_ref.stream()
+    
+    return [doc.to_dict().get('uri') for doc in docs if doc.to_dict().get('uri')]
+
+def add_assets_to_project_in_firestore(project_id: str, asset_uris: List[str]):
+    """Adds a list of asset URIs to a project's 'assets' subcollection in Firestore."""
+    if not FIRESTORE_AVAILABLE:
+        raise Exception("Firestore is not available.")
+    
+    project_ref = db.collection('projects').document(project_id)
+    assets_ref = project_ref.collection('assets')
+    
+    batch = db.batch()
+    added_count = 0
+    for uri in asset_uris:
+        # Use a hash of the URI as the document ID to prevent duplicates
+        asset_doc_id = hashlib.sha256(uri.encode()).hexdigest()
+        asset_doc_ref = assets_ref.document(asset_doc_id)
+        batch.set(asset_doc_ref, {
+            'uri': uri,
+            'added_timestamp': firestore.SERVER_TIMESTAMP
+        })
+        added_count += 1
+    batch.commit()
+    logger.info(f"Added {added_count} assets to project {project_id}.")
+
+def remove_asset_from_project_in_firestore(project_id: str, asset_uri: str):
+    """Removes an asset's reference from a project's subcollection in Firestore."""
+    if not FIRESTORE_AVAILABLE:
+        raise Exception("Firestore is not available.")
+
+    try:
+        # The document ID in the 'assets' subcollection is a hash of the URI
+        asset_doc_id = hashlib.sha256(asset_uri.encode()).hexdigest()
+        asset_doc_ref = db.collection('projects').document(project_id).collection('assets').document(asset_doc_id)
+        asset_doc_ref.delete()
+        logger.info(f"Removed asset '{asset_uri}' from project '{project_id}'.")
+    except Exception as e:
+        logger.error(f"Failed to remove asset from project: {e}")
+        raise e
+
 def image_tab():
     """Main tab for all image-related operations."""
     # Define the image sub-tabs and their corresponding functions
     sub_tabs = OrderedDict([
         ("Text-to-Image", text_to_image_tab),
-        ("Image Editing (Nano Banana)", image_editing_tab),
+        ("Image Editing", image_editing_tab),
     ])
 
     # Use a radio button for controlled sub-navigation
@@ -3760,7 +4098,7 @@ def display_dashboard(history_data):
         st.altair_chart(pie_chart, use_container_width=True)
 
 
-def display_history_video_card(row):
+def display_history_video_card(row, project_id=None):
     """Display a video history card with details and buttons."""
     uri = row['uri']
     doc_id = row.get('doc_id') # Get the unique Firestore document ID
@@ -3769,20 +4107,29 @@ def display_history_video_card(row):
     params = _parse_history_params(row.get('params', {}))
     is_favorite = row.get('favorite', False)
 
-    # --- Selection Checkbox ---
-    is_selected = uri in st.session_state.get('selected_history_items', {})
+    # --- Selection Checkbox (only show in history, not in projects) ---
+    if not project_id:
+        is_selected = uri in st.session_state.get('selected_history_items', {})
 
-    def toggle_selection():
-        if uri in st.session_state.selected_history_items:
-            del st.session_state.selected_history_items[uri]
-        else:
-            st.session_state.selected_history_items[uri] = {'type': 'video', 'doc_id': doc_id}
+        def toggle_selection():
+            if uri in st.session_state.selected_history_items:
+                del st.session_state.selected_history_items[uri]
+            else:
+                st.session_state.selected_history_items[uri] = {'type': 'video', 'doc_id': doc_id}
 
-    # Use columns for checkbox and favorite button
-    select_col, fav_col = st.columns([1, 5])
-    with select_col:
-        st.checkbox("Select", value=is_selected, key=f"select_{doc_id}", on_change=toggle_selection, label_visibility="collapsed")
-    with fav_col:
+        # Use columns for checkbox and favorite button
+        select_col, fav_col = st.columns([1, 5])
+        with select_col:
+            st.checkbox("Select", value=is_selected, key=f"select_{doc_id}", on_change=toggle_selection, label_visibility="collapsed")
+        with fav_col:
+            st.button(
+                "⭐️" if is_favorite else "☆", 
+                key=f"fav_{doc_id}", 
+                on_click=toggle_favorite_status, 
+                args=(doc_id, is_favorite),
+                help="Mark as favorite"
+            )
+    else: # In project view, just show the favorite button
         st.button(
             "⭐️" if is_favorite else "☆", 
             key=f"fav_{doc_id}", 
@@ -3875,6 +4222,30 @@ def display_history_video_card(row):
     if signed_url:
         st.markdown(f'<div style="text-align: right;"><a href="{signed_url}" target="_blank" style="font-size: 0.8rem;">Open in new tab</a></div>', unsafe_allow_html=True)
 
+    # --- Project-specific actions ---
+    if project_id:
+        confirm_key = f"confirm_remove_{doc_id}"
+
+        if st.session_state.get(confirm_key):
+            st.warning("Are you sure?")
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("✅ Yes, Remove", key=f"confirm_yes_{doc_id}", use_container_width=True, type="primary"):
+                    try:
+                        remove_asset_from_project_in_firestore(project_id, uri)
+                        st.session_state[confirm_key] = False
+                        st.success("Asset removed.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Failed to remove: {e}")
+            with col2:
+                if st.button("❌ Cancel", key=f"confirm_no_{doc_id}", use_container_width=True):
+                    st.session_state[confirm_key] = False
+                    st.rerun()
+        else:
+            if st.button("Remove from Project", key=f"remove_{doc_id}", use_container_width=True):
+                st.session_state[confirm_key] = True
+                st.rerun()
 def clear_history():
     """Clear all history data from Firestore and associated GCS files."""
     logger.start_section("Clear History")
@@ -4579,8 +4950,7 @@ def _parse_history_params(params_json):
         print(f"Error parsing params: {e}")
         return {}
 
-def display_history_audio_card(row):
-    """Display an audio history card with details and buttons."""
+def display_history_audio_card(row, project_id=None):
     uri = row['uri']
     timestamp = row['timestamp']
     prompt = row.get('prompt', 'No prompt available.')
@@ -4595,17 +4965,26 @@ def display_history_audio_card(row):
         signed_url = None
 
     if signed_url:
-        is_selected = uri in st.session_state.get('selected_history_items', {})
-        def toggle_selection():
-            if uri in st.session_state.selected_history_items:
-                del st.session_state.selected_history_items[uri]
-            else:
-                st.session_state.selected_history_items[uri] = {'type': 'audio', 'doc_id': doc_id}
+        if not project_id:
+            is_selected = uri in st.session_state.get('selected_history_items', {})
+            def toggle_selection():
+                if uri in st.session_state.selected_history_items:
+                    del st.session_state.selected_history_items[uri]
+                else:
+                    st.session_state.selected_history_items[uri] = {'type': 'audio', 'doc_id': doc_id}
 
-        select_col, fav_col = st.columns([1, 5])
-        with select_col:
-            st.checkbox("Select", value=is_selected, key=f"select_{doc_id}", on_change=toggle_selection, label_visibility="collapsed")
-        with fav_col:
+            select_col, fav_col = st.columns([1, 5])
+            with select_col:
+                st.checkbox("Select", value=is_selected, key=f"select_{doc_id}", on_change=toggle_selection, label_visibility="collapsed")
+            with fav_col:
+                st.button(
+                    "⭐️" if is_favorite else "☆",
+                    key=f"fav_hist_audio_{doc_id}",
+                    on_click=toggle_favorite_status,
+                    args=(doc_id, is_favorite),
+                    help="Mark as favorite"
+                )
+        else:
             st.button(
                 "⭐️" if is_favorite else "☆",
                 key=f"fav_hist_audio_{doc_id}",
@@ -4638,7 +5017,31 @@ def display_history_audio_card(row):
     if signed_url:
         st.markdown(f'<div style="text-align: right;"><a href="{signed_url}" target="_blank" style="font-size: 0.8rem;">Open in new tab</a></div>', unsafe_allow_html=True)
 
-def display_history_voice_card(row):
+    # --- Project-specific actions ---
+    if project_id:
+        confirm_key = f"confirm_remove_{doc_id}"
+
+        if st.session_state.get(confirm_key):
+            st.warning("Are you sure?")
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("✅ Yes, Remove", key=f"confirm_yes_{doc_id}", use_container_width=True, type="primary"):
+                    try:
+                        remove_asset_from_project_in_firestore(project_id, uri)
+                        st.session_state[confirm_key] = False
+                        st.success("Asset removed.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Failed to remove: {e}")
+            with col2:
+                if st.button("❌ Cancel", key=f"confirm_no_{doc_id}", use_container_width=True):
+                    st.session_state[confirm_key] = False
+                    st.rerun()
+        else:
+            if st.button("Remove from Project", key=f"remove_{doc_id}", use_container_width=True):
+                st.session_state[confirm_key] = True
+                st.rerun()
+def display_history_voice_card(row, project_id=None):
     """Display a voiceover history card with details and buttons."""
     uri = row['uri']
     timestamp = row['timestamp']
@@ -4654,17 +5057,26 @@ def display_history_voice_card(row):
         signed_url = None
 
     if signed_url:
-        is_selected = uri in st.session_state.get('selected_history_items', {})
-        def toggle_selection():
-            if uri in st.session_state.selected_history_items:
-                del st.session_state.selected_history_items[uri]
-            else:
-                st.session_state.selected_history_items[uri] = {'type': 'voice', 'doc_id': doc_id}
+        if not project_id:
+            is_selected = uri in st.session_state.get('selected_history_items', {})
+            def toggle_selection():
+                if uri in st.session_state.selected_history_items:
+                    del st.session_state.selected_history_items[uri]
+                else:
+                    st.session_state.selected_history_items[uri] = {'type': 'voice', 'doc_id': doc_id}
 
-        select_col, fav_col = st.columns([1, 5])
-        with select_col:
-            st.checkbox("Select", value=is_selected, key=f"select_{doc_id}", on_change=toggle_selection, label_visibility="collapsed")
-        with fav_col:
+            select_col, fav_col = st.columns([1, 5])
+            with select_col:
+                st.checkbox("Select", value=is_selected, key=f"select_{doc_id}", on_change=toggle_selection, label_visibility="collapsed")
+            with fav_col:
+                st.button(
+                    "⭐️" if is_favorite else "☆",
+                    key=f"fav_hist_voice_{doc_id}",
+                    on_click=toggle_favorite_status,
+                    args=(doc_id, is_favorite),
+                    help="Mark as favorite"
+                )
+        else:
             st.button(
                 "⭐️" if is_favorite else "☆",
                 key=f"fav_hist_voice_{doc_id}",
@@ -4696,6 +5108,31 @@ def display_history_voice_card(row):
 
     if signed_url:
         st.markdown(f'<div style="text-align: right;"><a href="{signed_url}" target="_blank" style="font-size: 0.8rem;">Open in new tab</a></div>', unsafe_allow_html=True)
+
+    # --- Project-specific actions ---
+    if project_id:
+        confirm_key = f"confirm_remove_{doc_id}"
+
+        if st.session_state.get(confirm_key):
+            st.warning("Are you sure?")
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("✅ Yes, Remove", key=f"confirm_yes_{doc_id}", use_container_width=True, type="primary"):
+                    try:
+                        remove_asset_from_project_in_firestore(project_id, uri)
+                        st.session_state[confirm_key] = False
+                        st.success("Asset removed.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Failed to remove: {e}")
+            with col2:
+                if st.button("❌ Cancel", key=f"confirm_no_{doc_id}", use_container_width=True):
+                    st.session_state[confirm_key] = False
+                    st.rerun()
+        else:
+            if st.button("Remove from Project", key=f"remove_{doc_id}", use_container_width=True):
+                st.session_state[confirm_key] = True
+                st.rerun()
 
 def dub_video(uploaded_video, input_language, output_language, bucket_name):
     """
@@ -4999,7 +5436,7 @@ def video_upload_to_gcs(file_path: str, bucket_name: str, object_name: str) -> s
         return None
 
 
-def display_history_image_card(row):
+def display_history_image_card(row, project_id=None):
     """Display an image history card with details and buttons."""
     # Extract data
     doc_id = row.get('doc_id') # Get the unique Firestore document ID
@@ -5019,19 +5456,27 @@ def display_history_image_card(row):
     filename = params.get('filename', default_filename)
     is_favorite = row.get('favorite', False)
     
-    # --- Selection Checkbox ---
-    is_selected = uri in st.session_state.get('selected_history_items', {})
+    # --- Selection Checkbox (only show in history, not in projects) ---
+    if not project_id:
+        is_selected = uri in st.session_state.get('selected_history_items', {})
 
-    def toggle_selection():
-        if uri in st.session_state.selected_history_items:
-            del st.session_state.selected_history_items[uri]
-        else:
-            st.session_state.selected_history_items[uri] = {'type': 'image', 'doc_id': doc_id}
-    # Use the unique Firestore document ID for the checkbox key
-    select_col, fav_col = st.columns([1, 5])
-    with select_col:
-        st.checkbox("Select", value=is_selected, key=f"select_{doc_id}", on_change=toggle_selection, label_visibility="collapsed")
-    with fav_col:
+        def toggle_selection():
+            if uri in st.session_state.selected_history_items:
+                del st.session_state.selected_history_items[uri]
+            else:
+                st.session_state.selected_history_items[uri] = {'type': 'image', 'doc_id': doc_id}
+        select_col, fav_col = st.columns([1, 5])
+        with select_col:
+            st.checkbox("Select", value=is_selected, key=f"select_{doc_id}", on_change=toggle_selection, label_visibility="collapsed")
+        with fav_col:
+            st.button(
+                "⭐️" if is_favorite else "☆",
+                key=f"fav_hist_img_{doc_id}",
+                on_click=toggle_favorite_status,
+                args=(doc_id, is_favorite),
+                help="Mark as favorite"
+            )
+    else: # In project view, just show the favorite button
         st.button(
             "⭐️" if is_favorite else "☆",
             key=f"fav_hist_img_{doc_id}",
@@ -5088,6 +5533,31 @@ def display_history_image_card(row):
     if signed_url:
         st.markdown(f'<div style="text-align: right;"><a href="{signed_url}" target="_blank" style="font-size: 0.8rem;">Open in new tab</a></div>', unsafe_allow_html=True)
 
+    # --- Project-specific actions ---
+    if project_id:
+        confirm_key = f"confirm_remove_{doc_id}"
+
+        if st.session_state.get(confirm_key):
+            st.warning("Are you sure?")
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("✅ Yes, Remove", key=f"confirm_yes_{doc_id}", use_container_width=True, type="primary"):
+                    try:
+                        remove_asset_from_project_in_firestore(project_id, uri)
+                        st.session_state[confirm_key] = False
+                        st.success("Asset removed.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Failed to remove: {e}")
+            with col2:
+                if st.button("❌ Cancel", key=f"confirm_no_{doc_id}", use_container_width=True):
+                    st.session_state[confirm_key] = False
+                    st.rerun()
+        else:
+            if st.button("Remove from Project", key=f"remove_{doc_id}", use_container_width=True):
+                st.session_state[confirm_key] = True
+                st.rerun()
+
 def download_gcs_file_and_simulate_upload(uri: str) -> Optional[SimulatedUploadFile]:
     """Downloads a file from GCS and wraps it in a file-like object for Streamlit."""
     try:
@@ -5119,7 +5589,7 @@ def handle_history_action(operation: str, uris: List[str]):
 
         if operation == "Edit Image(s)":
             st.session_state.edit_image_files = simulated_files
-            st.session_state.active_image_sub_tab = "Image Editing (Nano Banana)"
+            st.session_state.active_image_sub_tab = "Image Editing"
             st.session_state.next_active_main_tab = "🎨 Image"
         elif operation == "Use for Image-to-Video":
             # Set the canonical active image data. The Image-to-Video tab will
@@ -5161,11 +5631,14 @@ def display_history_actions():
         item_types = set()
         for item in items.values():
             item_type = item['type'] if isinstance(item, dict) else item
+            # Skip if item_type is None or not a string
+            if not isinstance(item_type, str):
+                continue
             item_types.add(item_type)
         operations = ["-- Select an action --"]
 
         if item_types == {'image'}:
-            operations.append("Edit Image(s) (Nano Banana)")
+            operations.append("Edit Image(s)")
             if len(items) == 1:
                 operations.append("Use for Image-to-Video")
         elif item_types == {'video'}:
@@ -5178,10 +5651,15 @@ def display_history_actions():
             pass # No specific actions for audio yet, but delete is available
         elif item_types == {'voice'}:
             pass # No specific actions for voice yet, but delete is available
+        if item_types: # If any item is selected, allow adding to a project
+            pass # No specific actions for audio yet, but delete is available
+        elif item_types == {'voice'}:
+            pass # No specific actions for voice yet, but delete is available
         
         # Add delete option for any selection
         operations.append("Delete Selected")
 
+        operations.insert(1, "Add to Project")
         if len(operations) > 1:
             selected_op = st.selectbox("Perform an action:", options=operations, key="history_action_selector", index=0)
             if selected_op != "-- Select an action --":
@@ -5208,6 +5686,27 @@ def display_history_actions():
                         if st.button("❌ Cancel", key="cancel_delete"):
                             # Just rerun to hide the confirmation
                             st.rerun()
+                elif selected_op == "Add to Project":
+                    user_projects = get_user_projects(st.session_state.user_id)
+                    if not user_projects:
+                        st.warning("You have no projects. Create a project in the 'Projects' tab first.")
+                    else:
+                        project_names = [p['name'] for p in user_projects]
+                        selected_project_name = st.selectbox("Select a project to add assets to:", project_names)
+                        
+                        if st.button("Confirm Add to Project", key="confirm_add_to_project"):
+                            project_to_add = next((p for p in user_projects if p['name'] == selected_project_name), None)
+                            if project_to_add:
+                                asset_uris = list(items.keys())
+                                try:
+                                    with st.spinner(f"Adding {len(asset_uris)} asset(s) to '{selected_project_name}'..."):
+                                        add_assets_to_project_in_firestore(project_to_add['id'], asset_uris)
+                                    st.success(f"Successfully added assets to project '{selected_project_name}'.")
+                                    st.session_state.selected_history_items.clear()
+                                    time.sleep(1) # Give user time to see the message
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Failed to add assets to project: {e}")
                 else:
                     handle_history_action(selected_op, list(items.keys()))
         else:
