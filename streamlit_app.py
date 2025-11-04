@@ -1561,72 +1561,138 @@ def display_project_view(project_id: str):
                 st.session_state.viewing_project_asset_category = None # Reset category view
                 st.rerun()
 
-        st.divider()
+        # --- Tabs for Assets and Members ---
+        asset_tab, members_tab = st.tabs(["🖼️ Assets", "👥 Members"])
 
-        # --- Fetch Assets and Group by Type ---
-        with st.spinner("Loading project assets..."):
-            asset_uris = get_project_assets_from_firestore(project_id)
-            project_assets_df = get_asset_details_from_firestore(asset_uris) if asset_uris else pd.DataFrame()
+        # --- Assets Tab ---
+        with asset_tab:
+            # --- Fetch Assets and Group by Type ---
+            with st.spinner("Loading project assets..."):
+                asset_uris = get_project_assets_from_firestore(project_id)
+                project_assets_df = get_asset_details_from_firestore(asset_uris) if asset_uris else pd.DataFrame()
 
-        # --- Display Asset Category Folders ---
-        asset_types_present = project_assets_df['type'].unique() if not project_assets_df.empty else []
-        
-        # Define all possible categories and their icons
-        all_categories = {
-            "video": "🎬 Videos",
-            "image": "🖼️ Images",
-            "audio": "🎵 Audios",
-            "voice": "🎤 Voices"
-        }
-
-        st.subheader("Asset Categories")
-        folder_cols = st.columns(4)
-        category_map = {}
-        
-        for i, (cat_key, cat_name) in enumerate(all_categories.items()):
-            with folder_cols[i]:
-                # Check if there are any assets of this type
-                assets_of_type = project_assets_df[project_assets_df['type'] == cat_key] if not project_assets_df.empty else pd.DataFrame()
-                is_present = not assets_of_type.empty
-                
-                # Use a button to act as the folder
-                if st.button(f"{cat_name} ({len(assets_of_type)})", key=f"folder_{cat_key}", disabled=not is_present, use_container_width=True):
-                    st.session_state.viewing_project_asset_category = cat_key
-                    # No rerun needed, the rest of the script will handle the display
-
-        st.divider()
-
-        # --- Display Assets for the Selected Category ---
-        selected_category = st.session_state.get('viewing_project_asset_category')
-
-        if selected_category:
-            st.subheader(f"Displaying: {all_categories[selected_category]}")
+            # --- Display Asset Category Folders ---
+            asset_types_present = project_assets_df['type'].unique() if not project_assets_df.empty else []
             
-            assets_to_display = project_assets_df[project_assets_df['type'] == selected_category]
+            # Define all possible categories and their icons
+            all_categories = {
+                "video": "🎬 Videos",
+                "image": "🖼️ Images",
+                "audio": "🎵 Audios",
+                "voice": "🎤 Voices"
+            }
 
-            if assets_to_display.empty:
-                st.info(f"No {selected_category} assets found in this project.")
-            else:
-                # Use the existing card display functions in a grid
-                num_assets = len(assets_to_display)
-                cols_per_row = 3
-                for i in range(0, num_assets, cols_per_row):
-                    cols = st.columns(cols_per_row)
-                    for j in range(cols_per_row):
-                        if i + j < num_assets:
-                            with cols[j]:
-                                row = assets_to_display.iloc[i + j]
-                                if selected_category == 'video':
-                                    display_history_video_card(row, project_id=project_id)
-                                elif selected_category == 'image':
-                                    display_history_image_card(row, project_id=project_id)
-                                elif selected_category == 'audio':
-                                    display_history_audio_card(row, project_id=project_id)
-                                elif selected_category == 'voice':
-                                    display_history_voice_card(row, project_id=project_id)
+            st.subheader("Asset Categories")
+            folder_cols = st.columns(4)
+            
+            for i, (cat_key, cat_name) in enumerate(all_categories.items()):
+                with folder_cols[i]:
+                    # Check if there are any assets of this type
+                    assets_of_type = project_assets_df[project_assets_df['type'] == cat_key] if not project_assets_df.empty else pd.DataFrame()
+                    is_present = not assets_of_type.empty
+                    
+                    # Use a button to act as the folder
+                    if st.button(f"{cat_name} ({len(assets_of_type)})", key=f"folder_{cat_key}", disabled=not is_present, use_container_width=True):
+                        st.session_state.viewing_project_asset_category = cat_key
+                        # No rerun needed, the rest of the script will handle the display
+
+            st.divider()
+
+            # --- Display Assets for the Selected Category ---
+            selected_category = st.session_state.get('viewing_project_asset_category')
+
+            if selected_category:
+                st.subheader(f"Displaying: {all_categories[selected_category]}")
+                
+                assets_to_display = project_assets_df[project_assets_df['type'] == selected_category]
+
+                if assets_to_display.empty:
+                    st.info(f"No {selected_category} assets found in this project.")
+                else:
+                    # Use the existing card display functions in a grid
+                    num_assets = len(assets_to_display)
+                    cols_per_row = 3
+                    for i in range(0, num_assets, cols_per_row):
+                        cols = st.columns(cols_per_row)
+                        for j in range(cols_per_row):
+                            if i + j < num_assets:
+                                with cols[j]:
+                                    row = assets_to_display.iloc[i + j]
+                                    if selected_category == 'video':
+                                        display_history_video_card(row, project_id=project_id)
+                                    elif selected_category == 'image':
+                                        display_history_image_card(row, project_id=project_id)
+                                    elif selected_category == 'audio':
+                                        display_history_audio_card(row, project_id=project_id)
+                                    elif selected_category == 'voice':
+                                        display_history_voice_card(row, project_id=project_id)
+
+        # --- Members Tab ---
+        with members_tab:
+            display_project_members_tab(project_id, project_data)
 
     except Exception as e:
         st.error(f"An error occurred while displaying the project: {e}")
+
+def display_project_members_tab(project_id: str, project_data: dict):
+    """Displays the UI for managing project members."""
+    st.subheader("Project Members")
+
+    owner_id = project_data.get('owner_id')
+    members = project_data.get('members', [])
+    current_user_id = st.session_state.user_id
+    is_owner = (current_user_id == owner_id)
+
+    # Display Owner
+    st.markdown(f"**👑 Project Owner:** `{owner_id}`")
+
+    # Display Member List
+    st.markdown("**Current Members:**")
+    if not members:
+        st.info("This project has no members yet.")
+    else:
+        for member_id in sorted(members):
+            # Don't show the owner in the removable list
+            if member_id == owner_id:
+                continue
+            
+            col1, col2 = st.columns([4, 1])
+            with col1:
+                st.markdown(f"- `{member_id}`")
+            with col2:
+                if is_owner:
+                    if st.button("Remove", key=f"remove_member_{member_id}", type="secondary"):
+                        try:
+                            remove_member_from_project_in_firestore(project_id, member_id)
+                            st.success(f"Removed member '{member_id}'.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Failed to remove member: {e}")
+
+    st.divider()
+
+    # --- Add New Member Form (only for owner) ---
+    if is_owner:
+        st.subheader("Invite New Member")
+        with st.form("new_member_form", clear_on_submit=True):
+            new_member_email = st.text_input(
+                "New Member's Email",
+                placeholder="Enter the email address of the user to invite."
+            )
+            submitted = st.form_submit_button("Add Member")
+
+            if submitted and new_member_email:
+                if new_member_email in members:
+                    st.warning(f"'{new_member_email}' is already a member of this project.")
+                else:
+                    try:
+                        add_member_to_project_in_firestore(project_id, new_member_email)
+                        st.success(f"Successfully invited '{new_member_email}' to the project!")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Failed to add member: {e}")
+    else:
+        st.info("Only the project owner can add or remove members.")
 
 def create_project_in_firestore(name: str, description: str, user_id: str):
     """Creates a new project document in Firestore."""
@@ -1736,6 +1802,40 @@ def remove_asset_from_project_in_firestore(project_id: str, asset_uri: str):
         logger.info(f"Removed asset '{asset_uri}' from project '{project_id}'.")
     except Exception as e:
         logger.error(f"Failed to remove asset from project: {e}")
+        raise e
+
+def add_member_to_project_in_firestore(project_id: str, new_member_id: str):
+    """Adds a new member to a project's 'members' array in Firestore."""
+    if not FIRESTORE_AVAILABLE:
+        raise Exception("Firestore is not available.")
+    try:
+        project_ref = db.collection('projects').document(project_id)
+        project_ref.update({
+            'members': firestore.ArrayUnion([new_member_id])
+        })
+        logger.info(f"Added member '{new_member_id}' to project '{project_id}'.")
+    except Exception as e:
+        logger.error(f"Failed to add member to project: {e}")
+        raise e
+
+def remove_member_from_project_in_firestore(project_id: str, member_id: str):
+    """Removes a member from a project's 'members' array in Firestore."""
+    if not FIRESTORE_AVAILABLE:
+        raise Exception("Firestore is not available.")
+    try:
+        project_ref = db.collection('projects').document(project_id)
+        project_data = project_ref.get().to_dict()
+        
+        # Prevent the owner from being removed
+        if member_id == project_data.get('owner_id'):
+            raise Exception("The project owner cannot be removed.")
+
+        project_ref.update({
+            'members': firestore.ArrayRemove([member_id])
+        })
+        logger.info(f"Removed member '{member_id}' from project '{project_id}'.")
+    except Exception as e:
+        logger.error(f"Failed to remove member from project: {e}")
         raise e
 
 def image_tab():
