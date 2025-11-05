@@ -1060,8 +1060,8 @@ def main():
         client_id=config.GOOGLE_CLIENT_ID,
         client_secret=config.GOOGLE_CLIENT_SECRET,
         authorize_endpoint="https://accounts.google.com/o/oauth2/v2/auth",
-        token_endpoint="https://oauth2.googleapis.com/token",
-        refresh_token_endpoint=None, # Google uses the same endpoint for refresh
+        token_endpoint="https://oauth2.googleapis.com/token", # Google uses the same endpoint for refresh
+        refresh_token_endpoint="https://oauth2.googleapis.com/token",
         revoke_token_endpoint="https://oauth2.googleapis.com/revoke",
     )
     # --- Password Hashing and Verification Helpers ---
@@ -1082,6 +1082,13 @@ def main():
     # If we have a token, but no user_id, the user is returning to the session
     # We need to fetch their info
     if 'token' in st.session_state and st.session_state.token and 'user_id' not in st.session_state:
+        # Check if the token has expired, and if so, refresh it
+        is_expired = (st.session_state.token.get('expires_at', 0) < time.time())
+        if is_expired and 'refresh_token' in st.session_state.token:
+            with st.spinner("Your session has expired. Attempting to refresh..."):
+                new_token = oauth2.refresh_token(st.session_state.token)
+                st.session_state.token = new_token
+
         user_info = get_google_user_info(st.session_state['token'])
         if user_info:
             st.session_state['user_id'] = user_info.get("email")
@@ -1100,7 +1107,7 @@ def main():
             name="Sign in with Google",
             icon="https://www.google.com.tw/favicon.ico",
             redirect_uri=config.REDIRECT_URI,
-            scope="openid email profile",
+            scope="openid email profile https://www.googleapis.com/auth/drive.readonly",
             key="google_login",
             use_container_width=True,
         )
