@@ -4,6 +4,7 @@ import os
 import shutil
 import time
 import re
+import mimetypes
 import uuid
 import datetime
 from typing import Dict, List, Optional, Union, Any
@@ -14,7 +15,6 @@ import streamlit as st
 from google.auth import default as google_auth_default
 from google.auth.transport.requests import Request
 from google.cloud import storage
-from moviepy.editor import VideoFileClip, concatenate_videoclips, vfx
 
 TEMP_DOWNLOAD_SUBDIR = "temp_gcs_downloads"
 
@@ -83,6 +83,91 @@ class Veo2API:
         
         # Return the access token.
         return credentials.token
+
+    def extend_video_veo3(
+        self,
+        video_path: str,
+        prompt: str,
+        storage_uri: str,
+        model: str = "veo-3.1-generate-preview",
+        resolution: str = "720p",
+        duration_seconds: int = 7,
+    ) -> Dict:
+        """
+        Extends a video using the Veo 3.1 API via a REST call.
+
+        Args:
+            video_path: Local path to the video file to extend.
+            prompt: Text prompt describing how to extend the video.
+            storage_uri: GCS URI to store the output video.
+            model: The Veo model to use for the extension.
+            resolution: The resolution of the output video ('720p' or '1080p').
+            duration_seconds: The desired duration of the extended portion.
+
+        Returns:
+            A dictionary containing the long-running operation details.
+        """
+        print(f"Extending video '{os.path.basename(video_path)}' with prompt: '{prompt[:50]}...'")
+
+        # 1. Upload the source video to GCS to get a URI
+        if not storage_uri or not storage_uri.startswith("gs://"):
+            raise ValueError("A valid GCS storage_uri (e.g., 'gs://your-bucket/') is required for video extension.")
+
+        bucket_name, folder_path = storage_uri.replace("gs://", "").split("/", 1)
+        gcs_client = storage.Client()
+        bucket = gcs_client.bucket(bucket_name)
+
+        video_blob_name = f"{folder_path.rstrip('/')}/video_extension_inputs/{uuid.uuid4().hex}-{os.path.basename(video_path)}"
+        video_blob = bucket.blob(video_blob_name)
+
+        print(f"Uploading source video to GCS at gs://{bucket_name}/{video_blob_name}...")
+        # Guess the content type of the video file
+        content_type, _ = mimetypes.guess_type(video_path)
+        if content_type is None:
+            content_type = 'video/mp4' # Default to mp4 if guess fails
+        video_blob.upload_from_filename(video_path, content_type=content_type)
+        video_gcs_uri = f"gs://{bucket_name}/{video_blob_name}"
+
+        # 2. Construct the REST API request body
+        instance = {
+            "prompt": prompt,
+            "video": {
+                "gcsUri": video_gcs_uri,
+                "mimeType": content_type # Add the determined MIME type here
+            }
+        }
+
+        parameters = {
+            "resolution": resolution,
+            "durationSeconds": duration_seconds,
+            "sampleCount": 1, # Assuming 1 for now
+            "storageUri": f"{storage_uri.rstrip('/')}/video_extensions_output/"
+        }
+
+        request_body = {
+            "instances": [instance],
+            "parameters": parameters
+        }
+
+        # 3. Make the API request
+        self.model_id = model # Set model for polling
+        url = f"{self.base_url}/projects/{self.project_id}/locations/{self.location}/publishers/google/models/{self.model_id}:predictLongRunning"
+        headers = {
+            "Authorization": f"Bearer {self._get_access_token()}",
+            "Content-Type": "application/json; charset=utf-8"
+        }
+
+        print("Initiating video extension operation via REST API...")
+        response = requests.post(url, headers=headers, json=request_body)
+
+        # Clean up the uploaded input video from GCS after starting the operation
+        try:
+            video_blob.delete()
+            print(f"Cleaned up temporary input video: {video_gcs_uri}")
+        except Exception as cleanup_error:
+            print(f"Warning: Failed to clean up temporary input video {video_gcs_uri}: {cleanup_error}")
+
+        return response.json()
     
     def generate_video(
         self,
@@ -919,18 +1004,16 @@ class Veo2API:
         request_body = {
             "instances": [{
                 "prompt": prompt_text,
-               "image": {
+                "image": {
                     "gcsUri": start_image_gcs_uri,
                     "mimeType": start_mime_type
                 },
-            }],
-            "parameters": {
-                "config": {
-                    "lastFrame": {
+                "lastFrame": {
                     "gcsUri": end_image_gcs_uri,
                     "mimeType": end_mime_type
-                    },
                 },
+            }],
+            "parameters": {
                 "aspectRatio": aspect_ratio,
                 "resolution": resolution,
                 "generateAudio": generate_audio,
@@ -1449,7 +1532,7 @@ def generate_video_simple(
     # Wait for operation to complete and return the result
     return client.wait_for_operation(operation_id)
 
-def generate_audio(self, prompt: str, negative_prompt: str = None, sample_count: int = 1, seed: Optional[int] = None, storage_uri: Optional[str] = None):
+def generate_audio(self, prompt: str, sample_count: int, negative_prompt: str = None, seed: Optional[int] = None, storage_uri: Optional[str] = None):
     """
     Calls a generative audio API, processes the response, and displays the audio on the Streamlit UI.
 
@@ -1487,101 +1570,37 @@ def generate_audio(self, prompt: str, negative_prompt: str = None, sample_count:
     instance = {"prompt": prompt}
     if negative_prompt:
         instance["negative_prompt"] = negative_prompt
+    # Only add the seed to the instance if it's provided
     if seed:
-        instance = {"seed": seed}
+        instance["seed"] = seed
 
-    parameters = {"sample_count": sample_count}
-
-
-    print(parameters)
+    parameters = {
+        "sample_count": sample_count
+    }
 
     payload = {
         "instances": [instance],
         "parameters": parameters
     }
 
+    print("--- AUDIO API REQUEST BODY ---")
+    print(json.dumps(payload, indent=2))
+
     # --- 4. Make the API Call ---
     try:
         response = requests.post(api_endpoint, headers=headers, data=json.dumps(payload))
-        response.raise_for_status()  # Raise an exception for bad status codes (4xx or 5xx)
+        response.raise_for_status()
         response_data = response.json()
     except requests.exceptions.RequestException as e:
         st.error(f"API Error: Failed to get a valid response. Status Code: {e.response.status_code if e.response else 'N/A'}")
         # Display the detailed error from the API if available
         st.json(e.response.json() if e.response else "No response from server.")
         return
+    
+    print("--- AUDIO API RESPONSE ---")
+    print(json.dumps(response_data, indent=2))
 
-    # --- 5. Process Response and Display Audio on UI ---
-    predictions = response_data.get("predictions", [])
-    if not predictions:
-        st.warning("Audio generation succeeded, but the API response contained no audio data.")
-        st.json(response_data)  # Show the full response for debugging
-        return []
-
-    audio_uris = []
-    st.success(f"Successfully generated {len(predictions)} audio sample(s)!")
-
-    # Loop through each prediction and display an audio player
-    for i, prediction in enumerate(predictions):
-        audio_content_b64 = prediction.get("bytesBase64Encoded")
-
-        if audio_content_b64:
-            try:
-                # Decode the Base64 string into raw audio bytes
-                audio_bytes = base64.b64decode(audio_content_b64)
-
-                st.markdown("---")
-                st.markdown(f"### Audio Sample {i + 1}")
-                
-                if storage_uri:
-                    try:
-                        from google.cloud import storage
-                        
-                        if not storage_uri.startswith("gs://") or not storage_uri.endswith("/"):
-                            st.error("Invalid storage URI. It should start with 'gs://' and end with a '/' (e.g., 'gs://your-bucket/generated_audio/')")
-                            return []
-
-                        bucket_name, folder_path = storage_uri[5:].split("/", 1)
-                        client = storage.Client()
-                        bucket = client.bucket(bucket_name)
-                        
-                        # Generate a unique filename for the audio
-                        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                        audio_filename = f"audio_{timestamp}_{i+1}.wav"
-                        gcs_filepath = f"{folder_path}{audio_filename}"
-                        
-                        # Upload the audio data to GCS
-                        blob = bucket.blob(gcs_filepath)
-                        blob.upload_from_string(audio_bytes, content_type="audio/wav")
-                        
-                        st.success(f"Audio sample {i+1} successfully uploaded to GCS: gs://{bucket_name}/{gcs_filepath}")
-                        audio_uris.append(f"gs://{bucket_name}/{gcs_filepath}")
-                    except ImportError:
-                        st.error("Google Cloud Storage SDK not found. Install it using: pip install google-cloud-storage")
-                        return []
-                    except Exception as e:
-                        st.error(f"Error uploading audio sample {i+1} to GCS: {e}")
-                
-                # Play audio directly in Streamlit
-                st.audio(audio_bytes, format="audio/wav")
-                # Display the raw prediction object (optional, for debugging)
-                # st.json(prediction)
-
-            except Exception as e:
-                st.error(f"Failed to decode or display audio sample {i + 1}. Please check the response format. Error: {e}")
-        else:
-            st.warning(f"Prediction {i+1} did not contain the audio bytes. This is often due to safety filters.")
-            # Check for safety ratings, which is a common reason for missing content.
-            safety_ratings = prediction.get("safetyRatings")
-            if safety_ratings:
-                st.error(f"Audio generation for sample {i+1} was likely blocked due to safety policies.")
-                with st.expander("View Safety Ratings"):
-                    st.json(safety_ratings)
-            else:
-                # If no specific reason is found, show the whole prediction object for general debugging.
-                st.info(f"Here is the full content of prediction {i+1} for debugging:")
-                st.json(prediction)
-    return audio_uris
+    return response_data
 
     # Optionally display the model information from the response
     # with st.expander("View Model Information"):
