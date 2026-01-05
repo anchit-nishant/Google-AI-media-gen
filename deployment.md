@@ -16,6 +16,8 @@ Navigate to the APIs & Services > Library page in the Google Cloud Console and e
 
   - Cloud Run Admin API
 
+  - Cloud Speech-to-Text API
+
   - Cloud Build API
 
   - Artifact Registry API
