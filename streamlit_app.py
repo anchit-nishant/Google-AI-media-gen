@@ -1950,6 +1950,38 @@ def transcribe_audio_chirp(project_id: str, audio_bytes: bytes) -> str:
         logger.error(f"Chirp transcription failed: {e}")
         return f"Error during transcription: {e}"
 
+def upload_audio_bytes_to_gcs(audio_bytes: bytes, bucket_name: str, object_name: str) -> Optional[str]:
+    """Uploads raw audio bytes to a GCS bucket."""
+    if not bucket_name:
+        st.error("GCS Bucket Name is not configured correctly.")
+        return None
+    try:
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(bucket_name)
+
+        # Create a unique object name for the audio file
+        unique_object_name = f"transcriptions/{uuid.uuid4()}-{secure_filename(object_name)}"
+        blob = bucket.blob(unique_object_name)
+
+        # Upload the bytes directly
+        blob.upload_from_string(audio_bytes, content_type="audio/wav")
+
+        gcs_uri = f"gs://{bucket_name}/{unique_object_name}"
+        logger.info(f"Successfully uploaded transcription audio to {gcs_uri}")
+        return gcs_uri
+    except Exception as e:
+        logger.error(f"Failed to upload audio bytes to GCS: {e}")
+        st.error(f"Error uploading audio to Cloud Storage: {e}")
+        return None
+
+def display_history_transcription_card(row, project_id=None):
+    """Displays a card for a transcription history item."""
+    # For now, we can reuse the audio card display logic as it's very similar.
+    # If more specific details for transcriptions are needed later, this function can be expanded.
+    st.markdown("##### Transcription")
+    display_history_audio_card(row, project_id)
+
+
 def live_audio_transcription_tab():
     """UI for live audio transcription using Chirp."""
     st.header("🎤 Live Audio Transcription with Chirp")
@@ -1972,6 +2004,34 @@ def live_audio_transcription_tab():
             project_id = st.session_state.get("project_id", config.PROJECT_ID)
             transcribed_text = transcribe_audio_chirp(project_id, audio_data['bytes'])
             st.session_state.live_transcription_text = transcribed_text
+
+            # If transcription is successful, save to history
+            if not transcribed_text.startswith("Error"):
+                storage_uri = st.session_state.get("storage_uri", config.STORAGE_URI)
+                if storage_uri and storage_uri.startswith("gs://"):
+                    bucket_name = storage_uri.replace("gs://", "").split("/")[0]
+                    audio_uri = upload_audio_bytes_to_gcs(
+                        audio_bytes=audio_data['bytes'],
+                        bucket_name=bucket_name,
+                        object_name="live_transcription.wav"
+                    )
+
+                    if audio_uri and FIRESTORE_AVAILABLE:
+                        params = {'model': 'chirp'}
+                        db.collection('history').add({
+                            'user_id': st.session_state.user_id,
+                            'timestamp': firestore.SERVER_TIMESTAMP,
+                            'type': 'transcription',
+                            'uri': audio_uri,
+                            'prompt': transcribed_text, # Store the transcription text as the 'prompt'
+                            'params': params,
+                            'favorite': False
+                        })
+                        logger.info(f"Saved transcription to history with audio URI: {audio_uri}")
+                        st.toast("Transcription saved to history!")
+                else:
+                    st.warning("Storage URI not configured. Transcription will not be saved to history.")
+
 
     # Display the transcription in a text area
     st.text_area(
@@ -4287,6 +4347,7 @@ def history_tab():
             ("🎬 Recent Videos", display_recent_videos),
             ("🎵 Recent Audios", display_recent_audios),
             ("🎤 Recent Voices", display_recent_voices),
+            ("📝 Recent Transcriptions", display_recent_transcriptions),
             ("🖼️ All Images", display_all_images),
             ("📋 All History", display_all_history)
         ])
@@ -4321,6 +4382,69 @@ def history_tab():
     
     logger.end_section()
         
+def display_recent_transcriptions(history_data):
+    """Displays the 'Recent Transcriptions' sub-tab content."""
+    st.markdown("### Recent Audio Transcriptions")
+    active_history = history_data
+    if 'deleted' in history_data.columns:
+        active_history = history_data[history_data['deleted'] != True]
+    transcription_history = active_history[active_history['type'] == 'transcription'].copy()
+
+    if transcription_history.empty:
+        st.info("No transcription history found.")
+    else:
+        show_favorites_only = st.toggle(
+            "Show only favorites ⭐️",
+            key="transcription_favorites_toggle"
+        )
+        if show_favorites_only:
+            transcription_history = transcription_history[transcription_history['favorite'] == True]
+
+        transcription_history = transcription_history.sort_values('timestamp', ascending=False).reset_index(drop=True)
+        total_transcriptions = len(transcription_history)
+        items_per_page = 9
+        max_pages = (total_transcriptions + items_per_page - 1) // items_per_page
+        if "transcription_page" not in st.session_state:
+            st.session_state.transcription_page = 0
+
+        st.markdown(f"Found {total_transcriptions} transcriptions.")
+
+        # Pagination Controls
+        if max_pages > 1:
+            col1, col2, col3 = st.columns([1, 2, 1])
+            with col1:
+                if st.button("◀ Previous", disabled=(st.session_state.transcription_page <= 0), key="prev_transcription"):
+                    st.session_state.transcription_page -= 1
+                    st.rerun()
+            with col2:
+                page_options = list(range(1, max_pages + 1))
+                selected_page = st.selectbox(
+                    "Go to page", options=page_options, index=st.session_state.transcription_page,
+                    label_visibility="collapsed", key="transcription_page_selector"
+                )
+                st.session_state.transcription_page = selected_page - 1
+            with col3:
+                if st.button("Next ▶", disabled=(st.session_state.transcription_page >= max_pages - 1), key="next_transcription"):
+                    st.session_state.transcription_page += 1
+                    st.rerun()
+
+        start_idx = st.session_state.transcription_page * items_per_page
+        end_idx = min(start_idx + items_per_page, total_transcriptions)
+        page_transcriptions = transcription_history.iloc[start_idx:end_idx]
+
+        # Display Cards
+        st.markdown('<div class="history-grid">', unsafe_allow_html=True)
+        rows = [page_transcriptions.iloc[i:i+3] for i in range(0, len(page_transcriptions), 3)]
+        for row_items in rows:
+            cols = st.columns(3)
+            for i, (_, row) in enumerate(row_items.iterrows()):
+                if i < len(cols):
+                    with cols[i]:
+                        # Reusing the audio card is suitable here as it shows the audio player and prompt (transcription)
+                        display_history_transcription_card(row)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+
 def display_dashboard(history_data):
     """Displays an analytics dashboard based on the user's generation history."""
     st.markdown("### 📊 Generation Dashboard")
@@ -4343,6 +4467,7 @@ def display_dashboard(history_data):
     total_images = len(df[df['type'] == 'image'])
     total_audios = len(df[df['type'] == 'audio'])
     total_voices = len(df[df['type'] == 'voice'])
+    total_transcriptions = len(df[df['type'] == 'transcription'])
 
     # Calculate total video duration
     def get_duration(row):
@@ -4362,12 +4487,13 @@ def display_dashboard(history_data):
     total_video_seconds = df['duration'].sum()
 
     # Display metrics in columns
-    col1, col2, col3, col4, col5 = st.columns(5)
+    col1, col2, col3, col4, col5, col6 = st.columns(6)
     col1.metric("🎬 Videos Generated", total_videos)
     col2.metric("⏱️ Total Video Seconds", f"{total_video_seconds:.0f}s")
     col3.metric("🎨 Images Generated", total_images)
     col4.metric("🎵 Audios Generated", total_audios)
     col5.metric("🎤 Voices Generated", total_voices)
+    col6.metric("📝 Transcriptions", total_transcriptions)
 
     st.divider()
 
