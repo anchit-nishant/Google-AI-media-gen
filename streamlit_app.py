@@ -30,6 +30,9 @@ import shutil
 from streamlit_oauth import OAuth2Component
 from werkzeug.utils import secure_filename
 from streamlit_mic_recorder import mic_recorder
+from google.api_core.client_options import ClientOptions
+from google.cloud.speech_v2 import SpeechClient
+from google.cloud.speech_v2.types import cloud_speech as cloud_speech_types
 
 
 # Import project modules
@@ -1876,6 +1879,7 @@ def audio_tab():
     sub_tabs = OrderedDict([
         ("Text-to-Audio", text_to_audio_tab),
         ("Text-to-Voiceover", text_to_voiceover_tab),
+        ("Live Transcription", live_audio_transcription_tab),
     ])
 
     # Use a radio button for controlled sub-navigation
@@ -1894,6 +1898,97 @@ def audio_tab():
     else:
         # Fallback to the first tab
         text_to_audio_tab()
+
+def transcribe_audio_chirp(project_id: str, audio_bytes: bytes) -> str:
+    """
+    Transcribes audio using Google's Chirp model via the Speech-to-Text v2 API.
+
+    Args:
+        project_id: The Google Cloud project ID.
+        audio_bytes: The audio data in bytes.
+
+    Returns:
+        The transcribed text as a string, or an error message.
+    """
+    try:
+        # Instantiates a client and specifies the regional endpoint.
+        # This is necessary because the 'chirp' model is in 'us-central1'.
+        client_options = ClientOptions(
+            api_endpoint="us-central1-speech.googleapis.com",
+        )
+        client = SpeechClient(client_options=client_options)
+
+        # In practice, stream should be a generator yielding chunks of audio data.
+        # Here, we chunk the received audio to simulate a stream.
+        chunk_size = 8192  # A common chunk size
+        stream = [
+            audio_bytes[i : i + chunk_size]
+            for i in range(0, len(audio_bytes), chunk_size)
+        ]
+        audio_requests = (
+            cloud_speech_types.StreamingRecognizeRequest(audio=audio) for audio in stream
+        )
+
+        recognition_config = cloud_speech_types.RecognitionConfig(
+            auto_decoding_config=cloud_speech_types.AutoDetectDecodingConfig(),
+            language_codes=["en-US"],
+            model="chirp", # Use "chirp" for the latest Chirp model
+        )
+        streaming_config = cloud_speech_types.StreamingRecognitionConfig(config=recognition_config)
+        
+        # The first request must contain the streaming configuration.
+        # The recognizer uses the format "projects/{project}/locations/{location}/recognizers/_"
+        config_request = cloud_speech_types.StreamingRecognizeRequest(
+            recognizer=f"projects/{project_id}/locations/us-central1/recognizers/_",
+            streaming_config=streaming_config,
+        )
+
+        responses = client.streaming_recognize(requests=iter([config_request] + list(audio_requests)))
+        return " ".join(result.alternatives[0].transcript for r in responses for result in r.results if result.alternatives)
+
+    except Exception as e:
+        logger.error(f"Chirp transcription failed: {e}")
+        return f"Error during transcription: {e}"
+
+def live_audio_transcription_tab():
+    """UI for live audio transcription using Chirp."""
+    st.header("🎤 Live Audio Transcription with Chirp")
+    st.info("Click 'Start Recording', speak into your microphone, and then click 'Stop Recording' to get the transcription.")
+
+    # Use the mic_recorder component to capture audio
+    audio_data = mic_recorder(
+        start_prompt="Start Recording",
+        stop_prompt="Stop Recording",
+        key='live_transcription_mic'
+    )
+
+    # Initialize transcription state
+    if 'live_transcription_text' not in st.session_state:
+        st.session_state.live_transcription_text = ""
+
+    # If audio data is returned, process it
+    if audio_data and audio_data['bytes']:
+        with st.spinner("Transcribing audio with Chirp..."):
+            project_id = st.session_state.get("project_id", config.PROJECT_ID)
+            transcribed_text = transcribe_audio_chirp(project_id, audio_data['bytes'])
+            st.session_state.live_transcription_text = transcribed_text
+
+    # Display the transcription in a text area
+    st.text_area(
+        "Transcription Output",
+        value=st.session_state.live_transcription_text,
+        height=200,
+        key="transcription_output_box"
+    )
+
+    # Add buttons for copy and download if there is text
+    if st.session_state.live_transcription_text:
+        st.download_button(
+            label="📄 Download as .txt",
+            data=st.session_state.live_transcription_text,
+            file_name="transcription.txt",
+            mime="text/plain"
+        )
 
 def gemini_chat_tab():
     """A tab for multimodal chat with Gemini."""
