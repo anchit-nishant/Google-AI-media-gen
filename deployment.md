@@ -127,7 +127,9 @@ First, configure what users will see when they grant permission to your app.
     -   **Authorized redirect URIs**: This is a critical step. You must add the URLs where Google can send users after they log in.
         -   For local development, add: `http://localhost:8501`
         -   After deploying to Cloud Run, you must **return to this page** and add the service URL (e.g., `https://your-service-name-....run.app`).
-4.  Click **Create**. A pop-up will appear with your **Client ID** and **Client Secret**. Copy both of these values for the next step.
+4. Configure the Admin Users in the `.env` file(Optional).
+      - ADMIN_USERS="admin.user@example.com,another.admin@example.com"
+5.  Click **Create**. A pop-up will appear with your **Client ID** and **Client Secret**. Copy both of these values for the next step.
 
 ## Part 3: Code and Deployment
 

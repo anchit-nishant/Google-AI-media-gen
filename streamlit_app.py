@@ -1080,6 +1080,10 @@ def main():
     # This runs only once per session after the user is logged in.
     if 'user_id' in st.session_state and not st.session_state.get('pending_ops_checked', False):
         check_and_process_pending_operations(st.session_state.user_id)
+        # Also set admin status
+        if 'is_admin' not in st.session_state:
+            st.session_state.is_admin = st.session_state.user_id in config.ADMIN_USERS
+
         st.session_state.pending_ops_checked = True # Set flag to prevent re-checking
 
     # If we have a token, but no user_id, the user is returning to the session
@@ -1096,6 +1100,8 @@ def main():
         if user_info:
             st.session_state['user_id'] = user_info.get("email")
             st.session_state['user_name'] = user_info.get("name")
+            # Set admin status upon login
+            st.session_state.is_admin = st.session_state.user_id in config.ADMIN_USERS
         else:
             # If token is invalid, clear it
             st.session_state.token = None
@@ -1308,6 +1314,11 @@ def main():
         ("📁 Projects", projects_tab),
         ("📋 History", history_tab),
     ])
+
+    # Conditionally add the Admin tab if the user is an admin
+    if st.session_state.get('is_admin'):
+        TABS["👑 Admin"] = admin_tab
+
     # Use a radio button for main navigation that is directly tied to the session state.
     # This is the standard way to create a "controlled" widget in Streamlit.
     st.radio(
@@ -1327,6 +1338,59 @@ def main():
     # st.markdown('</div>', unsafe_allow_html=True)
     
     logger.end_section()
+
+def admin_tab():
+    """Admin panel for viewing all user generations and dashboards."""
+    st.header("👑 Admin Panel")
+
+    if not st.session_state.get('is_admin'):
+        st.error("You do not have permission to view this page.")
+        return
+
+    # Fetch all users from the history collection
+    @st.cache_data(ttl=600) # Cache for 10 minutes
+    def get_all_users_from_history():
+        if not FIRESTORE_AVAILABLE:
+            return []
+        try:
+            docs = db.collection('history').stream()
+            user_ids = {doc.to_dict().get('user_id') for doc in docs if doc.to_dict().get('user_id')}
+            return sorted(list(user_ids))
+        except Exception as e:
+            st.error(f"Failed to fetch user list: {e}")
+            return []
+
+    with st.spinner("Loading user list..."):
+        all_users = get_all_users_from_history()
+
+    if not all_users:
+        st.info("No user history found.")
+        return
+
+    # User selection dropdown
+    selected_user = st.selectbox("Select a user to view their activity:", ["-- Select a User --"] + all_users)
+
+    if selected_user and selected_user != "-- Select a User --":
+        st.divider()
+        st.subheader(f"Activity for: `{selected_user}`")
+
+        # Fetch and display the dashboard for the selected user
+        try:
+            with st.spinner(f"Loading history for {selected_user}..."):
+                user_history_data = get_history_from_firestore(user_id=selected_user, limit=1000)
+
+            if user_history_data.empty:
+                st.info(f"No history data found for {selected_user}.")
+            else:
+                # Display the dashboard
+                display_dashboard(user_history_data)
+
+                st.divider()
+                # Display the full history in a table format
+                st.subheader("Full Generation History")
+                display_all_history(user_history_data)
+        except Exception as e:
+            st.error(f"An error occurred while loading data for {selected_user}: {e}")
 
 def video_tab():
     """Main tab for all video-related operations."""
