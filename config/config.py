@@ -140,3 +140,10 @@ DEFAULT_ENABLE_STREAMING = ENABLE_STREAMING_DEFAULT
 
 # Backwards compatibility for renamed variables
 HISTORY_FILENAME = HISTORY_FILE 
+
+# ----------------------------------------------------------------------
+# Admin Configuration
+# ----------------------------------------------------------------------
+# Comma-separated list of admin user emails, loaded from .env file
+ADMIN_USERS_STR = get_optional_env("ADMIN_USERS", "")
+ADMIN_USERS = [email.strip() for email in ADMIN_USERS_STR.split(',') if email.strip()]

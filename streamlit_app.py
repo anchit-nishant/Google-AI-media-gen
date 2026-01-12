@@ -1080,6 +1080,10 @@ def main():
     # This runs only once per session after the user is logged in.
     if 'user_id' in st.session_state and not st.session_state.get('pending_ops_checked', False):
         check_and_process_pending_operations(st.session_state.user_id)
+        # Also set admin status
+        if 'is_admin' not in st.session_state:
+            st.session_state.is_admin = st.session_state.user_id in config.ADMIN_USERS
+
         st.session_state.pending_ops_checked = True # Set flag to prevent re-checking
 
     # If we have a token, but no user_id, the user is returning to the session
@@ -1096,6 +1100,8 @@ def main():
         if user_info:
             st.session_state['user_id'] = user_info.get("email")
             st.session_state['user_name'] = user_info.get("name")
+            # Set admin status upon login
+            st.session_state.is_admin = st.session_state.user_id in config.ADMIN_USERS
         else:
             # If token is invalid, clear it
             st.session_state.token = None
@@ -1308,6 +1314,11 @@ def main():
         ("📁 Projects", projects_tab),
         ("📋 History", history_tab),
     ])
+
+    # Conditionally add the Admin tab if the user is an admin
+    if st.session_state.get('is_admin'):
+        TABS["👑 Admin"] = admin_tab
+
     # Use a radio button for main navigation that is directly tied to the session state.
     # This is the standard way to create a "controlled" widget in Streamlit.
     st.radio(
@@ -1327,6 +1338,121 @@ def main():
     # st.markdown('</div>', unsafe_allow_html=True)
     
     logger.end_section()
+
+@st.cache_data(ttl=600) # Cache for 10 minutes
+def get_all_history_from_firestore(limit=5000):
+    """
+    Get the complete history of generated content from all users from Firestore.
+
+    Args:
+        limit (int): Maximum number of entries to return.
+
+    Returns:
+        pandas.DataFrame: DataFrame containing the history entries.
+    """
+    if not FIRESTORE_AVAILABLE:
+        logger.error("Firestore is not available. Cannot get all history.")
+        return pd.DataFrame()
+
+    try:
+        # Query without a user_id filter to get all documents
+        history_ref = db.collection('history').limit(limit)
+        docs = history_ref.stream()
+
+        history_list = []
+        for doc in docs:
+            item = doc.to_dict()
+            item['doc_id'] = doc.id
+            # Ensure 'deleted' and 'favorite' columns exist for consistency
+            if 'deleted' not in item:
+                item['deleted'] = False
+            if 'favorite' not in item:
+                item['favorite'] = False
+            history_list.append(item)
+
+        if not history_list:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(history_list)
+        if 'timestamp' in df.columns:
+            df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
+            df = df.sort_values('timestamp', ascending=False)
+        return df
+    except Exception as e:
+        logger.error(f"Error getting all history from Firestore: {str(e)}")
+        st.error(f"Error getting all history from Firestore: {str(e)}")
+        return pd.DataFrame()
+
+def admin_global_dashboard_tab():
+    """Displays the global dashboard for all user activity."""
+    st.subheader("Global Generation Dashboard")
+    with st.spinner("Loading all user history for dashboard..."):
+        all_history_data = get_all_history_from_firestore()
+    display_dashboard(all_history_data)
+
+def admin_tab():
+    """Admin panel for viewing all user generations and dashboards."""
+    st.header("👑 Admin Panel")
+
+    if not st.session_state.get('is_admin'):
+        st.error("You do not have permission to view this page.")
+        return
+
+    # Create sub-tabs for the admin panel
+    dashboard_tab, user_activity_tab = st.tabs(["Global Dashboard", "User Activity"])
+
+    with dashboard_tab:
+        admin_global_dashboard_tab()
+
+    with user_activity_tab:
+        admin_user_activity_tab()
+
+def admin_user_activity_tab():
+    """Displays the UI for viewing a specific user's activity."""
+    # Fetch all users from the history collection
+    @st.cache_data(ttl=600) # Cache for 10 minutes
+    def get_all_users_from_history():
+        if not FIRESTORE_AVAILABLE:
+            return []
+        try:
+            docs = db.collection('history').stream()
+            user_ids = {doc.to_dict().get('user_id') for doc in docs if doc.to_dict().get('user_id')}
+            return sorted(list(user_ids))
+        except Exception as e:
+            st.error(f"Failed to fetch user list: {e}")
+            return []
+
+    with st.spinner("Loading user list..."):
+        all_users = get_all_users_from_history()
+
+    if not all_users:
+        st.info("No user history found.")
+        return
+
+    # User selection dropdown
+    selected_user = st.selectbox("Select a user to view their activity:", ["-- Select a User --"] + all_users)
+
+    if selected_user and selected_user != "-- Select a User --":
+        st.divider()
+        st.subheader(f"Activity for: `{selected_user}`")
+
+        # Fetch and display the dashboard for the selected user
+        try:
+            with st.spinner(f"Loading history for {selected_user}..."):
+                user_history_data = get_history_from_firestore(user_id=selected_user, limit=1000)
+
+            if user_history_data.empty:
+                st.info(f"No history data found for {selected_user}.")
+            else:
+                # Display the dashboard
+                display_dashboard(user_history_data)
+
+                st.divider()
+                # Display the full history in a table format
+                st.subheader("Full Generation History")
+                display_all_history(user_history_data)
+        except Exception as e:
+            st.error(f"An error occurred while loading data for {selected_user}: {e}")
 
 def video_tab():
     """Main tab for all video-related operations."""
@@ -4525,6 +4651,15 @@ def display_dashboard(history_data):
         ).properties(title="Generation Breakdown")
         st.altair_chart(pie_chart, use_container_width=True)
 
+    # --- User-specific charts (only for global dashboard) ---
+    # Check if 'user_id' column has more than one unique user, which indicates a global view.
+    if 'user_id' in df.columns and df['user_id'].nunique() > 1:
+        st.divider()
+        st.subheader("User Activity")
+        user_counts = df['user_id'].value_counts().reset_index()
+        user_counts.columns = ['User', 'Total Generations']
+        st.markdown("#### Total Generations by User")
+        st.bar_chart(user_counts, x='User', y='Total Generations')
 
 def display_history_video_card(row, project_id=None):
     """Display a video history card with details and buttons."""
