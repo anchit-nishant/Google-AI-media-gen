@@ -52,6 +52,30 @@ The application runs using a service account's identity. You need to create one 
 
     - Storage Object Creator
 
+    - Cloud Speech Admin
+
+4. Additonally grant the Cloud Speech Admin role to the service account running the comoute enginer. Follow the steps below.
+
+    - Navigate to the IAM page in the Google Cloud Console.
+
+    - Find the service account that your Cloud Run service uses. It's typically named something like [PROJECT_NUMBER]       -compute@developer.gserviceaccount.com (the default Compute Engine service account) unless you've specified a different one.
+
+    - Click the pencil icon (Edit principal) for that service account.
+    - Click + ADD ANOTHER ROLE.
+    - In the "Select a role" dropdown, type Speech Recognizer and select it from the list.
+    - Click SAVE.
+
+    You can also use the usei gcloud CLI:
+
+    - You can use the following command. Make sure to replace [PROJECT_ID] and [SERVICE_ACCOUNT_EMAIL] with your actual project ID and service account email.
+
+    ```
+    gcloud projects add-iam-policy-binding [PROJECT_ID] \
+        --member="serviceAccount:[SERVICE_ACCOUNT_EMAIL]" \
+        --role="roles/speech.recognizer"
+
+    ```
+
 Take note of the service account's email address.
 
 ## Part 2: Infrastructure Configuration
