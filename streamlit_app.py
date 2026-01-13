@@ -810,6 +810,16 @@ def init_state():
         logger.debug("Initializing 'pending_ops_checked' flag in session state")
         st.session_state.pending_ops_checked = False
 
+    # State for live transcription UI refresh
+    if 'transcription_rerun_counter' not in st.session_state:
+        logger.debug("Initializing 'transcription_rerun_counter' in session state")
+        st.session_state.transcription_rerun_counter = 0
+
+    # State to prevent transcription loop
+    if 'audio_processed' not in st.session_state:
+        logger.debug("Initializing 'audio_processed' flag in session state")
+        st.session_state.audio_processed = False
+
     logger.end_section()
 
 def _setup_page():
@@ -2117,18 +2127,26 @@ def live_audio_transcription_tab():
     audio_data = mic_recorder(
         start_prompt="Start Recording",
         stop_prompt="Stop Recording",
-        key='live_transcription_mic'
+        key='live_transcription_mic',
+        callback=None # Ensure no callback is set that might interfere
     )
 
     # Initialize transcription state
     if 'live_transcription_text' not in st.session_state:
         st.session_state.live_transcription_text = ""
 
-    # If audio data is returned, process it
-    if audio_data and audio_data['bytes']:
+    # If new audio data is returned, mark it for processing.
+    # The mic_recorder value is sticky, so we need a flag to process it only once.
+    if audio_data and not st.session_state.audio_processed:
+        st.session_state.audio_to_process = audio_data
+        st.session_state.audio_processed = True # Mark as processed to prevent re-entry
+        st.rerun() # Rerun to enter the processing block below
+
+    # Process the audio if it has been marked for processing.
+    if st.session_state.get('audio_to_process'):
         with st.spinner("Transcribing audio with Chirp..."):
             project_id = st.session_state.get("project_id", config.PROJECT_ID)
-            transcribed_text = transcribe_audio_chirp(project_id, audio_data['bytes'])
+            transcribed_text = transcribe_audio_chirp(project_id, st.session_state.audio_to_process['bytes'])
             st.session_state.live_transcription_text = transcribed_text
 
             # If transcription is successful, save to history
@@ -2137,7 +2155,7 @@ def live_audio_transcription_tab():
                 if storage_uri and storage_uri.startswith("gs://"):
                     bucket_name = storage_uri.replace("gs://", "").split("/")[0]
                     audio_uri = upload_audio_bytes_to_gcs(
-                        audio_bytes=audio_data['bytes'],
+                        audio_bytes=st.session_state.audio_to_process['bytes'],
                         bucket_name=bucket_name,
                         object_name="live_transcription.wav"
                     )
@@ -2158,13 +2176,17 @@ def live_audio_transcription_tab():
                 else:
                     st.warning("Storage URI not configured. Transcription will not be saved to history.")
 
+        # Clear the audio data and reset the flag after processing
+        st.session_state.audio_to_process = None
+        st.session_state.audio_processed = False
+        st.session_state.transcription_rerun_counter += 1 # Increment counter to force UI refresh on this run
 
     # Display the transcription in a text area
     st.text_area(
         "Transcription Output",
         value=st.session_state.live_transcription_text,
         height=200,
-        key="transcription_output_box"
+        key=f"transcription_output_box_{st.session_state.transcription_rerun_counter}"
     )
 
     # Add buttons for copy and download if there is text
