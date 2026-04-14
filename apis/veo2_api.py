@@ -89,7 +89,7 @@ class Veo2API:
         video_path: str,
         prompt: str,
         storage_uri: str,
-        model: str = "veo-3.1-generate-preview",
+        model: str = "veo-3.1-generate-001",
         resolution: str = "720p",
         duration_seconds: int = 7,
     ) -> Dict:
@@ -175,7 +175,7 @@ class Veo2API:
         input_image: Optional[Dict] = None,
         aspect_ratio: str = "16:9",
         negative_prompt: Optional[str] = None,
-        model: str = "veo-2.0-generate-001", #Add model parameter with default as veo2
+        model: str = "veo-3.1-generate-001", #Add model parameter with default as veo2
         person_generation: Optional[str] = None,
         sample_count: int = 1,
         seed: Optional[int] = None,
@@ -396,7 +396,7 @@ class Veo2API:
         resolution: Optional[str] = "720p",
         generateAudio: str = "true",
         negative_prompt: Optional[str] = None,
-        model: str = "veo-3.0-generate-preview", #Add model parameter with default as veo2
+        model: str = "veo-3.1-generate-001", #Add model parameter with default as veo2
         person_generation: Optional[str] = None,
         sample_count: int = 1,
         seed: Optional[int] = None,
@@ -769,12 +769,12 @@ class Veo2API:
         
         target_output_video_gcs_uri = f"gs://{bucket_name}/{output_local_video_path}"
 
-        api_url = f"https://us-central1-aiplatform.googleapis.com/v1/projects/{self.project_id}/locations/us-central1/publishers/google/models/veo-2.0-generate-exp:predictLongRunning" 
+        api_url = f"https://us-central1-aiplatform.googleapis.com/v1/projects/{self.project_id}/locations/us-central1/publishers/google/models/veo-3.1-generate-001:predictLongRunning" 
 
         headers['Content-Type'] = 'application/json'
         headers['charset'] = 'utf-8'
 
-        new_url = f"https://us-central1-aiplatform.googleapis.com/v1/projects/{self.project_id}/locations/us-central1/publishers/google/models/veo-2.0-generate-exp:fetchPredictOperation"
+        new_url = f"https://us-central1-aiplatform.googleapis.com/v1/projects/{self.project_id}/locations/us-central1/publishers/google/models/veo-3.1-generate-001:fetchPredictOperation"
         api_call_attempted = True
 
         # Determine MIME type for start_image
