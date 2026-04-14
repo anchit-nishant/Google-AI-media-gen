@@ -1510,7 +1510,7 @@ def video_extension_tab():
     with col1:
         model = st.selectbox(
             "Model",
-            options=["veo-3.1-generate-preview", "veo-3.1-generate-fast-preview"],
+            options=["veo-3.1-generate-001", "veo-3.1-generate-fast-001"],
             key="video_extension_model"
         )
     with col2:
@@ -2580,9 +2580,9 @@ def text_to_video_tab():
 
     model = st.selectbox(
         "Model",
-        options=["veo-3.1-generate-preview", "veo-3.1-generate-fast-preview", "veo-3.0-generate-preview", "veo-3.0-fast-generate-preview", "veo-3.0-fast-generate-001", "veo-3.0-generate-001", "veo-2.0-generate-001"],  # Assuming these are the model IDs
+        options=["veo-3.1-generate-001", "veo-3.1-generate-fast-001"],  # Assuming these are the model IDs
         index=0,  # Default to Veo 3
-        help="Choose the video generation model (Veo 2 or Veo 3)",
+        help="Choose the video generation model Veo 3",
         key="text_model"
     )
 
@@ -3252,7 +3252,7 @@ def video_editing_tab():
         with col1:
             interpolation_model = st.selectbox(
                 "Model Version", 
-                options=["veo-3.1-fast-generate-preview", "veo-3.1-generate-preview"],
+                options=["veo-3.1-fast-generate-001", "veo-3.1-generate-001"],
                 key="interpolate_model_version",
                 help="Select the model for frame interpolation."
             )
@@ -3650,7 +3650,7 @@ def image_to_video_tab():
         # Model selection
         model = st.selectbox(
             "Model",
-            options=["veo-3.1-generate-preview", "veo-3.1-generate-fast-preview", "veo-3.0-generate-preview", "veo-3.0-fast-generate-001", "veo-2.0-generate-001"],  # Assuming these are the model IDs
+            options=["veo-3.1-generate-001", "veo-3.1-generate-fast-001"],  # Assuming these are the model IDs
             index=0,  # Default to Veo 2
             help="Choose the video generation model (Veo 2 or Veo 3)",
             key="image_model"
