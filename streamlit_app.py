@@ -38,6 +38,7 @@ from google.cloud.speech_v2.types import cloud_speech as cloud_speech_types
 # Import project modules
 import config.config as config
 import apis.gemini_helper as gemini_helper
+import apis.third_party_helper as third_party_helper
 import app as dubbing_lib
 import apis.history_manager as history_manager
 from apis.veo2_api import Veo2API
@@ -799,6 +800,10 @@ def init_state():
     if "gemini_messages" not in st.session_state:
         logger.debug("Initializing 'gemini_messages' for chat history")
         st.session_state.gemini_messages = []
+    
+    # State for the new 3P Chat tab
+    if "third_party_messages" not in st.session_state:
+        st.session_state.third_party_messages = []
 
     # State for resetting the Gemini chat file uploader
     if "gemini_uploader_key_counter" not in st.session_state:
@@ -1321,6 +1326,7 @@ def main():
         ("🎨 Image", image_tab),
         ("🎵 Audio", audio_tab),
         ("♊ Gemini", gemini_chat_tab),
+        ("💬 3P Chat", third_party_chat_tab), # New tab for 3rd party models
         ("📁 Projects", projects_tab),
         ("📋 History", history_tab),
     ])
@@ -2387,6 +2393,124 @@ def gemini_chat_tab():
                 logger.info("Saved Gemini chat exchange to Firestore history.")
             except Exception as e:
                 logger.error(f"Failed to save chat history to Firestore: {e}")
+
+def third_party_chat_tab():
+    """A tab for chatting with third-party models on Vertex AI."""
+    st.header("Chat with 3P Models (Vertex AI)")
+
+    # Model selection
+    model_name = st.selectbox(
+        "Select 3P Model",
+        options=["claude-sonnet-4-6", "claude-opus-4-6", "claude-opus-4-5","claude-sonnet-4-5", "claude-haiku-4-5"], # Add other models as needed
+        key="third_party_chat_model",
+        help="Choose a third-party model available on Vertex AI."
+    )
+
+    # System instructions input
+    system_instructions = st.text_area(
+        "System Instructions (Optional)",
+        placeholder="e.g., You are a helpful assistant that speaks like a pirate.",
+        help="Provide instructions to guide the model's behavior and personality.",
+        key="third_party_system_instructions"
+    )
+
+    # Advanced settings for temperature and max tokens
+    with st.expander("Advanced Settings"):
+        temperature = st.slider(
+            "Temperature",
+            min_value=0.0,
+            max_value=2.0,
+            value=1.0,
+            step=0.1,
+            help="Controls the randomness of the output. Lower values are more deterministic, higher values are more creative."
+        )
+        max_tokens = st.slider(
+            "Max Output Tokens",
+            min_value=128,
+            max_value=4096, # Claude models can go higher, but keep reasonable for UI
+            value=1024,
+            step=128,
+            help="Maximum number of tokens the model should generate in its response."
+        )
+
+    # Initialize chat history for 3P models
+    if "third_party_messages" not in st.session_state:
+        st.session_state.third_party_messages = []
+
+    # Display chat messages from history
+    for message in st.session_state.third_party_messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"]["text"])
+
+    # --- Clear Chat Button ---
+    _, button_col = st.columns([4, 1])
+    with button_col:
+        if st.button("🗑️ Clear Chat", key="clear_third_party_chat_bottom", help="Clear chat history."):
+            st.session_state.third_party_messages = []
+            st.rerun()
+
+    # React to user input
+    if prompt_text := st.chat_input("What would you like to ask the 3P model?"):
+        # Add user message to chat history
+        st.session_state.third_party_messages.append({
+            "role": "user",
+            "content": {"text": prompt_text, "citations": []}
+        })
+
+        # Display assistant response in chat message container
+        with st.chat_message("assistant"):
+            message_placeholder = st.empty()
+            response_content = {"text": "", "citations": []}
+            response_dict = {}
+
+            with st.spinner(f"3P model ({model_name}) is thinking..."):
+                try:
+                    response_dict = third_party_helper.generate_third_party_chat_response(
+                        model_id=model_name,
+                        prompt=prompt_text,
+                        system_instructions=system_instructions,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        project_id=st.session_state.get("project_id", config.PROJECT_ID)
+                    )
+                    response_content["text"] = response_dict.get("text", "No response text found.")
+                    response_content["citations"] = response_dict.get("citations", []) # Will be empty for now
+                except Exception as e:
+                    response_content["text"] = f"An error occurred: {e}"
+                    st.error(response_content["text"])
+
+            message_placeholder.markdown(response_content["text"])
+
+        # Add assistant response to chat history
+        st.session_state.third_party_messages.append({
+            "role": "assistant",
+            "content": response_content,
+            "usage_metadata": response_dict.get('usage_metadata', {})
+        })
+
+        # Save the chat exchange to Firestore history
+        if FIRESTORE_AVAILABLE:
+            try:
+                chat_params = {
+                    'model': model_name,
+                    'temperature': temperature,
+                    'system_instructions': system_instructions,
+                    'max_output_tokens': max_tokens,
+                    'response': response_content # Store the full response object
+                }
+                db.collection('history').add({
+                    'user_id': st.session_state.user_id,
+                    'timestamp': firestore.SERVER_TIMESTAMP,
+                    'type': '3p_chat', # New type for 3P chat
+                    'uri': response_content.get('text', ''), # Record the text output as the 'uri'
+                    'prompt': prompt_text,
+                    'params': chat_params,
+                    'usage_metadata': response_dict.get('usage_metadata', {}),
+                    'favorite': False
+                })
+                logger.info("Saved 3P chat exchange to Firestore history.")
+            except Exception as e:
+                logger.error(f"Failed to save 3P chat history to Firestore: {e}")
 
 def text_to_image_tab():
     """Text-to-Image generation tab."""
