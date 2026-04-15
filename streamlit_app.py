@@ -2169,7 +2169,8 @@ def live_audio_transcription_tab():
                             'uri': audio_uri,
                             'prompt': transcribed_text, # Store the transcription text as the 'prompt'
                             'params': params,
-                            'favorite': False
+                                    'favorite': False,
+                                    'usage_metadata': {'total_token_count': 0} # Chirp usage is based on audio seconds, not tokens
                         })
                         logger.info(f"Saved transcription to history with audio URI: {audio_uri}")
                         st.toast("Transcription saved to history!")
@@ -2205,7 +2206,7 @@ def gemini_chat_tab():
     # Model selection
     model_name = st.selectbox(
         "Select Gemini Model",
-        options=["gemini-2.5-pro", "gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-2.0-flash-001", "gemini-2.0-flash-lite-001", "gemini-1.5-pro-002"],
+        options=["gemini-3.1-pro-preview", "gemini-3-flash-preview", "gemini-3.1-flash-lite-preview", "gemini-2.5-pro", "gemini-2.5-flash-lite", "gemini-2.5-flash"],
         key="gemini_chat_model",
         help="Choose the Gemini model to chat with. 'Flash' is faster, 'Pro' is more capable."
     )
@@ -2321,6 +2322,7 @@ def gemini_chat_tab():
             message_placeholder = st.empty()
             citations_placeholder = st.empty()
             response_content = {"text": "", "citations": []}
+            response_dict = {} # Initialize response_dict
 
             with st.spinner("Gemini is thinking..." if not trigger_from_audio else "Processing audio..."):
                 try:
@@ -2357,7 +2359,34 @@ def gemini_chat_tab():
                         st.markdown(f"**[{i}] [{citation['title']}]({citation['uri']})**")
 
         # Add assistant response to chat history
-        st.session_state.gemini_messages.append({"role": "assistant", "content": response_content})
+        st.session_state.gemini_messages.append({
+            "role": "assistant", 
+            "content": response_content,
+            "usage_metadata": response_dict.get('usage_metadata', {})
+        })
+        # Save the chat exchange to Firestore history
+        if FIRESTORE_AVAILABLE:
+            try:
+                chat_params = {
+                    'model': model_name,
+                    'temperature': temperature,
+                    'enable_grounding': enable_grounding,
+                    'system_instructions': system_instructions,
+                    'response': response_content # Store the full response object
+                }
+                db.collection('history').add({
+                    'user_id': st.session_state.user_id,
+                    'timestamp': firestore.SERVER_TIMESTAMP,
+                    'type': 'chat',
+                    'uri': response_content.get('text', ''), # Record the text output as the 'uri'
+                    'prompt': prompt_for_api,
+                    'params': chat_params,
+                    'usage_metadata': response_dict.get('usage_metadata', {}),
+                    'favorite': False
+                })
+                logger.info("Saved Gemini chat exchange to Firestore history.")
+            except Exception as e:
+                logger.error(f"Failed to save chat history to Firestore: {e}")
 
 def text_to_image_tab():
     """Text-to-Image generation tab."""
@@ -2510,7 +2539,7 @@ def image_editing_tab():
     with col1:
         model = st.selectbox(
             "Model",
-            options=["gemini-2.5-flash-image"],
+            options=["gemini-2.5-flash-image", "gemini-3-pro-image-preview", "gemini-3.1-flash-image-preview"],
             index=0,
             help="Choose the model for editing.",
             key="i2i_model"
@@ -2987,7 +3016,8 @@ def text_to_voiceover_tab():
                                         'type': 'voice',
                                         'uri': uri,
                                         'prompt': full_script, # The full script used for generation
-                                        'params': voice_params
+                                        'params': voice_params,
+                                        'usage_metadata': chunk.usage_metadata.to_dict() if chunk.usage_metadata else {}
                                     })
                                     logger.debug(f"Added voice {uri} to Firestore history.")
                                 except Exception as e:
@@ -4426,15 +4456,34 @@ def display_all_history(history_data):
     else:
         if view_mode == "Table":
             display_df = filtered_history.copy()
+            # Safely extract token counts, handling missing 'usage_metadata' column
+            if 'usage_metadata' in display_df.columns:
+                display_df['input_text_tokens'] = display_df['usage_metadata'].apply(lambda x: x.get('promptTokenCount', 0) if isinstance(x, dict) else 0)
+                display_df['input_image_tokens'] = display_df['usage_metadata'].apply(lambda x: x.get('inputImageTokenCount', 0) if isinstance(x, dict) else 0)
+                display_df['output_tokens'] = display_df['usage_metadata'].apply(lambda x: x.get('candidatesTokenCount', 0) if isinstance(x, dict) else 0)
+                display_df['thinking_tokens'] = display_df['usage_metadata'].apply(lambda x: x.get('totalTokenCount', 0) - x.get('promptTokenCount', 0) - x.get('candidatesTokenCount', 0) if isinstance(x, dict) else 0)
+                display_df['total_tokens'] = display_df['usage_metadata'].apply(lambda x: x.get('totalTokenCount', 0) if isinstance(x, dict) else 0)
+            else:
+                # If the column doesn't exist, create them with default 0 values
+                for col in ['input_text_tokens', 'input_image_tokens', 'output_tokens', 'thinking_tokens', 'total_tokens']:
+                    display_df[col] = 0
+            
             display_df['timestamp'] = pd.to_datetime(display_df['timestamp']).dt.strftime("%Y-%m-%d %H:%M:%S")
-            display_df = display_df.rename(columns={'timestamp': 'Generated', 'type': 'Type', 'uri': 'URI', 'prompt': 'Prompt'})
-            if 'params' in display_df.columns:
-                display_df = display_df.drop(columns=['params'])
+            # Extract model from params
+            display_df['Model'] = display_df['params'].apply(lambda x: _parse_history_params(x).get('model', 'N/A'))
+
+            display_df = display_df.rename(columns={'timestamp': 'Generated', 'type': 'Type', 'uri': 'Response', 'prompt': 'Prompt', 'Model': 'Model', 'input_text_tokens': 'Input Tokens (Text)', 'input_image_tokens': 'Input Tokens (Image)', 'output_tokens': 'Output Tokens', 'thinking_tokens': 'Thinking Tokens', 'total_tokens': 'Total Tokens'})
+            
+            # Select and reorder columns for display
+            columns_to_show = ['Generated', 'Type', 'Model', 'Prompt', 'Response', 'Input Tokens (Text)', 'Input Tokens (Image)', 'Output Tokens', 'Thinking Tokens', 'Total Tokens']
+            display_df = display_df[columns_to_show]
+
             display_df['Prompt'] = display_df['Prompt'].apply(lambda x: x[:50] + "..." if isinstance(x, str) and len(x) > 50 else x)
+            display_df['Response'] = display_df['Response'].apply(lambda x: x[:50] + "..." if isinstance(x, str) and len(x) > 50 else x)
             st.dataframe(display_df, use_container_width=True, column_config={
                 "Generated": st.column_config.DatetimeColumn("Generated", help="When this item was created", format="MMM DD, YYYY, hh:mm a", width="medium"),
                 "Type": st.column_config.TextColumn("Type", help="Item type (video or image)", width="small"),
-                "URI": st.column_config.TextColumn("URI", help="Google Cloud Storage URI", width="large"),
+                "Response": st.column_config.TextColumn("Response", help="GCS URI for media or text response for chat", width="large"),
                 "Prompt": st.column_config.TextColumn("Prompt", help="Prompt used for generation", width="large")
             })
         else:
@@ -5100,6 +5149,12 @@ def generate_video(
                                         'user_id': st.session_state.user_id,
                                         'type': "video", 'uri': uri, 'prompt': prompt, 'params': params
                                     })
+                                # Add usage metadata if available
+                                if result and 'usageMetadata' in result:
+                                    db.collection('history').document(doc_ref.id).update({
+                                        'usage_metadata': result['usageMetadata']
+                                    })
+
                                 db.collection('history').document(doc_ref.id).update({'favorite': False})
                                 logger.info(f"Added video {uri} to Firestore history with favorite set to false.")
 
@@ -5215,7 +5270,8 @@ def generate_image(
                     db.collection('history').document().set({
                         'timestamp': firestore.SERVER_TIMESTAMP, 'type': 'image', 'uri': uri,
                         'user_id': st.session_state.user_id,
-                        'favorite': False,
+                        'favorite': False, 
+                        'usage_metadata': response.get('usageMetadata', {}),
                         'prompt': prompt, 'params': params
                     })
 
@@ -5316,7 +5372,8 @@ def edit_image(
                     db.collection('history').document().set({
                         'timestamp': firestore.SERVER_TIMESTAMP, 'type': 'image', 'uri': uri,
                         'user_id': st.session_state.user_id,
-                        'favorite': False,
+                        'favorite': False, 
+                        'usage_metadata': response.get('usageMetadata', {}),
                         'prompt': f"Edited image with prompt: {prompt}", 'params': params
                     })
 
@@ -5895,7 +5952,8 @@ def generate_audio(
                             'user_id': st.session_state.user_id,
                             'type': "audio",
                             'uri': uri,
-                            'favorite': False,
+                            'favorite': False, 
+                            'usage_metadata': response.get('usageMetadata', {}),
                             'prompt': prompt,
                             'params': params
                         })

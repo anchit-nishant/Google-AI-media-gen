@@ -247,7 +247,15 @@ class Veo2API:
         }
         
         response = requests.post(url, headers=headers, json=request_body)
-        return response.json()
+        response_json = response.json()
+
+        # Add usage metadata to the response if it exists
+        if "metadata" in response_json and "usageMetadata" in response_json["metadata"]:
+            response_json["usageMetadata"] = response_json["metadata"]["usageMetadata"]
+        elif "usageMetadata" in response_json: # Sometimes it's at the top level
+            pass # It's already there
+
+        return response_json
     
 
     def poll_operation(self, operation_id: str) -> Dict:
@@ -273,7 +281,13 @@ class Veo2API:
         }
         
         response = requests.post(url, headers=headers, json=request_body)
-        return response.json()
+        response_json = response.json()
+
+        # Add usage metadata to the response if it exists in the nested metadata
+        if "metadata" in response_json and "usageMetadata" in response_json["metadata"]:
+            response_json["usageMetadata"] = response_json["metadata"]["usageMetadata"]
+
+        return response_json
     
     def wait_for_operation(self, operation_id: str, poll_interval: int = 10, max_attempts: int = 30) -> Dict:
         """
@@ -470,7 +484,15 @@ class Veo2API:
         }
         
         response = requests.post(url, headers=headers, json=request_body)
-        return response.json()
+        response_json = response.json()
+
+        # Add usage metadata to the response if it exists
+        if "metadata" in response_json and "usageMetadata" in response_json["metadata"]:
+            response_json["usageMetadata"] = response_json["metadata"]["usageMetadata"]
+        elif "usageMetadata" in response_json: # Sometimes it's at the top level
+            pass # It's already there
+
+        return response_json
     
 
     def poll_operation(self, operation_id: str) -> Dict:
@@ -1181,7 +1203,14 @@ class Veo2API:
 
         response = requests.post(url, headers=headers, json=request_body)
         response.raise_for_status() # Raise an exception for bad status codes
-        return response.json()
+        response_json = response.json()
+
+        # Add usage metadata to the response if it exists
+        if "metadata" in response_json and "usageMetadata" in response_json["metadata"]:
+            response_json["usageMetadata"] = response_json["metadata"]["usageMetadata"]
+        elif "usageMetadata" in response_json: # Sometimes it's at the top level
+            pass # It's already there
+        return response_json
         
         # The response from streamGenerateContent is a list of JSON objects (chunks).
         # We need to aggregate them to extract the image data.
@@ -1340,6 +1369,12 @@ def generate_image_gemini_image_preview(
     # Let's find the image data and format it like the other Imagen responses.
     predictions = []
     for chunk in full_response_json:
+        # The usageMetadata is usually in the last chunk
+        if "usageMetadata" in chunk:
+            # Attach it to the first chunk for easy retrieval later
+            if full_response_json and "usageMetadata" not in full_response_json[0]:
+                 full_response_json[0]["usageMetadata"] = chunk["usageMetadata"]
+
         if "candidates" in chunk:
             for candidate in chunk["candidates"]:
                 if "content" in candidate and "parts" in candidate["content"]:
@@ -1349,7 +1384,7 @@ def generate_image_gemini_image_preview(
                                 "bytesBase64Encoded": part["inlineData"]["data"]
                             })
     
-    return {"predictions": predictions}
+    return {"predictions": predictions, "usageMetadata": full_response_json[0].get("usageMetadata", {})}
 
 # This is a helper function to encode a local image file to base64
 def image_to_base64(filepath: str) -> str:

@@ -19,7 +19,7 @@ def save_binary_file(file_name, data):
     return file_name
 
 
-def generate_voiceover(full_script, model):
+def generate_voiceover(full_script, model) -> list:
     client = genai.Client(
         api_key=os.environ.get("GEMINI_API_KEY"),
     )
@@ -57,7 +57,8 @@ def generate_voiceover(full_script, model):
         ),
     )
 
-    file_index = 0
+    # List to hold tuples of (file_path, chunk_data)
+    generated_files_with_metadata = []
     print(model)
     for chunk in client.models.generate_content_stream(
         model=model,
@@ -73,7 +74,6 @@ def generate_voiceover(full_script, model):
         if chunk.candidates[0].content.parts[0].inline_data and \
                 chunk.candidates[0].content.parts[0].inline_data.data:
             file_name = f"temp_audio_{uuid.uuid4().hex}"  # Use a more robust naming scheme
-            file_index += 1
             inline_data = chunk.candidates[0].content.parts[0].inline_data
             data_buffer = inline_data.data
             file_extension = mimetypes.guess_extension(inline_data.mime_type)
@@ -81,11 +81,12 @@ def generate_voiceover(full_script, model):
                 file_extension = ".wav"
                 data_buffer = convert_to_wav(inline_data.data, inline_data.mime_type)
             final_audio_file = save_binary_file(f"{file_name}{file_extension}", data_buffer)
+            generated_files_with_metadata.append((final_audio_file, chunk))
 
         else:
             print(chunk.text)
 
-    return final_audio_file
+    return generated_files_with_metadata
 
 
 
