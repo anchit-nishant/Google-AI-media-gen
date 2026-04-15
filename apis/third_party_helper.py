@@ -2,6 +2,7 @@ import os
 import json
 import requests
 import sys
+import time
 from typing import Dict, Any, List, Optional
 
 # Assuming Veo2API is the source of _get_access_token
@@ -23,7 +24,7 @@ def generate_third_party_chat_response(
 ) -> Dict[str, Any]:
     """
     Generates a chat response from a third-party model (e.g., Anthropic Claude)
-    on Vertex AI, handling streaming responses.
+    on Vertex AI, handling streaming responses and calculating latency.
 
     Args:
         model_id: The ID of the third-party model (e.g., "claude-sonnet-4-6").
@@ -35,8 +36,9 @@ def generate_third_party_chat_response(
         location_id: The Vertex AI location for the model.
 
     Returns:
-        A dictionary containing the response text and usage metadata.
+        A dictionary containing the response text, usage metadata, and latency.
     """
+    start_time = time.time()
     try:
         print(f"Starting chat generation with 3P model: {model_id}")
 
@@ -44,9 +46,6 @@ def generate_third_party_chat_response(
 
         messages = []
         if system_instructions:
-            # Anthropic models typically handle system instructions as a top-level parameter
-            # or as a first user message. For streamRawPredict, it's usually part of the
-            # 'messages' array. Let's put it as a user message followed by an assistant ack.
             messages.append({"role": "user", "content": [{"type": "text", "text": system_instructions}]})
             messages.append({"role": "assistant", "content": [{"type": "text", "text": "Okay, I understand."}]})
         
@@ -54,14 +53,13 @@ def generate_third_party_chat_response(
 
         request_body = {
             "anthropic_version": "vertex-2023-10-16",
-            "stream": True, # Set to True for streaming
+            "stream": True,
             "max_tokens": max_tokens,
             "temperature": temperature,
             "messages": messages
         }
 
         publisher = "anthropic"
-
         endpoint = "aiplatform.googleapis.com"
         url = (f"https://{endpoint}/v1/projects/{project_id}/locations/{location_id}/"
                f"publishers/{publisher}/models/{model_id}:streamRawPredict")
@@ -71,14 +69,10 @@ def generate_third_party_chat_response(
             "Content-Type": "application/json; charset=utf-8"
         }
 
-        print(f"Sending streaming request to 3P API: {url}")
-        print(f"Request body: {json.dumps(request_body, indent=2)}")
-
         response_text = ""
         input_tokens = 0
         output_tokens = 0
 
-        # Use stream=True for requests.post to handle chunked responses
         with requests.post(url, headers=headers, json=request_body, stream=True) as r:
             r.raise_for_status()
             for line in r.iter_lines():
@@ -87,25 +81,14 @@ def generate_third_party_chat_response(
                     if decoded_line.startswith("data: "):
                         try:
                             event_data = json.loads(decoded_line[len("data: "):])
-
-                            if event_data.get('type') == 'content_block_delta':
-                                if event_data['delta'].get('type') == 'text_delta':
-                                    response_text += event_data['delta']['text']
-                            elif event_data.get('type') == 'message_start':
-                                if 'usage' in event_data['message']:
-                                    input_tokens = event_data['message']['usage'].get('input_tokens', 0)
-                            elif event_data.get('type') == 'message_delta':
-                                if 'usage' in event_data:
-                                    output_tokens += event_data['usage'].get('output_tokens', 0)
-                            elif event_data.get('type') == 'message_end':
-                                if 'usage' in event_data['message']:
-                                    input_tokens = event_data['message']['usage'].get('input_tokens', input_tokens)
-                                    output_tokens = event_data['message']['usage'].get('output_tokens', output_tokens)
-
-                        except json.JSONDecodeError:
-                            print(f"Could not decode JSON from line: {decoded_line}", file=sys.stderr)
-                        except KeyError as ke:
-                            print(f"KeyError in parsing event data: {ke} in {event_data}", file=sys.stderr)
+                            if event_data.get('type') == 'content_block_delta' and event_data['delta'].get('type') == 'text_delta':
+                                response_text += event_data['delta']['text']
+                            elif event_data.get('type') == 'message_start' and 'usage' in event_data['message']:
+                                input_tokens = event_data['message']['usage'].get('input_tokens', 0)
+                            elif event_data.get('type') == 'message_delta' and 'usage' in event_data:
+                                output_tokens += event_data['usage'].get('output_tokens', 0)
+                        except (json.JSONDecodeError, KeyError) as e:
+                            print(f"Error parsing stream event: {e} in line: {decoded_line}", file=sys.stderr)
 
         usage_metadata = {
             'promptTokenCount': input_tokens,
@@ -113,13 +96,14 @@ def generate_third_party_chat_response(
             'totalTokenCount': input_tokens + output_tokens
         }
         
-        print(f"✅ Extracted text from 3P model: \"{response_text[:100]}...\"")
-        print(f"✅ Extracted usage metadata: {usage_metadata}")
+        latency = round(time.time() - start_time, 2)
+        print(f"✅ 3P model generation took {latency} seconds.")
 
         return {
             "text": response_text.strip(),
             "citations": [],
-            "usage_metadata": usage_metadata
+            "usage_metadata": usage_metadata,
+            "latency_seconds": latency
         }
 
     except requests.exceptions.HTTPError as http_err:

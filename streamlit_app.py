@@ -2380,6 +2380,7 @@ def gemini_chat_tab():
                     'system_instructions': system_instructions,
                     'response': response_content # Store the full response object
                 }
+                chat_params['latency_seconds'] = response_dict.get('latency_seconds', 0)
                 db.collection('history').add({
                     'user_id': st.session_state.user_id,
                     'timestamp': firestore.SERVER_TIMESTAMP,
@@ -2498,6 +2499,7 @@ def third_party_chat_tab():
                     'max_output_tokens': max_tokens,
                     'response': response_content # Store the full response object
                 }
+                chat_params['latency_seconds'] = response_dict.get('latency_seconds', 0)
                 db.collection('history').add({
                     'user_id': st.session_state.user_id,
                     'timestamp': firestore.SERVER_TIMESTAMP,
@@ -3094,6 +3096,7 @@ def text_to_voiceover_tab():
     # --- Run Button ---
     if st.button("▶️ Run", type="primary", use_container_width=True):
         try:
+            start_time = time.time()
             # Collect the style instructions
             full_script = style_instructions + "\n"
             
@@ -3115,6 +3118,10 @@ def text_to_voiceover_tab():
                 import apis.gemini_TTS_api as gemini_TTS_api
                 file_paths = gemini_TTS_api.generate_voiceover(full_script, voiceover_model)
                 if file_paths:
+                    end_time = time.time()
+                    latency = round(end_time - start_time, 2)
+                    st.info(f"Voiceover generation completed in {latency} seconds.")
+
                     st.success("Voiceover generated successfully!")
                     print(f"File saved to to: {file_paths}")
                     # Play each audio file
@@ -3131,6 +3138,7 @@ def text_to_voiceover_tab():
                                 'mode': st.session_state.voiceover_mode,
                                 'style_instructions': style_instructions
                             }
+                            voice_params['latency_seconds'] = latency
                             for uri in uploaded_uris:
                                 try:
                                     doc_ref = db.collection('history').document()
@@ -4594,12 +4602,13 @@ def display_all_history(history_data):
             
             display_df['timestamp'] = pd.to_datetime(display_df['timestamp']).dt.strftime("%Y-%m-%d %H:%M:%S")
             # Extract model from params
-            display_df['Model'] = display_df['params'].apply(lambda x: _parse_history_params(x).get('model', 'N/A'))
+            display_df['Model'] = display_df['params'].apply(lambda p: _parse_history_params(p).get('model', 'N/A'))
+            display_df['Latency (s)'] = display_df['params'].apply(lambda p: _parse_history_params(p).get('latency_seconds', 0))
 
             display_df = display_df.rename(columns={'timestamp': 'Generated', 'type': 'Type', 'uri': 'Response', 'prompt': 'Prompt', 'Model': 'Model', 'input_text_tokens': 'Input Tokens (Text)', 'input_image_tokens': 'Input Tokens (Image)', 'output_tokens': 'Output Tokens', 'thinking_tokens': 'Thinking Tokens', 'total_tokens': 'Total Tokens'})
             
             # Select and reorder columns for display
-            columns_to_show = ['Generated', 'Type', 'Model', 'Prompt', 'Response', 'Input Tokens (Text)', 'Input Tokens (Image)', 'Output Tokens', 'Thinking Tokens', 'Total Tokens']
+            columns_to_show = ['Generated', 'Type', 'Model', 'Latency (s)', 'Prompt', 'Response', 'Input Tokens (Text)', 'Input Tokens (Image)', 'Output Tokens', 'Thinking Tokens', 'Total Tokens']
             display_df = display_df[columns_to_show]
 
             display_df['Prompt'] = display_df['Prompt'].apply(lambda x: x[:50] + "..." if isinstance(x, str) and len(x) > 50 else x)
@@ -5133,6 +5142,7 @@ def generate_video(
     with st.spinner("🎬 Generating your video... This may take several minutes"):
         try:
             # Initialize the Veo2 API client
+            start_time = time.time()
             client = Veo2API(project_id)
             
             # Prepare image if provided
@@ -5211,8 +5221,6 @@ def generate_video(
                     response = client.poll_operation(operation_id)
                     
                     if response.get("done", False):
-                        progress_bar.progress(1.0)
-                        status_text.text("Video generation complete!")
                         break
                     
                     if attempt < max_attempts - 1:
@@ -5225,15 +5233,20 @@ def generate_video(
                 
                 result = response
                 
+                end_time = time.time()
+                latency = round(end_time - start_time, 2)
+                params['latency_seconds'] = latency
                 # Check if there's an error in the response
-                if "error" in result:
+                if result.get("error"):
                     error_msg = result.get("error", {}).get("message", "Unknown error")
+                    status_text.error(f"Video generation failed.")
                     st.error(f"⚠️ Video generation failed: {error_msg}")
                     if show_full_response:
                         with st.expander("Error details"):
                             st.json(result)
                     return
                 
+                progress_bar.progress(1.0)
                 # Display the results
                 st.success("✅ Video generation complete!")
                 
@@ -5325,6 +5338,7 @@ def generate_image(
 
     with st.spinner("🎨 Generating your image with Imagen..."):
         try:
+            start_time = time.time()
             client = Veo2API(project_id) # Reusing the client
 
             # Prepare image if provided
@@ -5349,6 +5363,10 @@ def generate_image(
                 storage_uri=storage_uri,
                 enhance_prompt=enhance_prompt
             )
+            
+            end_time = time.time()
+            latency = round(end_time - start_time, 2)
+            st.info(f"Image generation completed in {latency} seconds.")
 
             if "error" in response:
                 error_msg = response.get("error", {}).get("message", "Unknown error")
@@ -5390,6 +5408,7 @@ def generate_image(
                     "sampleCount": sample_count, "aspectRatio": aspect_ratio, "seed": seed if seed else "random",
                     "person_generation": person_generation, "safetyFilterThreshold": safety_filter_level,
                 }
+                params['latency_seconds'] = latency
                 for uri in image_uris:
                     db.collection('history').document().set({
                         'timestamp': firestore.SERVER_TIMESTAMP, 'type': 'image', 'uri': uri,
@@ -5424,6 +5443,7 @@ def edit_image(
 
     with st.spinner("🎨 Generating your image with Gemini..."):
         try:
+            start_time = time.time()
             client = Veo2API(project_id)
 
             # Prepare a list of input images
@@ -5455,6 +5475,10 @@ def edit_image(
                 safety_threshold=safety_filter_level,
                 # Note: 'seed' and other unused parameters are ignored by the new function
             )
+
+            end_time = time.time()
+            latency = round(end_time - start_time, 2)
+            st.info(f"Image editing completed in {latency} seconds.")
 
             if "error" in response:
                 error_msg = response.get("error", {}).get("message", "Unknown error")
@@ -5492,6 +5516,7 @@ def edit_image(
                     "prompt": prompt, "model": model, "aspectRatio": aspect_ratio, "safetyFilterThreshold": safety_filter_level,
                     "input_images": [os.path.basename(p) for p in input_image_paths or []]
                 }
+                params['latency_seconds'] = latency
                 for uri in image_uris:
                     db.collection('history').document().set({
                         'timestamp': firestore.SERVER_TIMESTAMP, 'type': 'image', 'uri': uri,
@@ -6004,6 +6029,7 @@ def generate_audio(
     # Placeholder spinner
     with st.spinner("🎵 Generating your audio... This may take a moment"):
         try:
+            start_time = time.time()
             # Prepare API parameters for history
             params = {
                 "prompt": prompt,
@@ -6020,6 +6046,10 @@ def generate_audio(
                 seed=seed,
                 storage_uri=storage_uri,
             )
+
+            end_time = time.time()
+            latency = round(end_time - start_time, 2)
+            st.info(f"Audio generation completed in {latency} seconds.")
 
             # --- NEW RESPONSE HANDLING LOGIC ---
             predictions = response.get("predictions", [])
@@ -6069,6 +6099,7 @@ def generate_audio(
             if audio_uris:
                 logger.info(f"Adding {len(audio_uris)} audio entries to Firestore history.")
                 for uri in audio_uris:
+                    params['latency_seconds'] = latency
                     try:
                         doc_ref = db.collection('history').document()
                         doc_ref.set({
