@@ -247,7 +247,15 @@ class Veo2API:
         }
         
         response = requests.post(url, headers=headers, json=request_body)
-        return response.json()
+        response_json = response.json()
+
+        # Add usage metadata to the response if it exists
+        if "metadata" in response_json and "usageMetadata" in response_json["metadata"]:
+            response_json["usageMetadata"] = response_json["metadata"]["usageMetadata"]
+        elif "usageMetadata" in response_json: # Sometimes it's at the top level
+            pass # It's already there
+
+        return response_json
     
 
     def poll_operation(self, operation_id: str) -> Dict:
@@ -273,7 +281,13 @@ class Veo2API:
         }
         
         response = requests.post(url, headers=headers, json=request_body)
-        return response.json()
+        response_json = response.json()
+
+        # Add usage metadata to the response if it exists in the nested metadata
+        if "metadata" in response_json and "usageMetadata" in response_json["metadata"]:
+            response_json["usageMetadata"] = response_json["metadata"]["usageMetadata"]
+
+        return response_json
     
     def wait_for_operation(self, operation_id: str, poll_interval: int = 10, max_attempts: int = 30) -> Dict:
         """
@@ -470,7 +484,15 @@ class Veo2API:
         }
         
         response = requests.post(url, headers=headers, json=request_body)
-        return response.json()
+        response_json = response.json()
+
+        # Add usage metadata to the response if it exists
+        if "metadata" in response_json and "usageMetadata" in response_json["metadata"]:
+            response_json["usageMetadata"] = response_json["metadata"]["usageMetadata"]
+        elif "usageMetadata" in response_json: # Sometimes it's at the top level
+            pass # It's already there
+
+        return response_json
     
 
     def poll_operation(self, operation_id: str) -> Dict:
@@ -1181,7 +1203,14 @@ class Veo2API:
 
         response = requests.post(url, headers=headers, json=request_body)
         response.raise_for_status() # Raise an exception for bad status codes
-        return response.json()
+        response_json = response.json()
+
+        # Add usage metadata to the response if it exists
+        if "metadata" in response_json and "usageMetadata" in response_json["metadata"]:
+            response_json["usageMetadata"] = response_json["metadata"]["usageMetadata"]
+        elif "usageMetadata" in response_json: # Sometimes it's at the top level
+            pass # It's already there
+        return response_json
         
         # The response from streamGenerateContent is a list of JSON objects (chunks).
         # We need to aggregate them to extract the image data.
@@ -1242,58 +1271,78 @@ class Veo2API:
 
 def generate_image_gemini_image_preview(
     self,
-    prompt: str,
-    aspectRatio: str,
-    input_images: Optional[List[Dict[str, str]]] = None,
+    chat_history: List[Dict[str, Any]],
+    system_instructions: Optional[str],
+    aspectRatio: str, # Keep camelCase for consistency
     model: str = "gemini-2.5-flash-image",
     temperature: float = 1.0,
     top_p: float = 0.95,
     max_output_tokens: int = 32768,
-    safety_threshold: str = "OFF"
+    safety_threshold: str = "OFF",
+    storage_uri: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Generates or edits an image using Gemini with a text prompt and multiple input images.
+    Generates or edits an image using Gemini in a conversational context.
 
     Args:
-        prompt: Text prompt to guide image generation or editing.
-        input_images: Optional list of dictionaries, where each dict contains
-                      'mime_type' and 'data' (base64-encoded string) for an image.
+        chat_history: A list of message dictionaries, each with 'role' and 'content'.
+        system_instructions: Optional system-level instructions for the model.
+                      The 'content' dict can contain 'text' and a list of 'images' (base64).
+        aspectRatio: The desired aspect ratio for the generated image.
         model: The Gemini model ID to use.
         temperature: Controls randomness in generation (0.0-1.0).
         top_p: Nucleus sampling parameter.
         max_output_tokens: The maximum number of tokens in the response.
         safety_threshold: The safety threshold to apply (e.g., "OFF", "BLOCK_FEW").
+        storage_uri: GCS URI to store the output images.
 
     Returns:
-        Dict: API response containing the generated text and image content.
+        Dict: A dictionary containing the assistant's response ('content') and usage metadata.
+              The 'content' dict has 'text' and 'image_uris'.
     """
-    # 1. Construct the 'parts' of the request from multiple images and a prompt
-    parts = []
-    if input_images:
-        for image_info in input_images:
-            parts.append({
-                "inlineData": {
-                    "mimeType": image_info['mime_type'],
-                    "data": image_info['data'],
-                }
-            })
-    # The text prompt must be the last part
-    parts.append({"text": prompt})
+    # 1. Construct the 'contents' payload from the chat history
+    contents = []
+    # Prepend system instructions if they exist
+    if system_instructions:
+        contents.append({"role": "user", "parts": [{"text": system_instructions}]})
+        contents.append({"role": "model", "parts": [{"text": "Okay, I understand. I will follow these instructions for all image generations in this conversation."}]})
+    for message in chat_history:
+        role = message["role"]
+        content = message["content"]
+        parts = []
 
-    # 2. Construct the full request body
-    contents = [{"role": "user", "parts": parts}]
+        # Add images first, if any
+        if "images" in content and content["images"]:
+            for img_b64 in content["images"]:
+                # The API expects a dict with mime_type and data
+                parts.append({
+                    "inlineData": {
+                        # A simple heuristic to guess mime type from base64 header,
+                        # otherwise default to png.
+                        "mimeType": "image/jpeg" if img_b64.startswith('/9j/') else "image/png",
+                        "data": img_b64
+                    }
+                })
+        
+        # Add text part
+        if "text" in content and content["text"]:
+            parts.append({"text": content["text"]})
 
+        if parts:
+            contents.append({"role": role, "parts": parts})
+
+    # 2. Construct the generation configuration
     generation_config = {
         "temperature": temperature,
         "maxOutputTokens": max_output_tokens,
         "responseModalities": ["TEXT", "IMAGE"],
         "imageConfig": {
-            "aspectRatio": aspectRatio 
+            "aspectRatio": aspectRatio
         },
         "topP": top_p,
-
     }
 
+    # 3. Construct safety settings
     safety_categories = [
         "HARM_CATEGORY_HATE_SPEECH", "HARM_CATEGORY_DANGEROUS_CONTENT",
         "HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_HARASSMENT"
@@ -1302,13 +1351,14 @@ def generate_image_gemini_image_preview(
         {"category": cat, "threshold": safety_threshold} for cat in safety_categories
     ]
 
+    # 4. Construct the final request body
     request_body = {
         "contents": contents,
         "generationConfig": generation_config,
         "safetySettings": safety_settings
     }
     
-    # 3. Make the API request
+    # 5. Make the API request
     api_endpoint = f"aiplatform.googleapis.com"
     url = (f"https://{api_endpoint}/v1/projects/{self.project_id}/locations/global"
            f"/publishers/google/models/{model}:streamGenerateContent")
@@ -1318,11 +1368,33 @@ def generate_image_gemini_image_preview(
         "Content-Type": "application/json; charset=utf-8"
     }
 
-    response = requests.post(url, headers=headers, json=request_body)
-    response.raise_for_status()
+    print("--- Gemini Image Chat Full Request ---")
+    # Create a deep copy to avoid modifying the original request_body
+    loggable_body = json.loads(json.dumps(request_body))
+    # To make logs readable, truncate the base64 data in the printed output
+    for content in loggable_body.get("contents", []):
+        for part in content.get("parts", []):
+            if "inlineData" in part and "data" in part["inlineData"]:
+                part["inlineData"]["data"] = part["inlineData"]["data"][:30] + "..."
+    print(json.dumps(loggable_body, indent=2))
+    print("--------------------------------------")
+
+    start_time = time.time()
+    try:
+        response = requests.post(url, headers=headers, json=request_body)
+        response.raise_for_status()
+    finally:
+        latency = round(time.time() - start_time, 2)
+        print(f"Gemini Image Chat API call took {latency} seconds.")
+
     # The response from streamGenerateContent is a list of JSON objects (chunks).
     # We need to aggregate them to extract the image data.
+
     full_response_text = response.text
+
+    print("--- Gemini Image Chat Raw Response ---")
+    print(full_response_text)
+    print("--------------------------------------")
     
     # The response is a stream of JSON objects, not a single one.
     # We need to parse it line by line or as a list of objects.
@@ -1336,20 +1408,57 @@ def generate_image_gemini_image_preview(
         except json.JSONDecodeError:
             raise ValueError(f"Could not parse streaming response from Gemini API: {full_response_text}")
 
-    # For image generation, the content is usually in one of the first chunks.
-    # Let's find the image data and format it like the other Imagen responses.
-    predictions = []
+    # 6. Process the streaming response to extract text and images
+    assistant_text_response = ""
+    assistant_image_data = [] # List of base64 strings
+    usage_metadata = {}
+
     for chunk in full_response_json:
+        if "usageMetadata" in chunk:
+            usage_metadata = chunk["usageMetadata"]
+
         if "candidates" in chunk:
             for candidate in chunk["candidates"]:
                 if "content" in candidate and "parts" in candidate["content"]:
                     for part in candidate["content"]["parts"]:
-                        if "inlineData" in part and "data" in part["inlineData"]:
-                            predictions.append({
-                                "bytesBase64Encoded": part["inlineData"]["data"]
-                            })
-    
-    return {"predictions": predictions}
+                        if "text" in part:
+                            assistant_text_response += part["text"]
+                        elif "inlineData" in part and "data" in part["inlineData"]:
+                            assistant_image_data.append(part["inlineData"]["data"])
+
+    # 7. Upload generated images to GCS to get URIs
+    image_uris = []
+    if assistant_image_data and storage_uri:
+        print(f"Uploading {len(assistant_image_data)} generated images to GCS...")
+        try:
+            bucket_name, folder_path = storage_uri.replace("gs://", "").split("/", 1)
+            storage_client = storage.Client()
+            bucket = storage_client.bucket(bucket_name)
+            
+            for i, img_b64 in enumerate(assistant_image_data):
+                img_bytes = base64.b64decode(img_b64)
+                img_filename = f"gemini-image-chat-{uuid.uuid4().hex}.png"
+                gcs_filepath = f"{folder_path.rstrip('/')}/generated_images/{img_filename}"
+                
+                blob = bucket.blob(gcs_filepath)
+                blob.upload_from_string(img_bytes, content_type="image/png")
+                
+                gcs_uri = f"gs://{bucket_name}/{gcs_filepath}"
+                image_uris.append(gcs_uri)
+                print(f"  Uploaded image {i+1} to {gcs_uri}")
+        except Exception as e:
+            print(f"ERROR: Failed to upload generated images to GCS: {e}")
+            # Continue without URIs, the app will handle it
+
+    # 8. Return the final structured response
+    return {
+        "content": {
+            "text": assistant_text_response.strip(),
+            "image_uris": image_uris
+        },
+        "usageMetadata": usage_metadata,
+        "latency_seconds": latency # Return latency in the response
+    }
 
 # This is a helper function to encode a local image file to base64
 def image_to_base64(filepath: str) -> str:

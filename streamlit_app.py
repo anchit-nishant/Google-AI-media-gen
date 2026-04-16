@@ -38,6 +38,7 @@ from google.cloud.speech_v2.types import cloud_speech as cloud_speech_types
 # Import project modules
 import config.config as config
 import apis.gemini_helper as gemini_helper
+import apis.third_party_helper as third_party_helper
 import app as dubbing_lib
 import apis.history_manager as history_manager
 from apis.veo2_api import Veo2API
@@ -799,6 +800,14 @@ def init_state():
     if "gemini_messages" not in st.session_state:
         logger.debug("Initializing 'gemini_messages' for chat history")
         st.session_state.gemini_messages = []
+    
+    # State for the new 3P Chat tab
+    if "third_party_messages" not in st.session_state:
+        st.session_state.third_party_messages = []
+
+    # State for the new Nano Banana (Image Editing) Chat tab
+    if "nano_banana_messages" not in st.session_state:
+        st.session_state.nano_banana_messages = []
 
     # State for resetting the Gemini chat file uploader
     if "gemini_uploader_key_counter" not in st.session_state:
@@ -1321,6 +1330,7 @@ def main():
         ("🎨 Image", image_tab),
         ("🎵 Audio", audio_tab),
         ("♊ Gemini", gemini_chat_tab),
+        ("💬 3P Chat", third_party_chat_tab), # New tab for 3rd party models
         ("📁 Projects", projects_tab),
         ("📋 History", history_tab),
     ])
@@ -1988,8 +1998,8 @@ def image_tab():
     """Main tab for all image-related operations."""
     # Define the image sub-tabs and their corresponding functions
     sub_tabs = OrderedDict([
-        ("Text-to-Image", text_to_image_tab),
-        ("Image Editing", image_editing_tab),
+        ("Text-to-Image (Imagen)", text_to_image_tab),
+        ("Nano Banana (Gemini)", nano_banana_tab),
     ])
 
     # Use a radio button for controlled sub-navigation
@@ -2003,11 +2013,11 @@ def image_tab():
 
     # Call the function for the active sub-tab
     active_sub_tab_func = sub_tabs.get(st.session_state.active_image_sub_tab)
-    if active_sub_tab_func:
-        active_sub_tab_func()
-    else:
+    if not active_sub_tab_func:
         # Fallback to the first tab
-        text_to_image_tab()
+        active_sub_tab_func = text_to_image_tab
+    
+    active_sub_tab_func()
 
 def audio_tab():
     """Main tab for all audio-related operations."""
@@ -2169,7 +2179,8 @@ def live_audio_transcription_tab():
                             'uri': audio_uri,
                             'prompt': transcribed_text, # Store the transcription text as the 'prompt'
                             'params': params,
-                            'favorite': False
+                                    'favorite': False,
+                                    'usage_metadata': {'total_token_count': 0} # Chirp usage is based on audio seconds, not tokens
                         })
                         logger.info(f"Saved transcription to history with audio URI: {audio_uri}")
                         st.toast("Transcription saved to history!")
@@ -2205,7 +2216,7 @@ def gemini_chat_tab():
     # Model selection
     model_name = st.selectbox(
         "Select Gemini Model",
-        options=["gemini-2.5-pro", "gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-2.0-flash-001", "gemini-2.0-flash-lite-001", "gemini-1.5-pro-002"],
+        options=["gemini-3.1-pro-preview", "gemini-3-flash-preview", "gemini-3.1-flash-lite-preview", "gemini-2.5-pro", "gemini-2.5-flash-lite", "gemini-2.5-flash"],
         key="gemini_chat_model",
         help="Choose the Gemini model to chat with. 'Flash' is faster, 'Pro' is more capable."
     )
@@ -2321,6 +2332,7 @@ def gemini_chat_tab():
             message_placeholder = st.empty()
             citations_placeholder = st.empty()
             response_content = {"text": "", "citations": []}
+            response_dict = {} # Initialize response_dict
 
             with st.spinner("Gemini is thinking..." if not trigger_from_audio else "Processing audio..."):
                 try:
@@ -2357,7 +2369,154 @@ def gemini_chat_tab():
                         st.markdown(f"**[{i}] [{citation['title']}]({citation['uri']})**")
 
         # Add assistant response to chat history
-        st.session_state.gemini_messages.append({"role": "assistant", "content": response_content})
+        st.session_state.gemini_messages.append({
+            "role": "assistant", 
+            "content": response_content,
+            "usage_metadata": response_dict.get('usage_metadata', {})
+        })
+        # Save the chat exchange to Firestore history
+        if FIRESTORE_AVAILABLE:
+            try:
+                chat_params = {
+                    'model': model_name,
+                    'temperature': temperature,
+                    'enable_grounding': enable_grounding,
+                    'system_instructions': system_instructions,
+                    'response': response_content # Store the full response object
+                }
+                chat_params['latency_seconds'] = response_dict.get('latency_seconds', 0)
+                db.collection('history').add({
+                    'user_id': st.session_state.user_id,
+                    'timestamp': firestore.SERVER_TIMESTAMP,
+                    'type': 'chat',
+                    'uri': response_content.get('text', ''), # Record the text output as the 'uri'
+                    'prompt': prompt_for_api,
+                    'params': chat_params,
+                    'usage_metadata': response_dict.get('usage_metadata', {}),
+                    'favorite': False
+                })
+                logger.info("Saved Gemini chat exchange to Firestore history.")
+            except Exception as e:
+                logger.error(f"Failed to save chat history to Firestore: {e}")
+
+def third_party_chat_tab():
+    """A tab for chatting with third-party models on Vertex AI."""
+    st.header("Chat with 3P Models (Vertex AI)")
+
+    # Model selection
+    model_name = st.selectbox(
+        "Select 3P Model",
+        options=["claude-sonnet-4-6", "claude-opus-4-6", "claude-opus-4-5","claude-sonnet-4-5", "claude-haiku-4-5"], # Add other models as needed
+        key="third_party_chat_model",
+        help="Choose a third-party model available on Vertex AI."
+    )
+
+    # System instructions input
+    system_instructions = st.text_area(
+        "System Instructions (Optional)",
+        placeholder="e.g., You are a helpful assistant that speaks like a pirate.",
+        help="Provide instructions to guide the model's behavior and personality.",
+        key="third_party_system_instructions"
+    )
+
+    # Advanced settings for temperature and max tokens
+    with st.expander("Advanced Settings"):
+        temperature = st.slider(
+            "Temperature",
+            min_value=0.0,
+            max_value=2.0,
+            value=1.0,
+            step=0.1,
+            help="Controls the randomness of the output. Lower values are more deterministic, higher values are more creative."
+        )
+        max_tokens = st.slider(
+            "Max Output Tokens",
+            min_value=128,
+            max_value=4096, # Claude models can go higher, but keep reasonable for UI
+            value=1024,
+            step=128,
+            help="Maximum number of tokens the model should generate in its response."
+        )
+
+    # Initialize chat history for 3P models
+    if "third_party_messages" not in st.session_state:
+        st.session_state.third_party_messages = []
+
+    # Display chat messages from history
+    for message in st.session_state.third_party_messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"]["text"])
+
+    # --- Clear Chat Button ---
+    _, button_col = st.columns([4, 1])
+    with button_col:
+        if st.button("🗑️ Clear Chat", key="clear_third_party_chat_bottom", help="Clear chat history."):
+            st.session_state.third_party_messages = []
+            st.rerun()
+
+    # React to user input
+    if prompt_text := st.chat_input("What would you like to ask the 3P model?"):
+        # Add user message to chat history
+        st.session_state.third_party_messages.append({
+            "role": "user",
+            "content": {"text": prompt_text, "citations": []}
+        })
+
+        # Display assistant response in chat message container
+        with st.chat_message("assistant"):
+            message_placeholder = st.empty()
+            response_content = {"text": "", "citations": []}
+            response_dict = {}
+
+            with st.spinner(f"3P model ({model_name}) is thinking..."):
+                try:
+                    response_dict = third_party_helper.generate_third_party_chat_response(
+                        model_id=model_name,
+                        prompt=prompt_text,
+                        system_instructions=system_instructions,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        project_id=st.session_state.get("project_id", config.PROJECT_ID)
+                    )
+                    response_content["text"] = response_dict.get("text", "No response text found.")
+                    response_content["citations"] = response_dict.get("citations", []) # Will be empty for now
+                except Exception as e:
+                    response_content["text"] = f"An error occurred: {e}"
+                    st.error(response_content["text"])
+
+            message_placeholder.markdown(response_content["text"])
+
+        # Add assistant response to chat history
+        st.session_state.third_party_messages.append({
+            "role": "assistant",
+            "content": response_content,
+            "usage_metadata": response_dict.get('usage_metadata', {})
+        })
+
+        # Save the chat exchange to Firestore history
+        if FIRESTORE_AVAILABLE:
+            try:
+                chat_params = {
+                    'model': model_name,
+                    'temperature': temperature,
+                    'system_instructions': system_instructions,
+                    'max_output_tokens': max_tokens,
+                    'response': response_content # Store the full response object
+                }
+                chat_params['latency_seconds'] = response_dict.get('latency_seconds', 0)
+                db.collection('history').add({
+                    'user_id': st.session_state.user_id,
+                    'timestamp': firestore.SERVER_TIMESTAMP,
+                    'type': '3p_chat', # New type for 3P chat
+                    'uri': response_content.get('text', ''), # Record the text output as the 'uri'
+                    'prompt': prompt_text,
+                    'params': chat_params,
+                    'usage_metadata': response_dict.get('usage_metadata', {}),
+                    'favorite': False
+                })
+                logger.info("Saved 3P chat exchange to Firestore history.")
+            except Exception as e:
+                logger.error(f"Failed to save 3P chat history to Firestore: {e}")
 
 def text_to_image_tab():
     """Text-to-Image generation tab."""
@@ -2461,58 +2620,19 @@ def text_to_image_tab():
             storage_uri=st.session_state.get("storage_uri", config.STORAGE_URI),
         )
 
-def image_editing_tab():
-    """Image editing tab."""
-    st.header("Image Editing with Gemini")
-    
-    # This callback is triggered when the file_uploader's value changes.
-    # It syncs the widget's state to our application's state variable.
-    def _sync_edit_image_files():
-        st.session_state.edit_image_files = st.session_state.get("edit_image_uploader", [])
-    
-    st.file_uploader(
-        "Upload images to edit (or load from history)",
-        type=["jpg", "jpeg", "png", "webp"],
-        key="edit_image_uploader",
-        accept_multiple_files=True,
-        on_change=_sync_edit_image_files,
-    )
+def nano_banana_tab():
+    """Image generation and editing tab with a chat-like interface, using Gemini models."""
+    st.header("Chat with Nano Banana")
+    st.info("Generate or edit images in a conversational way. Upload images to include them in your prompt.")
 
-    # The primary source of truth for images to be edited.
-    input_image_files = st.session_state.get('edit_image_files', [])
-
-    # Display uploaded images
-    if input_image_files:
-        # Convert all file-like objects to PIL Images for display
-        # This handles both Streamlit's UploadedFile and our SimulatedUploadFile
-        try:
-            images_to_display = [Image.open(f) for f in input_image_files]
-            # Create a list of captions from the filenames
-            captions = [f.name for f in input_image_files]
-            st.image(images_to_display, caption=captions, width=128)
-            
-            def _clear_edit_images_callback():
-                st.session_state.edit_image_files = []
-            st.button("🗑️ Clear Loaded Images", key="clear_edit_images", on_click=_clear_edit_images_callback)
-
-        except Exception as e:
-            st.error(f"Could not display one of the loaded images: {e}")
-
-    prompt = st.text_area(
-        "Prompt",
-        value="Make the lion's mane glow brighter and change the sky to a deep purple.",
-        height=100,
-        help="Describe the edits you want to make.",
-        key="i2i_prompt"
-    )
-
+    # --- Settings ---
     col1, col2 = st.columns(2)
     with col1:
         model = st.selectbox(
             "Model",
-            options=["gemini-2.5-flash-image"],
+            options=["gemini-2.5-flash-image", "gemini-3-pro-image-preview", "gemini-3.1-flash-image-preview"],
             index=0,
-            help="Choose the model for editing.",
+            help="Choose the Gemini model for image generation/editing.",
             key="i2i_model"
         )
     with col2:
@@ -2520,50 +2640,146 @@ def image_editing_tab():
             "Aspect Ratio",
             options=["1:1", "3:2", "2:3", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"],
             index=0,
-            help="Choose the aspect ratio of the edited image.",
+            help="Choose the aspect ratio of the generated image.",
             key="i2i_aspect_ratio"
         )
-
-
-
-    enhance_prompt = st.checkbox(
-        "Enhance Prompt",
-        value=True,
-        help="Use Gemini to enhance your prompt.",
-        key="i2i_enhance_prompt"
+    
+    # System instructions input, similar to the Gemini chat tab
+    system_instructions = st.text_area(
+        "System Instructions (Optional)",
+        placeholder="e.g., You are an expert photo editor. All images you generate should have a vintage film look.",
+        help="Provide instructions to guide the model's behavior and style for all subsequent generations in this chat.",
+        key="nano_banana_system_instructions"
     )
 
-    if st.button("🎨 Edit Image", key="i2i_generate", type="primary"):
-        
-        if not input_image_files:
-            st.error("Please upload an input image to edit.")
-            return
+    # Advanced settings for temperature and top_p
+    with st.expander("Advanced Settings"):
+        temperature = st.slider(
+            "Temperature",
+            min_value=0.0, max_value=2.0, value=1.0, step=0.1,
+            help="Controls the randomness of the output. Lower values are more deterministic."
+        )
+        top_p = st.slider(
+            "Top-P",
+            min_value=0.0, max_value=1.0, value=0.95, step=0.05,
+            help="Nucleus sampling parameter. The model considers the results of the tokens with Top-P probability mass."
+        )
 
-       
-        input_image_paths = []
-        try:
-            
-            for uploaded_file in input_image_files:
-                with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(uploaded_file.name)[1]) as tmp_in:
-                    tmp_in.write(uploaded_file.getvalue())
-                    input_image_paths.append(tmp_in.name)
+    # --- Display Chat History ---
+    for message in st.session_state.nano_banana_messages:
+        with st.chat_message(message["role"]):
+            # Display user message (text and uploaded images)
+            if message["role"] == "user":
+                st.markdown(message["content"]["text"])
+                if message["content"].get("images"):
+                    # Handle both uploaded files and base64 strings for display
+                    images_to_display = []
+                    for img in message["content"]["images"]:
+                        if hasattr(img, 'getvalue'): # Streamlit UploadedFile
+                            images_to_display.append(img.getvalue())
+                        else: # Assumes it's a base64 string
+                            images_to_display.append(base64.b64decode(img))
+                    st.image(images_to_display, width=100)
+            # Display assistant message (generated images)
+            elif message["role"] == "assistant":
+                # The content from the model can have text and images
+                display_assistant_message(message["content"])
 
-            edit_image(
-                project_id=st.session_state.get("project_id", config.PROJECT_ID),
-                prompt=prompt,
-                model=model,
-                aspect_ratio=aspect_ratio,
-                seed=None,
-                person_generation="Don't Allow",
-                safety_filter_level="OFF",
-                enhance_prompt=enhance_prompt,
-                storage_uri=st.session_state.get("storage_uri", config.STORAGE_URI),
-                input_image_paths=input_image_paths,
-            )
-        finally:
-            # Clean up temporary files
-            for path in input_image_paths:
-                os.unlink(path)
+    # --- Chat Input Area ---
+    # File uploader for input images
+    uploaded_files = st.file_uploader(
+        "Upload images to include in your prompt",
+        type=["jpg", "jpeg", "png", "webp"],
+        accept_multiple_files=True,
+        key="nano_banana_uploader"
+    )
+    
+    # --- Clear Chat Button (moved to the bottom) ---
+    # Use columns to align the button to the right for a cleaner look.
+    _, button_col = st.columns([4, 1])
+    with button_col:
+        if st.button("🗑️ Clear Chat", key="clear_nano_banana_chat", help="Clear the Nano Banana chat history."):
+            # Clear the chat message history
+            st.session_state.nano_banana_messages = []
+            # Rerun the app to reflect the changes immediately
+            st.rerun()
+
+    # User text prompt
+    if prompt_text := st.chat_input("Describe the image you want to create or edit..."):
+        # Convert uploaded files to base64 to store in session state, making it serializable
+        # and consistent with how the API will return images.
+        uploaded_images_b64 = []
+        if uploaded_files:
+            for uploaded_file in uploaded_files:
+                uploaded_images_b64.append(base64.b64encode(uploaded_file.getvalue()).decode('utf-8'))
+
+        # 1. Add user message to chat history
+        user_message = {
+            "role": "user",
+            "content": {"text": prompt_text, "images": uploaded_images_b64}
+        }
+        st.session_state.nano_banana_messages.append(user_message)
+
+        # Rerun immediately to display the user's message and then trigger the API call.
+        st.rerun()
+
+    # This block runs on the rerun, after the user message is in the history.
+    # We check if the last message was from the user to prevent re-generating on every app interaction.
+    if st.session_state.nano_banana_messages and st.session_state.nano_banana_messages[-1]["role"] == "user":
+        with st.chat_message("assistant"):
+            with st.spinner("Nano Banana is thinking..."):
+                start_time = time.time() # Start timer
+                try:
+                    # Pass the new parameters to the API call
+                    response = client.generate_image_gemini_image_preview(
+                        chat_history=st.session_state.nano_banana_messages,
+                        system_instructions=system_instructions,
+                        model=model,
+                        aspectRatio=aspect_ratio,
+                        temperature=temperature,
+                        top_p=top_p,
+                        storage_uri=st.session_state.get("storage_uri", config.STORAGE_URI),
+                    )
+                    latency = round(time.time() - start_time, 2) # Calculate latency
+                    assistant_content = response.get("content", {"text": "Sorry, I couldn't generate a response."})
+
+                    if assistant_content:
+                        display_assistant_message(assistant_content)
+                        # Add assistant response to history
+                        st.session_state.nano_banana_messages.append({
+                            "role": "assistant",
+                            "content": assistant_content,
+                            "usage_metadata": response.get('usageMetadata', {})
+                        })
+
+                        # Save to global Firestore history
+                        if FIRESTORE_AVAILABLE and assistant_content.get("image_uris"):
+                            last_prompt = st.session_state.nano_banana_messages[-2]['content']['text']
+                            params = {
+                                "prompt": last_prompt, 
+                                "model": model, 
+                                "aspectRatio": aspect_ratio,
+                                "latency_seconds": latency # Store latency
+                            }
+                            for uri in assistant_content["image_uris"]:
+                                db.collection('history').document().set({
+                                    'timestamp': firestore.SERVER_TIMESTAMP,
+                                    'type': 'image',
+                                    'uri': uri,
+                                    'user_id': st.session_state.user_id,
+                                    'favorite': False,
+                                    'usage_metadata': response.get('usageMetadata', {}),
+                                    'prompt': f"Generated/Edited with prompt: {last_prompt}",
+                                    'params': params
+                                })
+                    else:
+                        st.error("Generation failed. Please check the logs or try a different prompt.")
+                except Exception as e:
+                    latency = round(time.time() - start_time, 2) # Also record latency on error
+                    st.error(f"An error occurred: {e}")
+                finally:
+                    # Rerun one last time to finalize the state and clear the input widgets.
+                    st.rerun()
 
 def text_to_video_tab():
     """Text-to-Video generation tab."""
@@ -2941,6 +3157,7 @@ def text_to_voiceover_tab():
     # --- Run Button ---
     if st.button("▶️ Run", type="primary", use_container_width=True):
         try:
+            start_time = time.time()
             # Collect the style instructions
             full_script = style_instructions + "\n"
             
@@ -2962,6 +3179,10 @@ def text_to_voiceover_tab():
                 import apis.gemini_TTS_api as gemini_TTS_api
                 file_paths = gemini_TTS_api.generate_voiceover(full_script, voiceover_model)
                 if file_paths:
+                    end_time = time.time()
+                    latency = round(end_time - start_time, 2)
+                    st.info(f"Voiceover generation completed in {latency} seconds.")
+
                     st.success("Voiceover generated successfully!")
                     print(f"File saved to to: {file_paths}")
                     # Play each audio file
@@ -2978,6 +3199,7 @@ def text_to_voiceover_tab():
                                 'mode': st.session_state.voiceover_mode,
                                 'style_instructions': style_instructions
                             }
+                            voice_params['latency_seconds'] = latency
                             for uri in uploaded_uris:
                                 try:
                                     doc_ref = db.collection('history').document()
@@ -2987,7 +3209,8 @@ def text_to_voiceover_tab():
                                         'type': 'voice',
                                         'uri': uri,
                                         'prompt': full_script, # The full script used for generation
-                                        'params': voice_params
+                                        'params': voice_params,
+                                        'usage_metadata': chunk.usage_metadata.to_dict() if chunk.usage_metadata else {}
                                     })
                                     logger.debug(f"Added voice {uri} to Firestore history.")
                                 except Exception as e:
@@ -4426,15 +4649,35 @@ def display_all_history(history_data):
     else:
         if view_mode == "Table":
             display_df = filtered_history.copy()
+            # Safely extract token counts, handling missing 'usage_metadata' column
+            if 'usage_metadata' in display_df.columns:
+                display_df['input_text_tokens'] = display_df['usage_metadata'].apply(lambda x: x.get('promptTokenCount', 0) if isinstance(x, dict) else 0)
+                display_df['input_image_tokens'] = display_df['usage_metadata'].apply(lambda x: x.get('inputImageTokenCount', 0) if isinstance(x, dict) else 0)
+                display_df['output_tokens'] = display_df['usage_metadata'].apply(lambda x: x.get('candidatesTokenCount', 0) if isinstance(x, dict) else 0)
+                display_df['thinking_tokens'] = display_df['usage_metadata'].apply(lambda x: x.get('totalTokenCount', 0) - x.get('promptTokenCount', 0) - x.get('candidatesTokenCount', 0) if isinstance(x, dict) else 0)
+                display_df['total_tokens'] = display_df['usage_metadata'].apply(lambda x: x.get('totalTokenCount', 0) if isinstance(x, dict) else 0)
+            else:
+                # If the column doesn't exist, create them with default 0 values
+                for col in ['input_text_tokens', 'input_image_tokens', 'output_tokens', 'thinking_tokens', 'total_tokens']:
+                    display_df[col] = 0
+            
             display_df['timestamp'] = pd.to_datetime(display_df['timestamp']).dt.strftime("%Y-%m-%d %H:%M:%S")
-            display_df = display_df.rename(columns={'timestamp': 'Generated', 'type': 'Type', 'uri': 'URI', 'prompt': 'Prompt'})
-            if 'params' in display_df.columns:
-                display_df = display_df.drop(columns=['params'])
+            # Extract model from params
+            display_df['Model'] = display_df['params'].apply(lambda p: _parse_history_params(p).get('model', 'N/A'))
+            display_df['Latency (s)'] = display_df['params'].apply(lambda p: _parse_history_params(p).get('latency_seconds', 0))
+
+            display_df = display_df.rename(columns={'timestamp': 'Generated', 'type': 'Type', 'uri': 'Response', 'prompt': 'Prompt', 'Model': 'Model', 'input_text_tokens': 'Input Tokens (Text)', 'input_image_tokens': 'Input Tokens (Image)', 'output_tokens': 'Output Tokens', 'thinking_tokens': 'Thinking Tokens', 'total_tokens': 'Total Tokens'})
+            
+            # Select and reorder columns for display
+            columns_to_show = ['Generated', 'Type', 'Model', 'Latency (s)', 'Prompt', 'Response', 'Input Tokens (Text)', 'Input Tokens (Image)', 'Output Tokens', 'Thinking Tokens', 'Total Tokens']
+            display_df = display_df[columns_to_show]
+
             display_df['Prompt'] = display_df['Prompt'].apply(lambda x: x[:50] + "..." if isinstance(x, str) and len(x) > 50 else x)
+            display_df['Response'] = display_df['Response'].apply(lambda x: x[:50] + "..." if isinstance(x, str) and len(x) > 50 else x)
             st.dataframe(display_df, use_container_width=True, column_config={
                 "Generated": st.column_config.DatetimeColumn("Generated", help="When this item was created", format="MMM DD, YYYY, hh:mm a", width="medium"),
                 "Type": st.column_config.TextColumn("Type", help="Item type (video or image)", width="small"),
-                "URI": st.column_config.TextColumn("URI", help="Google Cloud Storage URI", width="large"),
+                "Response": st.column_config.TextColumn("Response", help="GCS URI for media or text response for chat", width="large"),
                 "Prompt": st.column_config.TextColumn("Prompt", help="Prompt used for generation", width="large")
             })
         else:
@@ -4960,6 +5203,7 @@ def generate_video(
     with st.spinner("🎬 Generating your video... This may take several minutes"):
         try:
             # Initialize the Veo2 API client
+            start_time = time.time()
             client = Veo2API(project_id)
             
             # Prepare image if provided
@@ -5038,8 +5282,6 @@ def generate_video(
                     response = client.poll_operation(operation_id)
                     
                     if response.get("done", False):
-                        progress_bar.progress(1.0)
-                        status_text.text("Video generation complete!")
                         break
                     
                     if attempt < max_attempts - 1:
@@ -5052,15 +5294,20 @@ def generate_video(
                 
                 result = response
                 
+                end_time = time.time()
+                latency = round(end_time - start_time, 2)
+                params['latency_seconds'] = latency
                 # Check if there's an error in the response
-                if "error" in result:
+                if result.get("error"):
                     error_msg = result.get("error", {}).get("message", "Unknown error")
+                    status_text.error(f"Video generation failed.")
                     st.error(f"⚠️ Video generation failed: {error_msg}")
                     if show_full_response:
                         with st.expander("Error details"):
                             st.json(result)
                     return
                 
+                progress_bar.progress(1.0)
                 # Display the results
                 st.success("✅ Video generation complete!")
                 
@@ -5100,6 +5347,12 @@ def generate_video(
                                         'user_id': st.session_state.user_id,
                                         'type': "video", 'uri': uri, 'prompt': prompt, 'params': params
                                     })
+                                # Add usage metadata if available
+                                if result and 'usageMetadata' in result:
+                                    db.collection('history').document(doc_ref.id).update({
+                                        'usage_metadata': result['usageMetadata']
+                                    })
+
                                 db.collection('history').document(doc_ref.id).update({'favorite': False})
                                 logger.info(f"Added video {uri} to Firestore history with favorite set to false.")
 
@@ -5146,6 +5399,7 @@ def generate_image(
 
     with st.spinner("🎨 Generating your image with Imagen..."):
         try:
+            start_time = time.time()
             client = Veo2API(project_id) # Reusing the client
 
             # Prepare image if provided
@@ -5170,6 +5424,10 @@ def generate_image(
                 storage_uri=storage_uri,
                 enhance_prompt=enhance_prompt
             )
+            
+            end_time = time.time()
+            latency = round(end_time - start_time, 2)
+            st.info(f"Image generation completed in {latency} seconds.")
 
             if "error" in response:
                 error_msg = response.get("error", {}).get("message", "Unknown error")
@@ -5211,11 +5469,13 @@ def generate_image(
                     "sampleCount": sample_count, "aspectRatio": aspect_ratio, "seed": seed if seed else "random",
                     "person_generation": person_generation, "safetyFilterThreshold": safety_filter_level,
                 }
+                params['latency_seconds'] = latency
                 for uri in image_uris:
                     db.collection('history').document().set({
                         'timestamp': firestore.SERVER_TIMESTAMP, 'type': 'image', 'uri': uri,
                         'user_id': st.session_state.user_id,
-                        'favorite': False,
+                        'favorite': False, 
+                        'usage_metadata': response.get('usageMetadata', {}),
                         'prompt': prompt, 'params': params
                     })
 
@@ -5244,6 +5504,7 @@ def edit_image(
 
     with st.spinner("🎨 Generating your image with Gemini..."):
         try:
+            start_time = time.time()
             client = Veo2API(project_id)
 
             # Prepare a list of input images
@@ -5275,6 +5536,10 @@ def edit_image(
                 safety_threshold=safety_filter_level,
                 # Note: 'seed' and other unused parameters are ignored by the new function
             )
+
+            end_time = time.time()
+            latency = round(end_time - start_time, 2)
+            st.info(f"Image editing completed in {latency} seconds.")
 
             if "error" in response:
                 error_msg = response.get("error", {}).get("message", "Unknown error")
@@ -5312,11 +5577,13 @@ def edit_image(
                     "prompt": prompt, "model": model, "aspectRatio": aspect_ratio, "safetyFilterThreshold": safety_filter_level,
                     "input_images": [os.path.basename(p) for p in input_image_paths or []]
                 }
+                params['latency_seconds'] = latency
                 for uri in image_uris:
                     db.collection('history').document().set({
                         'timestamp': firestore.SERVER_TIMESTAMP, 'type': 'image', 'uri': uri,
                         'user_id': st.session_state.user_id,
-                        'favorite': False,
+                        'favorite': False, 
+                        'usage_metadata': response.get('usageMetadata', {}),
                         'prompt': f"Edited image with prompt: {prompt}", 'params': params
                     })
 
@@ -5823,6 +6090,7 @@ def generate_audio(
     # Placeholder spinner
     with st.spinner("🎵 Generating your audio... This may take a moment"):
         try:
+            start_time = time.time()
             # Prepare API parameters for history
             params = {
                 "prompt": prompt,
@@ -5839,6 +6107,10 @@ def generate_audio(
                 seed=seed,
                 storage_uri=storage_uri,
             )
+
+            end_time = time.time()
+            latency = round(end_time - start_time, 2)
+            st.info(f"Audio generation completed in {latency} seconds.")
 
             # --- NEW RESPONSE HANDLING LOGIC ---
             predictions = response.get("predictions", [])
@@ -5888,6 +6160,7 @@ def generate_audio(
             if audio_uris:
                 logger.info(f"Adding {len(audio_uris)} audio entries to Firestore history.")
                 for uri in audio_uris:
+                    params['latency_seconds'] = latency
                     try:
                         doc_ref = db.collection('history').document()
                         doc_ref.set({
@@ -5895,7 +6168,8 @@ def generate_audio(
                             'user_id': st.session_state.user_id,
                             'type': "audio",
                             'uri': uri,
-                            'favorite': False,
+                            'favorite': False, 
+                            'usage_metadata': response.get('usageMetadata', {}),
                             'prompt': prompt,
                             'params': params
                         })
@@ -6209,6 +6483,17 @@ def handle_history_action(operation: str, uris: List[str]):
         st.session_state.selected_history_items.clear()
         st.rerun()
 
+
+def display_assistant_message(content: dict):
+    """Displays the content of an assistant's message, which can include text and images."""
+    if not content:
+        return
+
+    if "text" in content and content["text"]:
+        st.markdown(content["text"])
+    
+    if "image_uris" in content and content["image_uris"]:
+        display_images(content["image_uris"])
 
 def display_history_actions():
     """Displays the action panel for selected history items."""

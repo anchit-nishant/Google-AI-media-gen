@@ -6,6 +6,7 @@ Provides functions to analyze images and generate optimized prompts for video ge
 import base64
 import io
 import sys
+import time
 from google import genai
 from google.genai import types
 
@@ -148,9 +149,29 @@ def generate_gemini_chat_response(model_name, prompt, uploaded_file=None, system
         str: The generated text response from the model.
     """
     try:
+        start_time = time.time()
         print(f"Starting chat generation with model: {model_name}")
         # Initialize Gemini client using the older method for compatibility
         client = init_gemini_client()
+
+        # Determine the correct location for the selected model
+        global_models = [
+            "gemini-3.1-pro-preview",
+            "gemini-3-flash-preview",
+            "gemini-3.1-flash-lite-preview"
+        ]
+
+        if model_name in global_models:
+            location = "global"
+        else:
+            location = config.GEMINI_LOCATION # Fallback to the default location
+
+        print(f"Initializing Gemini client for model '{model_name}' in location: '{location}'")
+        client = genai.Client(
+            vertexai=True,
+            project=config.GEMINI_PROJECT_ID,
+            location=location,
+        )
 
         # The modern library usage prefers a simple list of content parts.
         # The client library handles the conversion to the correct Part types.
@@ -224,7 +245,24 @@ def generate_gemini_chat_response(model_name, prompt, uploaded_file=None, system
 
         print(f"✅ Extracted text: \"{response_text[:100]}...\"")
         print(f"✅ Extracted {len(citations)} citations.")
-        return {"text": response_text.strip(), "citations": citations}
+              
+        usage_dict = {}
+        if response.usage_metadata:
+            usage_dict = {
+                'promptTokenCount': response.usage_metadata.prompt_token_count,
+                'candidatesTokenCount': response.usage_metadata.candidates_token_count,
+                'totalTokenCount': response.usage_metadata.total_token_count
+            }
+
+        latency = round(time.time() - start_time, 2)
+        print(f"✅ Gemini chat generation took {latency} seconds.")
+
+        return {
+            "text": response_text.strip(), 
+            "citations": citations,
+            "usage_metadata": usage_dict,
+            "latency_seconds": latency
+        }
 
     except Exception as e:
         error_msg = f"Failed to generate chat response: {str(e)}"
