@@ -72,12 +72,14 @@ def generate_third_party_chat_response(
         response_text = ""
         input_tokens = 0
         output_tokens = 0
+        raw_response_content = ""
 
         with requests.post(url, headers=headers, json=request_body, stream=True) as r:
             r.raise_for_status()
             for line in r.iter_lines():
                 if line:
                     decoded_line = line.decode('utf-8')
+                    raw_response_content += decoded_line + "\n"
                     if decoded_line.startswith("data: "):
                         try:
                             event_data = json.loads(decoded_line[len("data: "):])
@@ -89,6 +91,10 @@ def generate_third_party_chat_response(
                                 output_tokens += event_data['usage'].get('output_tokens', 0)
                         except (json.JSONDecodeError, KeyError) as e:
                             print(f"Error parsing stream event: {e} in line: {decoded_line}", file=sys.stderr)
+
+        print("--- 3P Model Raw Response ---")
+        print(raw_response_content)
+        print("-----------------------------")
 
         usage_metadata = {
             'promptTokenCount': input_tokens,

@@ -805,6 +805,10 @@ def init_state():
     if "third_party_messages" not in st.session_state:
         st.session_state.third_party_messages = []
 
+    # State for the new Nano Banana (Image Editing) Chat tab
+    if "nano_banana_messages" not in st.session_state:
+        st.session_state.nano_banana_messages = []
+
     # State for resetting the Gemini chat file uploader
     if "gemini_uploader_key_counter" not in st.session_state:
         logger.debug("Initializing 'gemini_uploader_key_counter' in session state")
@@ -1994,8 +1998,8 @@ def image_tab():
     """Main tab for all image-related operations."""
     # Define the image sub-tabs and their corresponding functions
     sub_tabs = OrderedDict([
-        ("Text-to-Image", text_to_image_tab),
-        ("Image Editing", image_editing_tab),
+        ("Text-to-Image (Imagen)", text_to_image_tab),
+        ("Nano Banana (Gemini)", nano_banana_tab),
     ])
 
     # Use a radio button for controlled sub-navigation
@@ -2009,11 +2013,11 @@ def image_tab():
 
     # Call the function for the active sub-tab
     active_sub_tab_func = sub_tabs.get(st.session_state.active_image_sub_tab)
-    if active_sub_tab_func:
-        active_sub_tab_func()
-    else:
+    if not active_sub_tab_func:
         # Fallback to the first tab
-        text_to_image_tab()
+        active_sub_tab_func = text_to_image_tab
+    
+    active_sub_tab_func()
 
 def audio_tab():
     """Main tab for all audio-related operations."""
@@ -2616,58 +2620,19 @@ def text_to_image_tab():
             storage_uri=st.session_state.get("storage_uri", config.STORAGE_URI),
         )
 
-def image_editing_tab():
-    """Image editing tab."""
-    st.header("Image Editing with Gemini")
-    
-    # This callback is triggered when the file_uploader's value changes.
-    # It syncs the widget's state to our application's state variable.
-    def _sync_edit_image_files():
-        st.session_state.edit_image_files = st.session_state.get("edit_image_uploader", [])
-    
-    st.file_uploader(
-        "Upload images to edit (or load from history)",
-        type=["jpg", "jpeg", "png", "webp"],
-        key="edit_image_uploader",
-        accept_multiple_files=True,
-        on_change=_sync_edit_image_files,
-    )
+def nano_banana_tab():
+    """Image generation and editing tab with a chat-like interface, using Gemini models."""
+    st.header("Chat with Nano Banana")
+    st.info("Generate or edit images in a conversational way. Upload images to include them in your prompt.")
 
-    # The primary source of truth for images to be edited.
-    input_image_files = st.session_state.get('edit_image_files', [])
-
-    # Display uploaded images
-    if input_image_files:
-        # Convert all file-like objects to PIL Images for display
-        # This handles both Streamlit's UploadedFile and our SimulatedUploadFile
-        try:
-            images_to_display = [Image.open(f) for f in input_image_files]
-            # Create a list of captions from the filenames
-            captions = [f.name for f in input_image_files]
-            st.image(images_to_display, caption=captions, width=128)
-            
-            def _clear_edit_images_callback():
-                st.session_state.edit_image_files = []
-            st.button("🗑️ Clear Loaded Images", key="clear_edit_images", on_click=_clear_edit_images_callback)
-
-        except Exception as e:
-            st.error(f"Could not display one of the loaded images: {e}")
-
-    prompt = st.text_area(
-        "Prompt",
-        value="Make the lion's mane glow brighter and change the sky to a deep purple.",
-        height=100,
-        help="Describe the edits you want to make.",
-        key="i2i_prompt"
-    )
-
+    # --- Settings ---
     col1, col2 = st.columns(2)
     with col1:
         model = st.selectbox(
             "Model",
             options=["gemini-2.5-flash-image", "gemini-3-pro-image-preview", "gemini-3.1-flash-image-preview"],
             index=0,
-            help="Choose the model for editing.",
+            help="Choose the Gemini model for image generation/editing.",
             key="i2i_model"
         )
     with col2:
@@ -2675,50 +2640,112 @@ def image_editing_tab():
             "Aspect Ratio",
             options=["1:1", "3:2", "2:3", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"],
             index=0,
-            help="Choose the aspect ratio of the edited image.",
+            help="Choose the aspect ratio of the generated image.",
             key="i2i_aspect_ratio"
         )
 
+    # --- Clear Chat Button ---
+    # Use columns to align the button to the right for a cleaner look.
+    _, button_col = st.columns([4, 1])
+    with button_col:
+        if st.button("🗑️ Clear Chat", key="clear_nano_banana_chat", help="Clear the Nano Banana chat history."):
+            # Clear the chat message history
+            st.session_state.nano_banana_messages = []
+            # Rerun the app to reflect the changes immediately
+            st.rerun()
+    # --- Display Chat History ---
+    for message in st.session_state.nano_banana_messages:
+        with st.chat_message(message["role"]):
+            # Display user message (text and uploaded images)
+            if message["role"] == "user":
+                st.markdown(message["content"]["text"])
+                if message["content"].get("images"):
+                    # Handle both uploaded files and base64 strings for display
+                    images_to_display = []
+                    for img in message["content"]["images"]:
+                        if hasattr(img, 'getvalue'): # Streamlit UploadedFile
+                            images_to_display.append(img.getvalue())
+                        else: # Assumes it's a base64 string
+                            images_to_display.append(base64.b64decode(img))
+                    st.image(images_to_display, width=100)
+            # Display assistant message (generated images)
+            elif message["role"] == "assistant":
+                # The content from the model can have text and images
+                display_assistant_message(message["content"])
 
-
-    enhance_prompt = st.checkbox(
-        "Enhance Prompt",
-        value=True,
-        help="Use Gemini to enhance your prompt.",
-        key="i2i_enhance_prompt"
+    # --- Chat Input Area ---
+    # File uploader for input images
+    uploaded_files = st.file_uploader(
+        "Upload images to include in your prompt",
+        type=["jpg", "jpeg", "png", "webp"],
+        accept_multiple_files=True,
+        key="nano_banana_uploader"
     )
 
-    if st.button("🎨 Edit Image", key="i2i_generate", type="primary"):
-        
-        if not input_image_files:
-            st.error("Please upload an input image to edit.")
-            return
+    # User text prompt
+    if prompt_text := st.chat_input("Describe the image you want to create or edit..."):
+        # Convert uploaded files to base64 to store in session state, making it serializable
+        # and consistent with how the API will return images.
+        uploaded_images_b64 = []
+        if uploaded_files:
+            for uploaded_file in uploaded_files:
+                uploaded_images_b64.append(base64.b64encode(uploaded_file.getvalue()).decode('utf-8'))
 
-       
-        input_image_paths = []
-        try:
-            
-            for uploaded_file in input_image_files:
-                with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(uploaded_file.name)[1]) as tmp_in:
-                    tmp_in.write(uploaded_file.getvalue())
-                    input_image_paths.append(tmp_in.name)
+        # 1. Add user message to chat history
+        user_message = {
+            "role": "user",
+            "content": {"text": prompt_text, "images": uploaded_images_b64}
+        }
+        st.session_state.nano_banana_messages.append(user_message)
 
-            edit_image(
-                project_id=st.session_state.get("project_id", config.PROJECT_ID),
-                prompt=prompt,
-                model=model,
-                aspect_ratio=aspect_ratio,
-                seed=None,
-                person_generation="Don't Allow",
-                safety_filter_level="OFF",
-                enhance_prompt=enhance_prompt,
-                storage_uri=st.session_state.get("storage_uri", config.STORAGE_URI),
-                input_image_paths=input_image_paths,
-            )
-        finally:
-            # Clean up temporary files
-            for path in input_image_paths:
-                os.unlink(path)
+        # Rerun immediately to display the user's message and then trigger the API call.
+        st.rerun()
+
+    # This block runs on the rerun, after the user message is in the history.
+    # We check if the last message was from the user to prevent re-generating on every app interaction.
+    if st.session_state.nano_banana_messages and st.session_state.nano_banana_messages[-1]["role"] == "user":
+        with st.chat_message("assistant"):
+            with st.spinner("Nano Banana is thinking..."):
+                try:
+                    response = client.generate_image_gemini_image_preview(
+                        chat_history=st.session_state.nano_banana_messages,
+                        model=model,
+                        aspectRatio=aspect_ratio,
+                        storage_uri=st.session_state.get("storage_uri", config.STORAGE_URI),
+                    )
+                    assistant_content = response.get("content", {"text": "Sorry, I couldn't generate a response."})
+
+                    if assistant_content:
+                        display_assistant_message(assistant_content)
+                        # Add assistant response to history
+                        st.session_state.nano_banana_messages.append({
+                            "role": "assistant",
+                            "content": assistant_content,
+                            "usage_metadata": response.get('usageMetadata', {})
+                        })
+
+                        # Save to global Firestore history
+                        if FIRESTORE_AVAILABLE and assistant_content.get("image_uris"):
+                            last_prompt = st.session_state.nano_banana_messages[-2]['content']['text']
+                            params = {"prompt": last_prompt, "model": model, "aspectRatio": aspect_ratio}
+                            for uri in assistant_content["image_uris"]:
+                                db.collection('history').document().set({
+                                    'timestamp': firestore.SERVER_TIMESTAMP,
+                                    'type': 'image',
+                                    'uri': uri,
+                                    'user_id': st.session_state.user_id,
+                                    'favorite': False,
+                                    'usage_metadata': response.get('usageMetadata', {}),
+                                    'prompt': f"Generated/Edited with prompt: {last_prompt}",
+                                    'params': params
+                                })
+                    else:
+                        st.error("Generation failed. Please check the logs or try a different prompt.")
+                except Exception as e:
+                    st.error(f"An error occurred: {e}")
+                finally:
+                    # Rerun one last time to finalize the state and clear the input widgets.
+                    st.rerun()
 
 def text_to_video_tab():
     """Text-to-Video generation tab."""
@@ -6422,6 +6449,17 @@ def handle_history_action(operation: str, uris: List[str]):
         st.session_state.selected_history_items.clear()
         st.rerun()
 
+
+def display_assistant_message(content: dict):
+    """Displays the content of an assistant's message, which can include text and images."""
+    if not content:
+        return
+
+    if "text" in content and content["text"]:
+        st.markdown(content["text"])
+    
+    if "image_uris" in content and content["image_uris"]:
+        display_images(content["image_uris"])
 
 def display_history_actions():
     """Displays the action panel for selected history items."""
