@@ -1272,6 +1272,7 @@ class Veo2API:
 def generate_image_gemini_image_preview(
     self,
     chat_history: List[Dict[str, Any]],
+    system_instructions: Optional[str],
     aspectRatio: str, # Keep camelCase for consistency
     model: str = "gemini-2.5-flash-image",
     temperature: float = 1.0,
@@ -1285,6 +1286,7 @@ def generate_image_gemini_image_preview(
 
     Args:
         chat_history: A list of message dictionaries, each with 'role' and 'content'.
+        system_instructions: Optional system-level instructions for the model.
                       The 'content' dict can contain 'text' and a list of 'images' (base64).
         aspectRatio: The desired aspect ratio for the generated image.
         model: The Gemini model ID to use.
@@ -1300,6 +1302,10 @@ def generate_image_gemini_image_preview(
     """
     # 1. Construct the 'contents' payload from the chat history
     contents = []
+    # Prepend system instructions if they exist
+    if system_instructions:
+        contents.append({"role": "user", "parts": [{"text": system_instructions}]})
+        contents.append({"role": "model", "parts": [{"text": "Okay, I understand. I will follow these instructions for all image generations in this conversation."}]})
     for message in chat_history:
         role = message["role"]
         content = message["content"]
@@ -1373,8 +1379,6 @@ def generate_image_gemini_image_preview(
     print(json.dumps(loggable_body, indent=2))
     print("--------------------------------------")
 
-    response = requests.post(url, headers=headers, json=request_body)
-    response.raise_for_status()
     start_time = time.time()
     try:
         response = requests.post(url, headers=headers, json=request_body)
@@ -1452,7 +1456,6 @@ def generate_image_gemini_image_preview(
             "text": assistant_text_response.strip(),
             "image_uris": image_uris
         },
-        "usageMetadata": usage_metadata
         "usageMetadata": usage_metadata,
         "latency_seconds": latency # Return latency in the response
     }

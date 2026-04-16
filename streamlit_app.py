@@ -2643,16 +2643,28 @@ def nano_banana_tab():
             help="Choose the aspect ratio of the generated image.",
             key="i2i_aspect_ratio"
         )
+    
+    # System instructions input, similar to the Gemini chat tab
+    system_instructions = st.text_area(
+        "System Instructions (Optional)",
+        placeholder="e.g., You are an expert photo editor. All images you generate should have a vintage film look.",
+        help="Provide instructions to guide the model's behavior and style for all subsequent generations in this chat.",
+        key="nano_banana_system_instructions"
+    )
 
-    # --- Clear Chat Button ---
-    # Use columns to align the button to the right for a cleaner look.
-    _, button_col = st.columns([4, 1])
-    with button_col:
-        if st.button("🗑️ Clear Chat", key="clear_nano_banana_chat", help="Clear the Nano Banana chat history."):
-            # Clear the chat message history
-            st.session_state.nano_banana_messages = []
-            # Rerun the app to reflect the changes immediately
-            st.rerun()
+    # Advanced settings for temperature and top_p
+    with st.expander("Advanced Settings"):
+        temperature = st.slider(
+            "Temperature",
+            min_value=0.0, max_value=2.0, value=1.0, step=0.1,
+            help="Controls the randomness of the output. Lower values are more deterministic."
+        )
+        top_p = st.slider(
+            "Top-P",
+            min_value=0.0, max_value=1.0, value=0.95, step=0.05,
+            help="Nucleus sampling parameter. The model considers the results of the tokens with Top-P probability mass."
+        )
+
     # --- Display Chat History ---
     for message in st.session_state.nano_banana_messages:
         with st.chat_message(message["role"]):
@@ -2681,6 +2693,16 @@ def nano_banana_tab():
         accept_multiple_files=True,
         key="nano_banana_uploader"
     )
+    
+    # --- Clear Chat Button (moved to the bottom) ---
+    # Use columns to align the button to the right for a cleaner look.
+    _, button_col = st.columns([4, 1])
+    with button_col:
+        if st.button("🗑️ Clear Chat", key="clear_nano_banana_chat", help="Clear the Nano Banana chat history."):
+            # Clear the chat message history
+            st.session_state.nano_banana_messages = []
+            # Rerun the app to reflect the changes immediately
+            st.rerun()
 
     # User text prompt
     if prompt_text := st.chat_input("Describe the image you want to create or edit..."):
@@ -2706,13 +2728,19 @@ def nano_banana_tab():
     if st.session_state.nano_banana_messages and st.session_state.nano_banana_messages[-1]["role"] == "user":
         with st.chat_message("assistant"):
             with st.spinner("Nano Banana is thinking..."):
+                start_time = time.time() # Start timer
                 try:
+                    # Pass the new parameters to the API call
                     response = client.generate_image_gemini_image_preview(
                         chat_history=st.session_state.nano_banana_messages,
+                        system_instructions=system_instructions,
                         model=model,
                         aspectRatio=aspect_ratio,
+                        temperature=temperature,
+                        top_p=top_p,
                         storage_uri=st.session_state.get("storage_uri", config.STORAGE_URI),
                     )
+                    latency = round(time.time() - start_time, 2) # Calculate latency
                     assistant_content = response.get("content", {"text": "Sorry, I couldn't generate a response."})
 
                     if assistant_content:
@@ -2727,7 +2755,12 @@ def nano_banana_tab():
                         # Save to global Firestore history
                         if FIRESTORE_AVAILABLE and assistant_content.get("image_uris"):
                             last_prompt = st.session_state.nano_banana_messages[-2]['content']['text']
-                            params = {"prompt": last_prompt, "model": model, "aspectRatio": aspect_ratio}
+                            params = {
+                                "prompt": last_prompt, 
+                                "model": model, 
+                                "aspectRatio": aspect_ratio,
+                                "latency_seconds": latency # Store latency
+                            }
                             for uri in assistant_content["image_uris"]:
                                 db.collection('history').document().set({
                                     'timestamp': firestore.SERVER_TIMESTAMP,
@@ -2742,6 +2775,7 @@ def nano_banana_tab():
                     else:
                         st.error("Generation failed. Please check the logs or try a different prompt.")
                 except Exception as e:
+                    latency = round(time.time() - start_time, 2) # Also record latency on error
                     st.error(f"An error occurred: {e}")
                 finally:
                     # Rerun one last time to finalize the state and clear the input widgets.
