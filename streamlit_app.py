@@ -14,6 +14,7 @@ import base64
 import sys
 import hashlib
 import pandas as pd
+import re
 import subprocess
 from datetime import datetime
 from PIL import Image
@@ -40,6 +41,7 @@ import config.config as config
 import apis.gemini_helper as gemini_helper
 import apis.third_party_helper as third_party_helper
 import app as dubbing_lib
+import apis.deck_generator as deck_generator
 import apis.history_manager as history_manager
 from apis.veo2_api import Veo2API
 
@@ -1330,6 +1332,7 @@ def main():
         ("🎨 Image", image_tab),
         ("🎵 Audio", audio_tab),
         ("♊ Gemini", gemini_chat_tab),
+        ("📊 Deck", deck_tab), # "Deck" in Japanese for a unique touch
         ("💬 3P Chat", third_party_chat_tab), # New tab for 3rd party models
         ("📁 Projects", projects_tab),
         ("📋 History", history_tab),
@@ -1358,6 +1361,142 @@ def main():
     # st.markdown('</div>', unsafe_allow_html=True)
     
     logger.end_section()
+
+def deck_tab():
+    """UI for generating a presentation deck."""
+    st.header("✨ AI Presentation Deck Generator")
+    st.info("Describe your presentation, and AI will create the outline, content, and images for you.")
+
+    main_prompt = st.text_area(
+        "What is the presentation about?",
+        placeholder="e.g., A 5-slide overview of the benefits of renewable energy.",
+        height=100,
+        key="deck_main_prompt"
+    )
+
+    style_prompt = st.text_input(
+        "Describe the visual style for the images",
+        placeholder="e.g., minimalist, futuristic, watercolor, photorealistic",
+        key="deck_style_prompt"
+    )
+
+    reference_images = st.file_uploader(
+        "Upload reference images for style (optional)",
+        type=["jpg", "jpeg", "png", "webp"],
+        accept_multiple_files=True,
+        key="deck_ref_images"
+    )
+
+    num_slides = st.slider(
+        "Number of Slides",
+        min_value=3,
+        max_value=10,
+        value=5,
+        key="deck_num_slides"
+    )
+
+    # Initialize session state for generated data
+    if 'deck_slides_data' not in st.session_state:
+        st.session_state.deck_slides_data = None
+
+    if st.button("Generate Deck", type="primary", disabled=not main_prompt):
+        with st.status("Generating your presentation...", expanded=True) as status:
+            try:
+                # 1. Generate slide outline
+                status.write("Step 1/3: Creating presentation outline with Gemini...")
+                outline = deck_generator.generate_slide_outline(client, main_prompt, num_slides)
+                if not outline:
+                    status.update(label="Failed to generate outline.", state="error")
+                    return
+                status.write(f"✅ Outline created for {len(outline)} slides.")
+
+                # 2. Generate images for each slide
+                status.write("Step 2/3: Generating images for each slide...")
+                ref_images_b64 = [base64.b64encode(f.getvalue()).decode('utf-8') for f in reference_images]
+                slides_with_images = []
+
+                for i, slide in enumerate(outline):
+                    st.write(f"  - Generating image for slide {i+1}: '{slide['title']}'")
+                    image_gcs_uri = deck_generator.generate_image_for_slide(client, slide, style_prompt, ref_images_b64, st.session_state.get("storage_uri", config.STORAGE_URI))
+                    if image_gcs_uri:
+                        # Store the GCS URI, not the signed URL, to allow for regeneration
+                        slides_with_images.append({**slide, "image_gcs_uri": image_gcs_uri})
+                    else:
+                        # Fallback if image generation fails
+                        slides_with_images.append({**slide, "image_gcs_uri": ""})
+                status.write("✅ All slide images generated.")
+
+                # 3. Assemble the HTML deck
+                status.write("Step 3/3: Assembling the final presentation...")
+                # Store the structured data, not the final HTML
+                st.session_state.deck_slides_data = slides_with_images
+                status.update(label="Presentation generated successfully!", state="complete")
+
+            except Exception as e:
+                status.update(label=f"An error occurred: {e}", state="error")
+
+    if st.session_state.deck_slides_data:
+        st.subheader("Your Deck is Ready!")
+
+        preview_col, settings_col = st.columns([3, 1])
+
+        with settings_col:
+            st.markdown("#### Deck Settings")
+            
+            # Theme selector
+            available_themes = ['black', 'white', 'league', 'sky', 'beige', 'simple', 'serif', 'solarized', 'blood', 'moon', 'night', 'dracula']
+            selected_theme = st.selectbox(
+                "Theme",
+                options=available_themes,
+                index=available_themes.index('black'), # Default to black
+                key="deck_theme"
+            )
+            
+            # Font selector
+            font_options = {
+                "Inter": {
+                    "family": "'Inter', sans-serif",
+                    "url": "https://fonts.googleapis.com/css2?family=Inter:wght@400;700&display=swap"
+                },
+                "Roboto": {
+                    "family": "'Roboto', sans-serif",
+                    "url": "https://fonts.googleapis.com/css2?family=Roboto:wght@400;700&display=swap"
+                },
+                "Lato": {
+                    "family": "'Lato', sans-serif",
+                    "url": "https://fonts.googleapis.com/css2?family=Lato:wght@400;700&display=swap"
+                },
+                "Merriweather": {
+                    "family": "'Merriweather', serif",
+                    "url": "https://fonts.googleapis.com/css2?family=Merriweather:wght@400;700&display=swap"
+                },
+                "Montserrat": {
+                    "family": "'Montserrat', sans-serif",
+                    "url": "https://fonts.googleapis.com/css2?family=Montserrat:wght@400;700&display=swap"
+                }
+            }
+            selected_font_name = st.selectbox("Font", options=list(font_options.keys()), key="deck_font")
+
+            # Background opacity slider
+            background_opacity = st.slider(
+                "Background Image Opacity",
+                min_value=0.0, max_value=1.0, value=0.3, step=0.05,
+                key="deck_bg_opacity"
+            )
+
+        # Re-assemble the deck HTML whenever a setting changes
+        slides_with_signed_urls = []
+        for slide in st.session_state.deck_slides_data:
+            signed_url = get_cached_signed_url(slide['image_gcs_uri']) if slide['image_gcs_uri'] else ""
+            slides_with_signed_urls.append({**slide, "image_url": signed_url})
+        
+        font_details = font_options[selected_font_name]
+        deck_html = deck_generator.assemble_revealjs_deck(slides_with_signed_urls, theme=selected_theme, background_opacity=background_opacity, font_family=font_details["family"], font_url=font_details["url"])
+
+        with preview_col:
+            st.components.v1.html(deck_html, height=600, scrolling=False)
+            st.download_button("Download Deck (deck.html)", deck_html, "deck.html", "text/html")
+
 
 @st.cache_data(ttl=600) # Cache for 10 minutes
 def get_all_history_from_firestore(limit=5000):
