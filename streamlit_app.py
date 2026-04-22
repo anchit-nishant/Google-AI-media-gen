@@ -14,6 +14,7 @@ import base64
 import sys
 import hashlib
 import pandas as pd
+import re
 import subprocess
 from datetime import datetime
 from PIL import Image
@@ -40,6 +41,7 @@ import config.config as config
 import apis.gemini_helper as gemini_helper
 import apis.third_party_helper as third_party_helper
 import app as dubbing_lib
+import apis.deck_generator as deck_generator
 import apis.history_manager as history_manager
 from apis.veo2_api import Veo2API
 
@@ -1330,6 +1332,7 @@ def main():
         ("🎨 Image", image_tab),
         ("🎵 Audio", audio_tab),
         ("♊ Gemini", gemini_chat_tab),
+        ("📊 Deck", deck_tab), # "Deck" in Japanese for a unique touch
         ("💬 3P Chat", third_party_chat_tab), # New tab for 3rd party models
         ("📁 Projects", projects_tab),
         ("📋 History", history_tab),
@@ -1358,6 +1361,221 @@ def main():
     # st.markdown('</div>', unsafe_allow_html=True)
     
     logger.end_section()
+
+def deck_tab():
+    """UI for generating a presentation deck."""
+    st.header("✨ AI Presentation Deck Generator")
+    st.info("Describe your presentation, and AI will create the outline, content, and images for you.")
+
+    main_prompt = st.text_area(
+        "What is the presentation about?",
+        placeholder="e.g., A 5-slide overview of the benefits of renewable energy.",
+        height=100,
+        key="deck_main_prompt"
+    )
+
+    style_prompt = st.text_input(
+        "Describe the visual style for the images",
+        placeholder="e.g., minimalist, futuristic, watercolor, photorealistic",
+        key="deck_style_prompt"
+    )
+
+    custom_system_instructions = st.text_area(
+        "Custom System Instructions (Optional)",
+        placeholder="e.g., Use a formal tone. Focus on financial data. Ensure all slides have a blue and gold color scheme.",
+        height=100,
+        key="deck_custom_instructions"
+    )
+
+    reference_images = st.file_uploader(
+        "Upload reference images for style (optional)",
+        type=["jpg", "jpeg", "png", "webp"],
+        accept_multiple_files=True,
+        key="deck_ref_images"
+    )
+
+    num_slides = st.slider(
+        "Number of Slides",
+        min_value=3,
+        max_value=10,
+        value=5,
+        key="deck_num_slides"
+    )
+
+    # Initialize session state for generated data
+    if 'deck_slides_data' not in st.session_state:
+        st.session_state.deck_slides_data = None
+
+    if st.button("Generate Deck", type="primary", disabled=not main_prompt):
+        with st.status("Generating your presentation...", expanded=True) as status:
+            start_time = time.time()
+            try:
+                # 1. Generate slide outline
+                status.write("Step 1/3: Creating presentation outline with Gemini...")
+                outline, outline_usage = deck_generator.generate_slide_outline(client, main_prompt, num_slides, custom_system_instructions)
+                if not outline:
+                    status.update(label="Failed to generate outline. Check logs for details.", state="error")
+                    return
+                status.write(f"✅ Outline created for {len(outline)} slides.")
+
+                # 2. Generate images for each slide
+                status.write("Step 2/3: Generating images for each slide...")
+                # Combine user-uploaded reference images with auto-fetched logos
+                user_ref_images_b64 = [base64.b64encode(f.getvalue()).decode('utf-8') for f in reference_images]
+                status.write("  - Searching for company logos in prompt...")
+                fetched_logos_b64 = deck_generator.find_and_fetch_logos(main_prompt)
+                all_reference_images_b64 = user_ref_images_b64 + fetched_logos_b64
+                status.write(f"  - Found {len(fetched_logos_b64)} potential logos. Total reference images: {len(all_reference_images_b64)}.")
+
+                slides_with_images = []
+                total_image_usage = {'promptTokenCount': 0, 'candidatesTokenCount': 0}
+
+                for i, slide in enumerate(outline): # outline is a list of dicts
+                    st.write(f"  - Generating image for slide {i+1}: '{slide['title']}'")
+                    image_gcs_uri, image_usage = deck_generator.generate_image_for_slide(client, slide, style_prompt, all_reference_images_b64, st.session_state.get("storage_uri", config.STORAGE_URI), custom_system_instructions)
+                    if image_usage:
+                        for key in total_image_usage:
+                            total_image_usage[key] += image_usage.get(key, 0)
+
+                    if image_gcs_uri:
+                        # Store the GCS URI, not the signed URL, to allow for regeneration
+                        slides_with_images.append({**slide, "image_gcs_uri": image_gcs_uri})
+                    else:
+                        # Fallback if image generation fails
+                        slides_with_images.append({**slide, "image_gcs_uri": ""})
+                status.write("✅ All slide images generated.")
+
+                # 3. Assemble the HTML deck
+                status.write("Step 3/3: Assembling the final presentation...")
+                # Store the structured data, not the final HTML
+                st.session_state.deck_slides_data = slides_with_images
+                
+                # --- Upload Deck to GCS ---
+                deck_gcs_uri = None
+                storage_uri = st.session_state.get("storage_uri", config.STORAGE_URI)
+                if storage_uri and storage_uri.startswith("gs://"):
+                    try:
+                        # Re-assemble the deck with default settings for saving
+                        slides_with_signed_urls_for_save = []
+                        for slide in slides_with_images:
+                            signed_url = get_cached_signed_url(slide['image_gcs_uri']) if slide['image_gcs_uri'] else ""
+                            slides_with_signed_urls_for_save.append({**slide, "image_url": signed_url})
+                        
+                        deck_html_content = deck_generator.assemble_revealjs_deck(slides_with_signed_urls_for_save)
+
+                        bucket_name = storage_uri.replace("gs://", "").split("/")[0]
+                        deck_filename = f"{secure_filename(main_prompt[:50])}_{uuid.uuid4().hex[:8]}.html"
+                        deck_blob_name = f"decks/{deck_filename}"
+                        
+                        storage_client = storage.Client()
+                        bucket = storage_client.bucket(bucket_name)
+                        blob = bucket.blob(deck_blob_name)
+                        blob.upload_from_string(deck_html_content, content_type='text/html')
+                        deck_gcs_uri = f"gs://{bucket_name}/{deck_blob_name}"
+                        logger.info(f"Successfully uploaded deck to {deck_gcs_uri}")
+                    except Exception as upload_error:
+                        logger.error(f"Failed to upload deck to GCS: {upload_error}")
+
+                # --- Add to History --- #
+                if FIRESTORE_AVAILABLE:
+                    latency = round(time.time() - start_time, 2)
+                    # Aggregate usage metadata
+                    total_usage = {
+                        'promptTokenCount': outline_usage.get('promptTokenCount', 0) + total_image_usage.get('promptTokenCount', 0),
+                        'candidatesTokenCount': outline_usage.get('candidatesTokenCount', 0) + total_image_usage.get('candidatesTokenCount', 0),
+                    }
+                    total_usage['totalTokenCount'] = total_usage['promptTokenCount'] + total_usage['candidatesTokenCount']
+
+                    deck_params = {
+                        'model': 'gemini-3.1-pro-preview', # For the outline
+                        'image_model': 'gemini-3-pro-image-preview', # For the images
+                        'num_slides': num_slides,
+                        'style_prompt': style_prompt,
+                        'latency_seconds': latency
+                    }
+                    
+                    db.collection('history').add({
+                        'user_id': st.session_state.user_id,
+                        'timestamp': firestore.SERVER_TIMESTAMP,
+                        'type': 'deck',
+                        # Store the GCS URI of the generated deck file
+                        'uri': deck_gcs_uri if deck_gcs_uri else f"Deck generated from prompt: '{main_prompt[:20]}...'",
+                        'prompt': main_prompt,
+                        'params': deck_params,
+                        'usage_metadata': total_usage,
+                        'favorite': False
+                    })
+                    logger.info("Saved deck generation record to Firestore history.")
+                    # Force a history refresh on the next visit to the history tab
+                    st.session_state.history_loaded = False
+
+                status.update(label="Presentation generated successfully!", state="complete")
+
+            except Exception as e:
+                status.update(label=f"An error occurred: {e}", state="error")
+
+    if st.session_state.deck_slides_data:
+        st.subheader("Your Deck is Ready!")
+
+        preview_col, settings_col = st.columns([3, 1])
+
+        with settings_col:
+            st.markdown("#### Deck Settings")
+            
+            # Theme selector
+            available_themes = ['black', 'white', 'league', 'sky', 'beige', 'simple', 'serif', 'solarized', 'blood', 'moon', 'night', 'dracula']
+            selected_theme = st.selectbox(
+                "Theme",
+                options=available_themes,
+                index=available_themes.index('black'), # Default to black
+                key="deck_theme"
+            )
+            
+            # Font selector
+            font_options = {
+                "Inter": {
+                    "family": "'Inter', sans-serif",
+                    "url": "https://fonts.googleapis.com/css2?family=Inter:wght@400;700&display=swap"
+                },
+                "Roboto": {
+                    "family": "'Roboto', sans-serif",
+                    "url": "https://fonts.googleapis.com/css2?family=Roboto:wght@400;700&display=swap"
+                },
+                "Lato": {
+                    "family": "'Lato', sans-serif",
+                    "url": "https://fonts.googleapis.com/css2?family=Lato:wght@400;700&display=swap"
+                },
+                "Merriweather": {
+                    "family": "'Merriweather', serif",
+                    "url": "https://fonts.googleapis.com/css2?family=Merriweather:wght@400;700&display=swap"
+                },
+                "Montserrat": {
+                    "family": "'Montserrat', sans-serif",
+                    "url": "https://fonts.googleapis.com/css2?family=Montserrat:wght@400;700&display=swap"
+                }
+            }
+            selected_font_name = st.selectbox("Font", options=list(font_options.keys()), key="deck_font")
+
+            # Background opacity slider
+            background_opacity = st.slider(
+                "Background Image Opacity",
+                min_value=0.0, max_value=1.0, value=0.3, step=0.05,
+                key="deck_bg_opacity"
+            )
+
+        # Re-assemble the deck HTML whenever a setting changes
+        slides_with_signed_urls = []
+        for slide in st.session_state.deck_slides_data:
+            signed_url = get_cached_signed_url(slide['image_gcs_uri']) if slide['image_gcs_uri'] else ""
+            slides_with_signed_urls.append({**slide, "image_url": signed_url})
+        
+        font_details = font_options[selected_font_name]
+        deck_html = deck_generator.assemble_revealjs_deck(slides_with_signed_urls, theme=selected_theme, background_opacity=background_opacity, font_family=font_details["family"], font_url=font_details["url"])
+
+        with preview_col:
+            st.components.v1.html(deck_html, height=600, scrolling=False)
+            st.download_button("Download Deck (deck.html)", deck_html, "deck.html", "text/html")
+
 
 @st.cache_data(ttl=600) # Cache for 10 minutes
 def get_all_history_from_firestore(limit=5000):
@@ -4687,11 +4905,22 @@ def display_all_history(history_data):
                 cols = st.columns(3)
                 for i, (_, row) in enumerate(row_items.iterrows()):
                     if i < len(cols):
-                        with cols[i]:
+                        with cols[i]: # This is the Grid view
                             if row['type'] == 'video':
                                 display_history_video_card(row)
-                            else:
+                            elif row['type'] == 'image':
                                 display_history_image_card(row)
+                            elif row['type'] == 'audio':
+                                display_history_audio_card(row)
+                            elif row['type'] == 'voice':
+                                display_history_voice_card(row)
+                            elif row['type'] == 'transcription':
+                                display_history_transcription_card(row)
+                            elif row['type'] in ['chat', '3p_chat', 'deck']:
+                                display_history_chat_card(row) # Use a generic card for text-based history
+                            else:
+                                # Fallback for any other types
+                                display_history_chat_card(row)
             st.markdown('</div>', unsafe_allow_html=True)
         
         col1, col2 = st.columns(2)
@@ -6593,6 +6822,68 @@ def display_history_actions():
             if st.button("Clear Selection"):
                 st.session_state.selected_history_items.clear()
                 st.rerun()
+
+def display_history_chat_card(row, project_id=None):
+    """
+    Display a generic history card for text-based items like chats and decks.
+    This avoids trying to render images for non-media types.
+    """
+    doc_id = row.get('doc_id')
+    uri = row.get('uri', '') # For decks, this is a GCS URI; for chats, it's the response text.
+    timestamp = row.get('timestamp')
+    prompt = row.get('prompt', 'No prompt available.')
+    params = _parse_history_params(row.get('params', {}))
+    is_favorite = row.get('favorite', False)
+    item_type = row.get('type', 'item')
+
+    with st.container(border=True, height=450):
+        # --- Selection Checkbox and Favorite Button ---
+        if not project_id:
+            # Use doc_id as the key for selection to handle long text in URI
+            is_selected = doc_id in st.session_state.get('selected_history_items', {})
+
+            def toggle_selection():
+                if doc_id in st.session_state.selected_history_items:
+                    del st.session_state.selected_history_items[doc_id]
+                else:
+                    st.session_state.selected_history_items[doc_id] = {'type': item_type, 'doc_id': doc_id, 'uri': uri}
+
+            select_col, fav_col = st.columns([1, 5])
+            with select_col:
+                st.checkbox("Select", value=is_selected, key=f"select_{doc_id}", on_change=toggle_selection, label_visibility="collapsed")
+            with fav_col:
+                st.button(
+                    "⭐️" if is_favorite else "☆",
+                    key=f"fav_hist_chat_{doc_id}",
+                    on_click=toggle_favorite_status,
+                    args=(doc_id, is_favorite),
+                    help="Mark as favorite"
+                )
+        else: # In project view, just show the favorite button
+            st.button(
+                "⭐️" if is_favorite else "☆",
+                key=f"fav_hist_chat_{doc_id}",
+                on_click=toggle_favorite_status,
+                args=(doc_id, is_favorite),
+                help="Mark as favorite"
+            )
+
+        # --- Display Content ---
+        st.markdown(f"**Type:** `{item_type.capitalize()}`")
+        
+        # Display prompt
+        st.markdown("**Prompt:**")
+        st.text_area(f"prompt_{doc_id}", value=prompt, height=100, disabled=True)
+
+        # Display response (which is stored in the 'uri' field for chats)
+        st.markdown("**Response:**")
+        st.text_area(f"response_{doc_id}", value=uri, height=150, disabled=True)
+
+        # Display parameters
+        if params:
+            with st.expander("Details", expanded=False):
+                st.json(params)
+
 
 if __name__ == "__main__":
     # Initialize minimal session state variables

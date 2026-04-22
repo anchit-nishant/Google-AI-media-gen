@@ -133,7 +133,7 @@ def generate_prompt_from_image(image, custom_instructions=None):
         print(f"❌ {error_msg}", file=sys.stderr)
         raise Exception(error_msg) 
 
-def generate_gemini_chat_response(model_name, prompt, uploaded_file=None, system_instructions=None, temperature=1.0, enable_grounding=False):
+def generate_gemini_chat_response(model_name, prompt, uploaded_file=None, system_instructions=None, temperature=1.0, enable_grounding=False, max_output_tokens=8192):
     """
     Generates a chat response from Gemini, handling multimodal inputs.
 
@@ -144,6 +144,7 @@ def generate_gemini_chat_response(model_name, prompt, uploaded_file=None, system
         system_instructions (str, optional): System-level instructions for the model.
         temperature (float): The temperature for the generation.
         enable_grounding (bool): Whether to enable Google Search grounding.
+        max_output_tokens (int): The maximum number of tokens to generate.
 
     Returns:
         str: The generated text response from the model.
@@ -213,9 +214,10 @@ def generate_gemini_chat_response(model_name, prompt, uploaded_file=None, system
         generation_config = {
             "temperature": temperature,
             "top_p": 1,
-            "max_output_tokens": 8192, # Using a more reasonable max for chat
+            "max_output_tokens": max_output_tokens,
             "safety_settings": safety_settings,
             "tools": tools,
+            "thinking_config": types.ThinkingConfig(),
         }
 
         # Generate content
@@ -233,15 +235,33 @@ def generate_gemini_chat_response(model_name, prompt, uploaded_file=None, system
         print("--------------------------------")
 
         # Process the response to extract text and citations
-        response_text = response.text
+        response_text = ""
+        # For a non-streaming response, the text is directly in the parts of the first candidate.
+        # Add a check to ensure the candidate and its content exist, which can be missing
+        # if the model's response is cut off (e.g., by MAX_TOKENS).
+        if response.candidates and len(response.candidates) > 0:
+            candidate = response.candidates[0]
+            if candidate.content and candidate.content.parts:
+                # The response can contain multiple parts (e.g., text, thought_signature).
+                # We must iterate and check for the 'text' attribute on each part to be safe.
+                response_text = "".join(
+                    [part.text for part in candidate.content.parts if hasattr(part, "text")]
+                )
+            elif candidate.finish_reason.name == "MAX_TOKENS":
+                print("⚠️ Gemini response was stopped due to maximum token limit. The returned content may be incomplete.")
+
         citations = []
         # The grounding metadata is located within the first candidate of the response.
-        if response.candidates and hasattr(response.candidates[0], 'grounding_metadata') and response.candidates[0].grounding_metadata:
-            citations = [
-                {"title": chunk.web.title, "uri": chunk.web.uri}
-                for chunk in response.candidates[0].grounding_metadata.grounding_chunks
-                if hasattr(chunk, 'web') and hasattr(chunk.web, 'title') and hasattr(chunk.web, 'uri')
-            ]
+        if (response.candidates and 
+            hasattr(response.candidates[0], 'grounding_metadata') and 
+            response.candidates[0].grounding_metadata and
+            response.candidates[0].grounding_metadata.grounding_chunks):
+                citations = [
+                    {"title": chunk.web.title, "uri": chunk.web.uri}
+                    for chunk in response.candidates[0].grounding_metadata.grounding_chunks
+                    # Add an extra check to ensure chunk is not None before accessing attributes
+                    if chunk and hasattr(chunk, 'web') and hasattr(chunk.web, 'title') and hasattr(chunk.web, 'uri')
+                ]
 
         print(f"✅ Extracted text: \"{response_text[:100]}...\"")
         print(f"✅ Extracted {len(citations)} citations.")
