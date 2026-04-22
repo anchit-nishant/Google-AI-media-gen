@@ -1351,20 +1351,16 @@ def generate_image_gemini_image_preview(
         {"category": cat, "threshold": safety_threshold} for cat in safety_categories
     ]
 
-    # Add Google Search grounding tool using the types from google.genai
-    from google.genai import types
-    tools = [types.Tool(google_search=types.GoogleSearch())]
+    # Add Google Search grounding tool directly as a dictionary for the REST API.
+    tools = [{"googleSearch": {}}]
     
     # 4. Construct the final request body
     request_body = {
         "contents": contents,
         "generationConfig": generation_config,
-        "safetySettings": safety_settings
+        "safetySettings": safety_settings,
+        "tools": tools
     }
-    
-    # The tools need to be converted to a dictionary for the JSON payload
-    if tools:
-        request_body['tools'] = [tool.to_dict() for tool in tools]
 
     # 5. Make the API request
     api_endpoint = f"aiplatform.googleapis.com"

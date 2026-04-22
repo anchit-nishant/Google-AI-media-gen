@@ -8,7 +8,7 @@ import apis.gemini_helper as gemini_helper
 from apis.veo2_api import Veo2API
 
 
-def generate_slide_outline(client: Veo2API, main_prompt: str, num_slides: int) -> Optional[List[Dict[str, str]]]:
+def generate_slide_outline(client: Veo2API, main_prompt: str, num_slides: int) -> Optional[tuple[list, dict]]:
     """
     Uses Gemini to generate a structured outline for a presentation.
 
@@ -18,8 +18,9 @@ def generate_slide_outline(client: Veo2API, main_prompt: str, num_slides: int) -
         num_slides: The number of slides to create.
 
     Returns:
-        A list of dictionaries, where each dictionary represents a slide
-        with 'title' and 'content' keys, or None on failure.
+        A tuple containing:
+        - A list of slide dictionaries.
+        - A dictionary with the API usage metadata.
     """
     system_prompt = f"""
     You are a world-class presentation designer. Your task is to create a structured outline for a {num_slides}-slide presentation based on the user's request that adheres to the Seven Fundamental Principles of Designt.
@@ -61,6 +62,8 @@ def generate_slide_outline(client: Veo2API, main_prompt: str, num_slides: int) -
     3.  **MODERN AESTHETICS**: Employ glassmorphism (e.g., `backdrop-blur-md bg-white/10`), rounded corners (`rounded-xl`), and subtle shadows (`shadow-lg`) to create depth.
     4.  **BENTO GRIDS**: When presenting multiple points, organize them in a grid of cards (a "Bento Box" layout). But DO NOT add empty Bento Boxes wihtout any text content.
     5.  Whenever a visual is needed, insert a placeholder tag for Nano Banana : [IMAGE_PROMPT: "Detailed description of a 3D abstract object, claymorphism style, neon accents, 8k resolution"]
+    6. Explicit Content Rule: "Every grid cell (Bento box) MUST contain at least one of the following: a Heading (<h3>), a Paragraph (<p>), or an Icon/Metric. NEVER generate an empty div or a box with only a background gradient."
+    7. The 'Metric First' Rule: "For Bento grids, every card must lead with a 'Hero Metric' (e.g., a large number or percentage) to ensure high-impact data visualization."
 
     Your output MUST be a valid JSON array of objects. Do not include any text or explanations outside of this array. Do not write the title twice on the slides. MAINTAIN A CONSISTENT DESIGN THEME AND PATTERN ACROSS ALL SLIDES
     Each object in the array represents a slide and must have the following structure:
@@ -123,10 +126,22 @@ def generate_slide_outline(client: Veo2API, main_prompt: str, num_slides: int) -
         
         # 3. Load the JSON.
         outline = json.loads(clean_json)
+        usage_metadata = response.get('usage_metadata', {})
+
+        # --- THE POST-PROCESSING CODE ---
+
+        def clean_html_content(html):
+            # Remove empty divs that don't have text or image placeholders
+            cleaned = re.sub(r'<div[^>]*>\s*</div>', '', html)
+            # Ensure [IMAGE_PROMPT] is wrapped in a styled container if Gemini forgot
+            if "[IMAGE_PROMPT" in cleaned and "<img" not in cleaned:
+                cleaned = cleaned.replace('[IMAGE_PROMPT', '<div class="overflow-hidden rounded-2xl border border-white/10 bg-white/5">[IMAGE_PROMPT')
+                cleaned = cleaned.replace('"]', '"]</div>')
+            return cleaned
         
         # 4. Final verification.
         if isinstance(outline, list) and all(isinstance(s, dict) and 'title' in s and 'content' in s for s in outline):
-            return outline
+            return outline, usage_metadata
         else:
             print("Error: Parsed JSON is not a valid list of slide objects.")
             return None
@@ -140,7 +155,7 @@ def generate_slide_outline(client: Veo2API, main_prompt: str, num_slides: int) -
         print("-----------------")
         return None
 
-def generate_image_for_slide(client: Veo2API, slide_content: Dict, style_prompt: str, reference_images_b64: List[str], storage_uri: str) -> Optional[str]:
+def generate_image_for_slide(client: Veo2API, slide_content: Dict, style_prompt: str, reference_images_b64: List[str], storage_uri: str) -> Optional[tuple[str, dict]]:
     """
     Generates an image for a single slide using Gemini (Nano Banana).
 
@@ -152,7 +167,9 @@ def generate_image_for_slide(client: Veo2API, slide_content: Dict, style_prompt:
         storage_uri: The GCS URI to store the generated image.
 
     Returns:
-        The GCS URI of the generated image, or None on failure.
+        A tuple containing:
+        - The GCS URI of the generated image.
+        - A dictionary with the API usage metadata.
     """
     # Extract the image prompt from the content
     content_text = slide_content['content']
@@ -180,14 +197,26 @@ def generate_image_for_slide(client: Veo2API, slide_content: Dict, style_prompt:
     try:
         response = client.generate_image_gemini_image_preview(
             chat_history=chat_history,
-            system_instructions="You are an expert image generation AI. Your task is to create a visually stunning, high-quality, and photorealistic image based on the user's prompt. The image should be suitable for a professional presentation. CRITICAL: Do NOT include any text, letters, or words in the generated image.",
+            system_instructions="""
+            You are an expert image generation AI. Your task is to create a visually stunning, high-quality, and photorealistic image based on the user's prompt. The image should be suitable for a professional presentation. STRICT TECHNICAL SPECIFICATIONS:
+
+            Bento Logic: If using a grid, each col-span must have a specific purpose: Fact, Metric, or Visual.
+
+            No Placeholders: Do not output comments like <!-- Image here -->. If you don't have content for a box, do not create the box.
+            """,
             aspectRatio="16:9",
             model="gemini-3-pro-image-preview", # Use a fast model for this
             storage_uri=storage_uri
         )
         
+
+        ##Image Placement: All [IMAGE_PROMPT] tags must be placed inside a container that has relative overflow-hidden rounded-3xl.
+
+        ## Typography: Headlines must use text-6xl to text-8xl with font-black. Body text must never exceed text-xl to maintain Hierarchy.
+
         image_uris = response.get("content", {}).get("image_uris", [])
-        return image_uris[0] if image_uris else None
+        usage_metadata = response.get('usageMetadata', {})
+        return (image_uris[0], usage_metadata) if image_uris else (None, usage_metadata)
 
     except Exception as e:
         print(f"Error generating image for slide '{slide_content['title']}': {e}")
@@ -215,11 +244,8 @@ def assemble_revealjs_deck(slides_data: List[Dict[str, Any]], theme: str = "blac
         
         slides_html += f"""
         <section data-background-image="{slide['image_url']}" data-background-opacity="{background_opacity}">
-            <div class="w-full h-full flex flex-col justify-center items-center text-white">
-                <h2 class="text-6xl font-bold mb-8">{slide['title']}</h2>
-                <div class="w-4/5">
-                    {slide_body_html}
-                </div>
+            <div class="reveal-slide-container w-full h-full flex flex-col justify-center items-center">
+                {slide_body_html}
             </div>
         </section>
         """
