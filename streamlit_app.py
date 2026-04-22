@@ -1380,6 +1380,13 @@ def deck_tab():
         key="deck_style_prompt"
     )
 
+    custom_system_instructions = st.text_area(
+        "Custom System Instructions (Optional)",
+        placeholder="e.g., Use a formal tone. Focus on financial data. Ensure all slides have a blue and gold color scheme.",
+        height=100,
+        key="deck_custom_instructions"
+    )
+
     reference_images = st.file_uploader(
         "Upload reference images for style (optional)",
         type=["jpg", "jpeg", "png", "webp"],
@@ -1405,7 +1412,7 @@ def deck_tab():
             try:
                 # 1. Generate slide outline
                 status.write("Step 1/3: Creating presentation outline with Gemini...")
-                outline, outline_usage = deck_generator.generate_slide_outline(client, main_prompt, num_slides)
+                outline, outline_usage = deck_generator.generate_slide_outline(client, main_prompt, num_slides, custom_system_instructions)
                 if not outline:
                     status.update(label="Failed to generate outline. Check logs for details.", state="error")
                     return
@@ -1413,13 +1420,19 @@ def deck_tab():
 
                 # 2. Generate images for each slide
                 status.write("Step 2/3: Generating images for each slide...")
-                ref_images_b64 = [base64.b64encode(f.getvalue()).decode('utf-8') for f in reference_images]
+                # Combine user-uploaded reference images with auto-fetched logos
+                user_ref_images_b64 = [base64.b64encode(f.getvalue()).decode('utf-8') for f in reference_images]
+                status.write("  - Searching for company logos in prompt...")
+                fetched_logos_b64 = deck_generator.find_and_fetch_logos(main_prompt)
+                all_reference_images_b64 = user_ref_images_b64 + fetched_logos_b64
+                status.write(f"  - Found {len(fetched_logos_b64)} potential logos. Total reference images: {len(all_reference_images_b64)}.")
+
                 slides_with_images = []
                 total_image_usage = {'promptTokenCount': 0, 'candidatesTokenCount': 0}
 
                 for i, slide in enumerate(outline): # outline is a list of dicts
                     st.write(f"  - Generating image for slide {i+1}: '{slide['title']}'")
-                    image_gcs_uri, image_usage = deck_generator.generate_image_for_slide(client, slide, style_prompt, ref_images_b64, st.session_state.get("storage_uri", config.STORAGE_URI))
+                    image_gcs_uri, image_usage = deck_generator.generate_image_for_slide(client, slide, style_prompt, all_reference_images_b64, st.session_state.get("storage_uri", config.STORAGE_URI), custom_system_instructions)
                     if image_usage:
                         for key in total_image_usage:
                             total_image_usage[key] += image_usage.get(key, 0)
